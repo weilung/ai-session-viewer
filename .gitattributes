@@ -1,0 +1,5 @@
+# 倉庫內統一 LF，避免 Windows/Linux/macOS 換行不一致
+* text=auto eol=lf
+# Windows 批次檔用 CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf

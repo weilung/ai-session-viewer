@@ -1,0 +1,16 @@
+# 產生的輸出（內含你的私密對話內容，切勿提交！）
+out/
+out-*/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 編輯器 / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# AI 工具本機狀態
+.claude/

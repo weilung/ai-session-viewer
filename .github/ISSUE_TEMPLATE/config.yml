@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 貢獻說明 / 其他問題
+    url: https://github.com/weilung/ai-session-viewer/blob/main/CONTRIBUTING.md
+    about: 想直接改碼、或想了解「投影」流程，請先看 CONTRIBUTING。

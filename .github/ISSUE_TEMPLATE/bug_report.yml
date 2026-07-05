@@ -1,0 +1,56 @@
+name: 🐛 回報 Bug
+description: 工具跑不動、輸出怪怪的、或壞掉了
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感謝回報！請填以下資訊幫助重現。
+        ⚠️ **隱私**：請勿貼上任何真實私密對話內容；用假資料或去識別化片段即可。
+  - type: textarea
+    id: what
+    attributes:
+      label: 發生什麼事
+      description: 預期 vs 實際結果
+      placeholder: 我執行 …，預期 …，但實際 …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 重現步驟
+      placeholder: |
+        1. 執行 `python ai_session_viewer.py …`
+        2. 打開 out/index.html
+        3. …
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 作業系統
+      placeholder: 例如 Windows 11 / Debian 12 / macOS 14
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python 版本（python --version）
+      placeholder: 例如 Python 3.12.3
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 工具版本 / commit
+      description: release tag（例如 v1.0.0）或 git commit
+      placeholder: v1.0.0
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他（錯誤訊息、截圖等）
+      description: 貼錯誤訊息時記得先移除任何私密內容
+    validations:
+      required: false

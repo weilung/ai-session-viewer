@@ -1,0 +1,29 @@
+name: 💡 功能建議
+description: 提出新功能或改善想法
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        歡迎提想法！較大的改動建議先在這裡討論方向再動手——本 repo 是投影，
+        變更會由維護者搬進上游、驗證後重新投影落地。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解決的問題 / 情境
+      placeholder: 我想要 …，因為 …
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: 建議的做法
+      placeholder: 可以 …
+    validations:
+      required: false
+  - type: textarea
+    id: alt
+    attributes:
+      label: 替代方案 / 補充
+    validations:
+      required: false

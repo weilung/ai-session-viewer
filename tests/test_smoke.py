@@ -8,9 +8,11 @@ ai_session_viewer 的煙霧測試（不含任何真實對話）。
     pytest tests/                        # 或用 pytest
 
 它在暫存目錄造一個假的 projects 結構，跑轉換器，檢查輸出涵蓋：
-表格算繪、工具摺疊、圖片內嵌、/rename 標題、模型/token、以及不安全連結被移除。
+表格算繪、工具摺疊、圖片內嵌、/rename 標題、模型/token、不安全連結被移除、
+回合錨點（HTML id ↔ MD {#tN} 標記）與 --search 全文搜尋結果頁。
 """
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -99,6 +101,8 @@ def test_smoke(tmp_path=None):
         "快取": "未顯示快取/成本資訊",
         "煙霧測試": "session 頁標題應為 /rename 名稱",
         "Demo auto title": "應顯示自動標題作輔助",
+        "closest('.sidechain-wrap')": "跳轉錨點應展開回合內收合區（略過子代理框）",
+        "nextElementSibling": "跳轉 compact 分隔線應展開壓縮摘要",
     }
     for needle, msg in checks.items():
         assert needle in html, msg
@@ -107,7 +111,136 @@ def test_smoke(tmp_path=None):
     assert ">resume</th>" in index, "索引應有 resume 欄"
     assert "sessions/claude-code/demo/" in index, "索引連結應包含工具/帳號 namespace"
     assert "javascript:alert" not in html, "不安全連結未被移除"
+
+    # 回合錨點：HTML 每則有 id、MD 標頭有對應 {#tN} 標記
+    assert 'id="t1"' in html, "HTML 第一則應有錨點 id=t1"
+    md = htmls[0].with_suffix(".md").read_text(encoding="utf-8")
+    assert "{#t1}" in md, "MD 回合標頭應有 {#t1} 錨點標記"
     print("OK: smoke test passed")
+
+
+def test_search(tmp_path=None):
+    # --search：搜既有輸出，結果頁含高亮與跳轉錨點；多詞 = 同一則內 AND
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    projects = _build_fixture(tmp)
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={projects}", "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"轉換失敗\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+
+    # 「比較表格」與「README」同在第一則使用者訊息 → 命中 t1
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(out), "--search", "比較表格 README"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"搜尋失敗\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    pages = sorted((out / "search").glob("*.html"))
+    assert len(pages) == 1, f"應產生 1 個結果頁，實得 {len(pages)}"
+    page = pages[0].read_text(encoding="utf-8")
+    assert "<mark>" in page, "結果頁應有命中詞高亮"
+    assert "#t1" in page, "結果應連到命中那一則的錨點"
+    assert 'target="_blank"' in page and "../sessions/" in page, "結果應以相對路徑另開分頁"
+    assert 'id="q"' in page, "結果頁應有頁內再過濾框"
+
+    # 「比較表格」「移除」分屬不同則 → AND 不成立，0 命中（仍寫出結果頁、正常退出）
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(out), "--search", "比較表格 移除"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"零命中搜尋不應失敗\nSTDERR:{r.stderr}"
+    assert "命中 0 則" in r.stdout, f"應回報 0 命中，實得：{r.stdout}"
+    assert len(list((out / "search").glob("*.html"))) == 2, "零命中也應寫出結果頁"
+
+    def _s(query, *extra):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--out", str(out), "--search", query, *extra],
+            capture_output=True, text=True, encoding="utf-8")
+
+    # 片語（引號、逐字）：連續文字命中；片語內空白不是 AND
+    r = _s('"做一個比較表格"')
+    assert r.returncode == 0 and "命中 0 則" not in r.stdout, f"片語應命中\n{r.stdout}{r.stderr}"
+    r = _s('"表格 README"')          # 兩詞同一則但不相鄰 → 片語不命中（AND 的話會中）
+    assert "命中 0 則" in r.stdout, "片語不應退化成 AND"
+    r = _s('"比較如下： | 項目"')     # 原文中間隔著換行 → 片語內空白應可跨換行
+    assert "命中 0 則" not in r.stdout, "片語內空白應比對跨換行"
+    # OR：獨立大寫是運算子，任一命中即可
+    r = _s("zzznope OR README")
+    assert "命中 0 則" not in r.stdout, "OR 任一命中應成立"
+    r = _s("zzznope OR zzznope2")
+    assert "命中 0 則" in r.stdout, "OR 兩者皆無應 0 命中"
+    r = _s("OR")                     # 只有懸空運算子 → 視同沒關鍵字
+    assert r.returncode != 0 and "關鍵字" in r.stderr, "純 OR 應報缺關鍵字"
+    # match-case：fixture 只有大寫 README
+    r = _s("readme")
+    assert "命中 0 則" not in r.stdout, "預設不分大小寫應命中"
+    r = _s("readme", "--match-case")
+    assert "命中 0 則" in r.stdout, "--match-case 應區分大小寫而不命中"
+
+    # md-only 建置（--format md）：結果頁應退化連到 .md 並標示，不可連到不存在的 .html
+    out2 = tmp / "out_mdonly"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={projects}", "--no-codex",
+         "--out", str(out2), "--format", "md"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"md-only 轉換失敗\nSTDERR:{r.stderr}"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(out2), "--search", "比較表格"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0 and "命中 0 則" not in r.stdout, f"md-only 搜尋應命中\n{r.stdout}{r.stderr}"
+    page2 = sorted((out2 / "search").glob("*.html"))[0].read_text(encoding="utf-8")
+    assert re.search(r'href="\.\./sessions/[^"]+\.md"', page2), "md-only 應連到 .md"
+    assert ".html#" not in page2, "md-only 不應連到不存在的 .html"
+    assert "僅 .md" in page2 and "個無 .html" in page2, "md-only 應有標示與頁頂警告"
+
+    # 過期輸出防護：來源變更後只重建其中一種格式，磁碟上另一種格式的「舊檔」不可再被信任
+    def _append_event(text_mark, uuid, ts):
+        with (projects / "demo-proj" / f"{SID}.jsonl").open("a", encoding="utf-8") as f:
+            f.write("\n" + json.dumps(
+                {"type": "user", "uuid": uuid, "parentUuid": "u3", "timestamp": ts,
+                 "sessionId": SID, "isSidechain": False,
+                 "message": {"role": "user", "content": text_mark}}, ensure_ascii=False))
+
+    def _conv(dst, *extra):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--claude-source", f"demo={projects}", "--no-codex",
+             "--out", str(dst), *extra], capture_output=True, text=True, encoding="utf-8")
+
+    # (a) both 建置 → 來源變更 → 只重建 md：舊 .html 雖存在但過期，搜尋應退化連 .md
+    out3 = tmp / "out_stale_html"
+    assert _conv(out3).returncode == 0
+    _append_event("追加訊息MARKA。", "u8", "2026-06-01T01:00:20.000Z")
+    assert _conv(out3, "--format", "md").returncode == 0
+    assert list((out3 / "sessions").rglob("*.html")), "過期 .html 應仍在磁碟上（前提）"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(out3), "--search", "比較表格"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0 and "命中 0 則" not in r.stdout
+    page3 = sorted((out3 / "search").glob("*.html"))[0].read_text(encoding="utf-8")
+    assert ".html#" not in page3 and "僅 .md" in page3, "過期 .html 不應被連結，應退化連 .md"
+
+    # (b) both 建置 → 來源變更 → 只重建 html：.md 語料過期，該 session 應跳過並警告
+    out4 = tmp / "out_stale_md"
+    assert _conv(out4).returncode == 0
+    _append_event("追加訊息MARKB。", "u7", "2026-06-01T01:00:21.000Z")
+    assert _conv(out4, "--format", "html").returncode == 0
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(out4), "--search", "比較表格"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0 and "命中 0 則" in r.stdout, "過期 .md 不可當語料，應 0 命中"
+    assert "缺或過時" in r.stderr, "應警告有 session 因缺/過時 .md 未納入"
+
+    # 沒建置紀錄時應明確報錯（非 0 退出）
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(tmp / "nowhere"), "--search", "x"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode != 0 and "先跑一次轉換" in r.stderr, "缺 manifest 應報錯提示先轉換"
+
+    # 空白關鍵字應報錯，不可掉進正常轉換流程
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(out), "--search", "   "],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode != 0 and "關鍵字" in r.stderr, "空白 --search 應報錯而非執行轉換"
+    assert "掃描到" not in r.stdout, "空白 --search 不應觸發轉換"
+    print("OK: search test passed")
 
 
 # 子代理就地呈現（A+B）：子代理對話應接在派出它的 Task 呼叫底下，且不另列索引
@@ -186,6 +319,18 @@ def test_subagent_inline(tmp_path=None):
     rows = index.count('<tr data-source')
     assert rows == 1, f"子代理不應另列索引，應只有 1 列，實得 {rows}"
     assert "🧩 ×1" in index, "索引標題後應有子代理數量標示 🧩 ×1"
+
+    # 子代理回合也有錨點（HTML id="sN" ↔ MD {#sN}），--search 命中子代理內容可直接跳
+    assert re.search(r'id="s\d+"', html), "子代理回合應有 s 系錨點 id"
+    md = [p for p in (out / "sessions").rglob("*.md")][0].read_text(encoding="utf-8")
+    assert "{#s" in md, "MD 子代理回合標頭應有 {#sN} 錨點標記"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(out), "--search", "SUBAGENTMARKER"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"子代理搜尋失敗\nSTDERR:{r.stderr}"
+    page = sorted((out / "search").glob("*.html"))[0].read_text(encoding="utf-8")
+    assert re.search(r"#s\d+", page), "命中子代理內容應連到 s 系錨點"
+    assert "子代理" in page, "結果頁應標示該筆來自子代理"
     print("OK: subagent inline test passed")
 
 
@@ -269,6 +414,7 @@ def test_compact_marker(tmp_path=None):
 
 if __name__ == "__main__":
     test_smoke()
+    test_search()
     test_subagent_inline()
     test_day_divider()
     test_compact_marker()

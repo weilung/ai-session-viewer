@@ -12,6 +12,7 @@ ai_session_viewer.py
     python3 ai_session_viewer.py --account work  # 只轉 ~/.claude-work
     python3 ai_session_viewer.py --claude-source a=~/.claude/projects --codex-source b=/path/sessions
     python3 ai_session_viewer.py --project Obts --format html
+    python3 ai_session_viewer.py --search "關鍵字" --open   # 全文搜尋既有輸出（結果頁在 out/search/）
 （Windows 可用 py 取代 python3，或雙擊 run.cmd；Debian/macOS 用 run.sh）
 """
 from __future__ import annotations
@@ -45,7 +46,7 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 23  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 25  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 SOURCE_LABELS = {
@@ -1019,6 +1020,12 @@ def analyze(s):
             s.subagent_meta[tid] = {"type": evs[0].get("_agent_type", ""),
                                     "desc": evs[0].get("_agent_desc", "")}
     s.side_groups = [g for groups in s.subagent_map.values() for g in groups]
+    # 全文搜尋用的穩定錨點：主對話 t{n}、子代理 s{n}。錨點掛在 group dict 上，
+    # HTML（id 屬性）與 Markdown（{#…} 標記）讀同一份，兩種輸出必然一致。
+    for i, g in enumerate(s.main_groups, 1):
+        g["anchor"] = f"t{i}"
+    for i, g in enumerate(s.side_groups, 1):
+        g["anchor"] = f"s{i}"
     # 子代理數量：優先用不重複的 agentId（外部檔），否則退回分組數
     agent_ids = {e.get("agentId") for e in side if e.get("agentId")}
     s.n_subagents = len(agent_ids) if agent_ids else len(s.subagent_map)
@@ -1403,6 +1410,7 @@ def render_subagent_block(tid, smap, smeta, tmap, used_ids, rendered):
 
 def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=None, rendered_sub=None):
     role = group["role"]
+    aid = f' id="{group["anchor"]}"' if group.get("anchor") else ""
     if group.get("compact"):
         # /compact 壓縮點：標示分隔線（手動/自動＋壓縮量），摘要收進摺疊（此摘要即下次送模型 context 的起點）
         summ = "".join(md_to_html(b.get("text") or "")
@@ -1416,7 +1424,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         when = local_str(group.get("dt"), "%H:%M:%S")
         if when:
             bits.append(when)
-        return (f'<div class="compact-sep"><span>✂ {esc(" · ".join(bits))}'
+        return (f'<div class="compact-sep"{aid}><span>✂ {esc(" · ".join(bits))}'
                 ' — 先前對話已壓縮為摘要，以下即下次送模型 context 的起點</span></div>'
                 '<details class="think compact-sum"><summary>📋 壓縮摘要</summary>'
                 f'<div class="tbody">{summ}</div></details>')
@@ -1459,7 +1467,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
     when = local_str(dt, "%H:%M:%S")
     when_full = (day_label(dt) + " " + when) if dt else ""   # 游標停留顯示完整日期
     meters = render_turn_meters(group)
-    return (f'<div class="turn {role}{side_cls}">'
+    return (f'<div class="turn {role}{side_cls}"{aid}>'
             f'<div class="head"><span class="who">{icon} {who}</span>{side_badge}'
             f'{meters}<span class="when" title="{esc_attr(when_full)}">{esc(when)}</span></div>'
             f'<div class="body">{"".join(parts)}</div></div>')
@@ -1569,7 +1577,16 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
 <script>
 function toggleAll(o){{document.querySelectorAll('details.tool,details.think,details.sidechain-wrap').forEach(function(d){{d.open=o;}});}}
 function openSub(id){{var el=document.getElementById(id);if(!el)return true;
+ document.querySelectorAll('.hl').forEach(function(x){{x.classList.remove('hl');}});
  var p=el;while(p){{if(p.tagName==='DETAILS')p.open=true;p=p.parentElement;}}
+ if(el.classList.contains('turn')){{[].slice.call(el.querySelectorAll('details')).forEach(function(d){{
+  if(d.classList.contains('sidechain-wrap'))return;
+  var sw=d.closest('.sidechain-wrap');
+  if(sw&&el.contains(sw))return;
+  d.open=true;}});}}
+ else if(el.classList.contains('compact-sep')){{var n=el.nextElementSibling;
+  if(n&&n.tagName==='DETAILS')n.open=true;}}
+ el.classList.add('hl');
  el.scrollIntoView({{behavior:'smooth',block:'start'}});history.replaceState(null,'',  '#'+id);return false;}}
 if(location.hash.length>1){{setTimeout(function(){{openSub(location.hash.slice(1));}},0);}}
 var MET=['cache','cost','ctx','out'],DEF={{cache:1,cost:1,ctx:0,out:0}};
@@ -1666,7 +1683,9 @@ def render_turn_md(group, tmap):
     side = "↳ " if group.get("side") else ""
     when = local_str(group.get("dt"), "%H:%M:%S")
     meters = turn_meters_md(group)
-    return f"\n### {side}{icon} · {when}{meters}\n\n" + "\n\n".join(parts) + "\n"
+    # {#tN}/{#sN}＝對應 HTML 該則的錨點 id：--search 用它定位，手動 rg 到後也可接在 .html# 後跳到該則
+    mark = f" {{#{group['anchor']}}}" if group.get("anchor") else ""
+    return f"\n### {side}{icon} · {when}{meters}{mark}\n\n" + "\n\n".join(parts) + "\n"
 
 
 def render_session_md(s: Session) -> str:
@@ -2574,6 +2593,21 @@ vertical-align:middle;margin-right:7px}
 .report .hn{color:var(--muted);font-size:11px}
 .report .kv{font-size:13px;margin:.25em 0}
 .report .num{text-align:right}
+/* 全文搜尋（--search）結果頁 + 錨點跳轉高亮 */
+mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1px}
+.hl{outline:2px solid var(--accent);outline-offset:2px}
+details.sgroup{border:1px solid var(--border);border-radius:10px;margin:12px 0;background:var(--panel)}
+details.sgroup>summary{padding:8px 12px;font-size:14px}
+.stitle{font-weight:600}
+.shead-meta{color:var(--muted);font-size:12px}
+.sopen{font-size:12px;margin-left:6px;white-space:nowrap}
+a.hit{display:block;margin:8px 12px;padding:7px 11px;border:1px solid var(--border);border-radius:8px;
+background:var(--panel2);color:var(--text)}
+a.hit:hover{border-color:var(--accent);text-decoration:none}
+.hit .hmeta{color:var(--muted);font-size:12px;margin-bottom:2px}
+.hit .snip{font-size:13.5px;line-height:1.7;word-break:break-word}
+.hwhen{font-family:ui-monospace,Consolas,monospace}
+.hmore{color:var(--muted);font-size:12px;margin:2px 14px 10px}
 """
 
 
@@ -2883,6 +2917,294 @@ def row_matches_project(row: dict, project_filter: str) -> bool:
     return needle in blob
 
 
+# =========================================================================
+# 全文搜尋（--search）：掃既有輸出的 .md，產生可點擊跳到該則的結果頁（out/search/）
+# =========================================================================
+SEARCH_KEEP_DAYS = 30      # 結果頁保留天數；每次搜尋時清掉更舊的
+SNIP_CTX = 60              # 命中詞前後各取的字元數
+SNIP_MAX = 3               # 每則訊息最多顯示幾段片段
+HITS_PER_SESSION = 30      # 每個 session 最多列出幾則命中
+MAX_HIT_CARDS = 800        # 整頁命中上限（防極熱門詞把頁面撐爆）
+
+# 只認我們自己產生的回合標頭（render_turn_md），把 .md 切回一則一則；
+# 訊息內文若恰好偽裝出同款行會誤切——後果只是該筆跳錯位置，屬已知簡化。
+_TURN_HEAD_RE = re.compile(r"^### (?P<side>↳ )?(?P<who>👤 You|🤖 Claude) ·(?P<rest>.*)\{#(?P<a>[ts]\d+)\}\s*$")
+_TIME_RE = re.compile(r"\d\d:\d\d:\d\d")
+
+# 查詢語法：空白=AND；獨立大寫 OR=前後任一；"片語"/'片語' 逐字（引號要在詞邊界，
+# 所以 don't 這種撇號不受影響）。要搜字面 OR 請加引號。
+_QUERY_TOKEN_RE = re.compile(
+    r'(?:(?<=\s)|^)"([^"]*)"(?=\s|$)'       # "片語"
+    r"|(?:(?<=\s)|^)'([^']*)'(?=\s|$)"      # '片語'
+    r"|(\S+)")                              # 一般詞（含裸 OR 運算子）
+
+
+def parse_query(q):
+    """把查詢字串解析成 groups：[[(文字, 是否片語), …], …]。
+    組與組之間是 AND；同組內是 OR。裸 token「OR」把下一項併入前一組
+    （Google 式：A B OR C ＝ A 且 (B 或 C)）；開頭/結尾的懸空 OR 忽略。"""
+    toks = []
+    for m in _QUERY_TOKEN_RE.finditer(q or ""):
+        if m.group(1) is not None or m.group(2) is not None:
+            t = m.group(1) if m.group(1) is not None else m.group(2)
+            if t.strip():
+                toks.append((t, True))
+        else:
+            toks.append((m.group(3), False))
+    groups, pend_or = [], False
+    for text, is_phrase in toks:
+        if not is_phrase and text == "OR":
+            pend_or = bool(groups)
+            continue
+        if pend_or:
+            groups[-1].append((text, is_phrase))
+        else:
+            groups.append([(text, is_phrase)])
+        pend_or = False
+    return groups
+
+
+def _term_pattern(text, is_phrase, flags):
+    """單一詞/片語 → regex。片語內的空白改成 \\s+，讓片語能跨換行/縮排比對。"""
+    src = re.escape(text)
+    if is_phrase:
+        src = re.sub(r"(?:\\ )+", lambda _: r"\s+", src)
+    return re.compile(src, flags)
+
+
+def iter_turn_chunks(md_text):
+    """把 session 的 .md 切成 (錨點, 是否子代理, 角色字串, 時間, 內文)；第一個回合前的 session 標頭不納入
+    （標題/專案/cwd 等 metadata 搜尋 index.html 就有，這裡專搜對話內容）。"""
+    cur, buf = None, []
+    for line in md_text.splitlines():
+        m = _TURN_HEAD_RE.match(line)
+        if m:
+            if cur:
+                yield (*cur, "\n".join(buf))
+            tm = _TIME_RE.search(m.group("rest") or "")
+            cur = (m.group("a"), bool(m.group("side")), m.group("who"), tm.group(0) if tm else "")
+            buf = []
+        elif cur is not None:
+            buf.append(line)
+    if cur:
+        yield (*cur, "\n".join(buf))
+
+
+def _merge_spans(spans, length):
+    """命中位置擴成 ±SNIP_CTX 的窗並合併重疊，最多 SNIP_MAX 段。"""
+    wins = []
+    for s0, e0 in sorted(spans):
+        a, b = max(0, s0 - SNIP_CTX), min(length, e0 + SNIP_CTX)
+        if wins and a <= wins[-1][1]:
+            wins[-1] = (wins[-1][0], max(wins[-1][1], b))
+        else:
+            wins.append((a, b))
+    return wins[:SNIP_MAX]
+
+
+def _snippet_html(chunk, spans, union_pat):
+    """取命中片段、壓平空白、esc 後把命中詞包 <mark>。"""
+    outp = []
+    for a, b in _merge_spans(spans, len(chunk)):
+        seg = re.sub(r"\s+", " ", chunk[a:b]).strip()
+        parts, last = [], 0
+        for m in union_pat.finditer(seg):
+            parts.append(esc(seg[last:m.start()]))
+            parts.append(f"<mark>{esc(m.group(0))}</mark>")
+            last = m.end()
+        parts.append(esc(seg[last:]))
+        outp.append(("…" if a > 0 else "") + "".join(parts) + ("…" if b < len(chunk) else ""))
+    return " ".join(outp)
+
+
+def render_search_html(q, args, groups, n_hits, n_scope, n_missing, truncated):
+    scope = []
+    if args.project:
+        scope.append(f"專案含「{args.project}」")
+    if args.account:
+        scope.append(f"帳號 {args.account}")
+    if args.no_claude:
+        scope.append("不含 Claude")
+    if args.no_codex:
+        scope.append("不含 Codex")
+    if args.match_case:
+        scope.append("區分大小寫")
+    scope_txt = "、".join(scope) if scope else "全部"
+    cards = []
+    for g in groups:
+        r = g["row"]
+        has_html = g.get("has_html", True)
+        href = f'../sessions/{r["out_html"] if has_html else r["out_md"]}'
+        chips = f'<span class="chip src">{esc(r.get("source_label", ""))}</span>'
+        if r.get("account"):
+            chips += f' <span class="chip acc">{esc(r["account"])}</span>'
+        if not has_html:
+            chips += ' <span class="chip">僅 .md</span>'
+        items = []
+        for h in g["hits"]:
+            icon = "👤" if "👤" in h["who"] else "🤖"
+            side = ' <span class="badge">↳ 子代理</span>' if h["side"] else ""
+            target = f'{href}#{h["anchor"]}' if has_html else href   # .md 無錨點可跳，開純文字後可搜 {#tN}
+            items.append(
+                f'<a class="hit" href="{esc_attr(target)}" target="_blank" rel="noopener">'
+                f'<div class="hmeta">{icon}{side} <span class="hwhen">{esc(h["when"])}</span> · #{h["anchor"]}</div>'
+                f'<div class="snip">{h["snip"]}</div></a>')
+        more = (f'<div class="hmore">…此 session 另有 {g["more"]} 則命中未列出（開整頁後可用瀏覽器內搜尋）</div>'
+                if g["more"] else "")
+        head_meta = " · ".join(x for x in [esc(r.get("proj", "")), esc(r.get("date_str", "")),
+                                           f'{len(g["hits"]) + g["more"]} 則'] if x)
+        cards.append(
+            f'<details class="sgroup" open><summary>{chips} <span class="stitle">{esc(r.get("title", ""))}</span>'
+            f' <span class="shead-meta">{head_meta}</span>'
+            f' <a class="sopen" href="{esc_attr(href)}" target="_blank" rel="noopener"'
+            f' onclick="event.stopPropagation()">開整頁 ↗</a></summary>'
+            + "".join(items) + more + "</details>")
+    note_missing = f" · ⚠ {n_missing} 個缺/過時 .md 未納入" if n_missing else ""
+    n_nohtml = sum(1 for g in groups if not g.get("has_html", True))
+    if n_nohtml:
+        note_missing += f" · ⚠ {n_nohtml} 個無 .html（連到 .md 純文字）"
+    note_trunc = (f'<div class="smeta">⚠ 命中過多，僅列出前 {MAX_HIT_CARDS} 則——請加關鍵字縮小範圍。</div>'
+                  if truncated else "")
+    empty_note = ('<p class="smeta">沒有命中。空白分隔＝同一則訊息內全部出現（AND）——可減少詞數、'
+                  '改用 <span class="mono">A OR B</span>、或把片語加引號；'
+                  '標題/專案等 metadata 請用 index.html 的搜尋。</p>')
+    # 重跑提示：查詢含雙引號時改用單引號包（PowerShell/bash 皆可貼）
+    requote = f"'{q}'" if '"' in q else f'"{q}"'
+    recmd = f"py ai_session_viewer.py --search {requote}" + (" --match-case" if args.match_case else "") + " --open"
+    body = f"""
+<div class="wrap">
+  <div class="topbar"><span><a class="back" href="../index.html">← 回索引</a></span></div>
+  <h1>🔍 {esc(q)}</h1>
+  <div class="smeta">命中 {n_hits} 則 / {len(groups)} 個 session · 範圍：{esc(scope_txt)}
+（{n_scope} 個 session{note_missing}）· {local_str(datetime.now().astimezone())}</div>
+  <div class="smeta">重新搜尋：<span class="mono">{esc(recmd)}</span></div>
+  {note_trunc}
+  <div class="filters">
+    <input id="q" class="search" placeholder="🔎 在結果內再過濾…" oninput="af()">
+    <span id="cnt" class="cnt"></span>
+  </div>
+  {''.join(cards) if cards else empty_note}
+</div>
+<script>
+var Q=document.getElementById('q'),CNT=document.getElementById('cnt');
+var HITS=[].slice.call(document.querySelectorAll('a.hit'));
+var GROUPS=[].slice.call(document.querySelectorAll('details.sgroup'));
+function af(){{var q=Q.value.trim().toLowerCase(),n=0;
+ HITS.forEach(function(h){{var ok=!q||h.textContent.toLowerCase().indexOf(q)>=0;h.style.display=ok?'':'none';if(ok)n++;}});
+ GROUPS.forEach(function(g){{var any=false;[].slice.call(g.querySelectorAll('a.hit')).forEach(function(h){{if(h.style.display!=='none')any=true;}});g.style.display=any?'':'none';}});
+ CNT.textContent=n+' / '+HITS.length+' 則';}}
+af();
+</script>
+"""
+    return html_page(f"搜尋：{q}", body)
+
+
+def run_search(args):
+    """--search 模式：不重新轉換，直接搜既有輸出並產生結果頁。"""
+    groups_spec = parse_query(args.search)
+    if not groups_spec:
+        print('--search 需要至少一個關鍵字（語法：空白=AND、OR=任一、"片語"；見 --help）。',
+              file=sys.stderr)
+        raise SystemExit(2)
+    out = Path(args.out)
+    entries, stale = load_manifest(out)
+    if not entries:
+        hint = ("建置紀錄版本過舊（renderer 已更新）" if stale
+                else f"找不到建置紀錄（{out / MANIFEST_NAME}）")
+        print(f"{hint}；請先跑一次轉換（例：py ai_session_viewer.py --out {args.out}）再搜尋。", file=sys.stderr)
+        raise SystemExit(2)
+
+    rows = [e["row"] for e in entries.values() if e.get("row") and not e["row"].get("empty")]
+    if args.project:
+        rows = [r for r in rows if row_matches_project(r, args.project)]
+    if args.account:
+        rows = [r for r in rows if r.get("account", "") == args.account]
+    if args.no_claude:
+        rows = [r for r in rows if r.get("source_kind") != SOURCE_CLAUDE]
+    if args.no_codex:
+        rows = [r for r in rows if r.get("source_kind") != SOURCE_CODEX]
+    rows.sort(key=lambda r: r.get("start_ts") or 0, reverse=True)
+
+    # 比對/高亮共用同一套 regex，語意保證一致；預設不分大小寫（--match-case 切換）
+    flags = 0 if args.match_case else re.IGNORECASE
+    group_pats = [[_term_pattern(t, ph, flags) for t, ph in g] for g in groups_spec]
+    union_pat = re.compile(
+        "|".join(sorted((p.pattern for alts in group_pats for p in alts), key=len, reverse=True)),
+        flags)
+
+    def matches(text):          # 每組至少一個 alternative 命中（組間 AND、組內 OR）
+        return all(any(p.search(text) for p in alts) for alts in group_pats)
+
+    t0 = datetime.now()
+    groups, n_hits, n_missing, truncated = [], 0, 0, False
+    for r in rows:
+        if n_hits >= MAX_HIT_CARDS:
+            truncated = True
+            break
+        if not r.get("has_md", True):        # .md 缺或與 row 不同步（--format html 建置）→ 語料不可信，跳過
+            n_missing += 1
+            continue
+        try:
+            text = (out / "sessions" / r["out_md"]).read_text(encoding="utf-8")
+        except OSError:
+            n_missing += 1
+            continue
+        if not matches(text):                 # 整檔快篩：任一組整檔都沒中就不必切回合
+            continue
+        hits, more = [], 0
+        for anchor, is_side, who, when, chunk in iter_turn_chunks(text):
+            if not matches(chunk):
+                continue
+            if len(hits) >= HITS_PER_SESSION or n_hits >= MAX_HIT_CARDS:
+                more += 1
+                continue
+            spans = set()                     # 每組取第一個命中的 alternative 當片段定位點
+            for alts in group_pats:
+                m = next((mm for mm in (p.search(chunk) for p in alts) if mm), None)
+                if m:
+                    spans.add((m.start(), m.end()))
+            hits.append({"anchor": anchor, "side": is_side, "who": who, "when": when,
+                         "snip": _snippet_html(chunk, sorted(spans), union_pat)})
+            n_hits += 1
+        if hits or more:
+            # 沒有「與 row 同步的」.html（--format md 建置、或格式切換留下的過期檔）：
+            # 結果頁退化連到 .md，避免連進無錨點/過期的頁
+            has_html = r.get("has_html", True) and (out / "sessions" / r["out_html"]).exists()
+            groups.append({"row": r, "hits": hits, "more": more, "has_html": has_html})
+    elapsed = (datetime.now() - t0).total_seconds()
+
+    sdir = out / "search"
+    sdir.mkdir(parents=True, exist_ok=True)
+    pruned = 0
+    cutoff = datetime.now().timestamp() - SEARCH_KEEP_DAYS * 86400
+    for f in sdir.glob("*.html"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                pruned += 1
+        except OSError:
+            pass
+    q = args.search.strip()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = sdir / f"{stamp}__{safe_name(q, 40)}.html"
+    dest.write_text(render_search_html(q, args, groups, n_hits, len(rows), n_missing, truncated),
+                    encoding="utf-8")
+
+    print(f"搜尋「{q}」：命中 {n_hits} 則 / {len(groups)} 個 session"
+          f"（範圍 {len(rows)} 個 session，{elapsed:.1f} 秒）")
+    if n_missing:
+        print(f"  ⚠ {n_missing} 個 session 缺或過時 .md 未納入（--format html？重跑預設轉換可補齊）",
+              file=sys.stderr)
+    if pruned:
+        print(f"  已清除 {pruned} 個超過 {SEARCH_KEEP_DAYS} 天的舊結果頁")
+    print(f"  結果頁： {dest.resolve()}")
+    if args.open:
+        try:
+            webbrowser.open(dest.resolve().as_uri())
+        except Exception:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser(description="把 Claude Code / Codex 的 JSONL session 轉成 HTML/Markdown")
     ap.add_argument("--claude-source", action="append", default=None,
@@ -2900,7 +3222,18 @@ def main():
                     help="連同只有 /指令、無實際對話的空 session 一起輸出")
     ap.add_argument("--force", action="store_true", help="忽略快取，全部重新產生")
     ap.add_argument("--open", action="store_true", help="完成後打開 index.html")
+    ap.add_argument("--search", default=None, metavar="查詢",
+                    help="全文搜尋既有輸出的對話內容並產生結果頁到 out/search/（不重新轉換，先跑過一次轉換）。"
+                         "語法：空白分隔＝同一則訊息內全部命中（AND）；獨立大寫 OR＝前後任一命中"
+                         "（A B OR C ＝ A 且 (B 或 C)）；\"片語\" 或 '片語' 逐字比對（片語內空白可跨換行），"
+                         "要搜字面 OR 也用引號。可搭 --project/--account/--no-claude/--no-codex 縮範圍，"
+                         "--open 直接打開結果頁")
+    ap.add_argument("--match-case", action="store_true", help="--search 時區分大小寫（預設不分）")
     args = ap.parse_args()
+
+    if args.search is not None:      # 有給 --search 就走搜尋；空字串/純空白由 run_search 報錯
+        run_search(args)
+        return
 
     out = Path(args.out)
     sess_dir = out / "sessions"
@@ -2982,8 +3315,10 @@ def main():
                  or (row.get("proj") == proj_names.get((acc_name, proj_name))
                      and "cache_steps" in row))                # 缺 cache_steps（理論上不會）→ 重建補上
             and (args.include_empty or not row.get("empty"))
-            and (not want_html or (sess_dir / row["out_html"]).exists())
-            and (not want_md or (sess_dir / row["out_md"]).exists())
+            # 檔案存在還不夠：has_* 旗標記錄該檔確實由本 row 的 sig+renderer 產生，
+            # 擋掉「格式切換建置留下的過期檔」被當成現行輸出（--search 也靠同一旗標）
+            and (not want_html or (row.get("has_html", True) and (sess_dir / row["out_html"]).exists()))
+            and (not want_md or (row.get("has_md", True) and (sess_dir / row["out_md"]).exists()))
         )
         if reusable:
             new_entries[key] = {"sig": sig, "row": row}
@@ -3024,7 +3359,15 @@ def main():
                 render_session_html(s, rel_index_href(s.out_html), mem_link), encoding="utf-8")
         if want_md:
             (sess_dir / s.out_md).write_text(render_session_md(s), encoding="utf-8")
-        new_entries[key] = {"sig": sig, "row": session_to_row(s)}
+        row = session_to_row(s)
+        # has_html/has_md＝該檔與本 row 的 sig+renderer 同步。縮格式建置（--format md/html）時，
+        # 另一格式若在「同一 sig」下產過且檔仍在，旗標沿用；sig 變了就不可信（過期檔）。
+        prev = cached.get("row") if cached.get("sig") == sig else None
+        row["has_html"] = want_html or bool(prev and prev.get("has_html")
+                                            and (sess_dir / row["out_html"]).exists())
+        row["has_md"] = want_md or bool(prev and prev.get("has_md")
+                                        and (sess_dir / row["out_md"]).exists())
+        new_entries[key] = {"sig": sig, "row": row}
         n_build += 1
 
     rows = [e["row"] for e in new_entries.values()

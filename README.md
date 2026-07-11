@@ -41,6 +41,7 @@ HTML 把工具呼叫、思考、子代理對話都做成**可摺疊**區塊，�
 | `--include-empty` | 連同只有 `/指令`、無實際對話的空 session 一起輸出 |
 | `--force` | 忽略快取，全部重新產生 |
 | `--open` | 完成後自動打開 `index.html` |
+| `--search "詞…"` | 全文搜尋既有輸出的**對話內容**，產生可點擊跳轉的結果頁（見〈全文搜尋〉）；搭 `--open` 直接打開 |
 
 ## 多帳號 / 多工具來源
 
@@ -176,11 +177,26 @@ Claude Code 的 **memory**（`~/.claude/projects/<專案>/memory/`：`MEMORY.md`
 
 ## 全文搜尋
 
-索引頁的搜尋比對 標題／專案／cwd／夾(munged)／帳號／分支 等欄位（所以搬遷前的舊路徑或舊專案名仍搜得到）。要搜**對話內容**，直接對輸出的 `.md` 用 ripgrep：
+索引頁的搜尋比對 標題／專案／cwd／夾(munged)／帳號／分支 等欄位（所以搬遷前的舊路徑或舊專案名仍搜得到）。
+要搜**對話內容**，用內建全文搜尋：
 
 ```bash
-rg "關鍵字" out/        # 或用 VS Code 全域搜尋
+py ai_session_viewer.py --search "關鍵字" --open            # 空白分隔多詞 = 同一則訊息內全部命中（AND）
+py ai_session_viewer.py --search "快取 OR cache"            # 獨立大寫 OR = 任一命中；A B OR C ＝ A 且 (B 或 C)
+py ai_session_viewer.py --search "'cache read' 命中"        # 引號包片語（單雙皆可）逐字比對，片語內空白可跨換行
+py ai_session_viewer.py --search readme --match-case        # 區分大小寫（預設不分）
+py ai_session_viewer.py --search "關鍵字" --project Obts    # 縮範圍：--account / --no-claude / --no-codex 同理
 ```
+
+沒有 `AND` 關鍵字——空白就是 AND；要搜「OR」這個字面詞就用引號（`"OR"`）。
+
+它直接掃既有輸出的 `.md`（所以要**先跑過一次轉換**；工具輸出、思考內容都搜得到），把命中做成一頁結果
+（`out/search/<時間>__<關鍵字>.html`）：依 session 分組、顯示高亮片段，**點任一筆就開該對話頁並跳到命中的那一則**
+（命中在收合區塊或子代理對話內會自動展開），頁內另有再過濾框。結果頁會留存方便回頭看，
+每次搜尋時自動清掉超過 30 天的舊結果頁。
+
+離線／進階仍可 `rg "關鍵字" out/`（或 VS Code 全域搜尋）：`.md` 每則訊息標頭帶有 `{#t12}`（子代理為 `{#s3}`）
+錨點標記，把它接在同名 `.html` 後（`….html#t12`）就能開瀏覽器直接跳到那一則。
 
 ## 開發 / 測試
 

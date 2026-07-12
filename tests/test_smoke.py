@@ -412,9 +412,111 @@ def test_compact_marker(tmp_path=None):
     print("OK: compact marker test passed")
 
 
+def test_cache_report(tmp_path=None):
+    # 快取分析報告 v2：TTL 細分計價（1h=2×）、成因分解（first/switch/expiry/evict）、
+    # 429 邊界自動偵測（切帳號不污染 TTL 統計）、TTL 遵約率、SVG 圖表與 md twin。
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-000000000005"
+
+    def astep(uuid, parent, ts, mid, inp, cc5, cc1h, cr):
+        return {"type": "assistant", "uuid": uuid, "parentUuid": parent, "timestamp": ts,
+                "sessionId": sid, "isSidechain": False,
+                "message": {"role": "assistant", "model": "claude-opus-4-7", "id": mid,
+                            "usage": {"input_tokens": inp, "output_tokens": 0,
+                                      "cache_creation_input_tokens": cc5 + cc1h,
+                                      "cache_read_input_tokens": cr,
+                                      "cache_creation": {"ephemeral_5m_input_tokens": cc5,
+                                                         "ephemeral_1h_input_tokens": cc1h}},
+                            "content": [{"type": "text", "text": "ok"}]}}
+
+    evs = [
+        {"type": "user", "uuid": "q1", "parentUuid": None, "timestamp": "2026-06-03T00:59:00.000Z",
+         "cwd": "/x/Proj", "gitBranch": "main", "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": "快取測試CACHEMARK。"}},
+        # A：session 第一句（cold，成因 first）；1h 寫入 100 萬 → 成本 2×＝$10
+        astep("a1", "q1", "2026-06-03T01:00:00.000Z", "mm1", 0, 0, 1_000_000, 0),
+        # B：+10 分，warm（帶內命中 → 遵約樣本）
+        astep("a2", "a1", "2026-06-03T01:10:00.000Z", "mm2", 100, 0, 10_000, 1_000_000),
+        # 429 limit（撞牆 → 其後第一步歸因「切帳號」，且不進 TTL 統計）
+        {"type": "assistant", "uuid": "e1", "parentUuid": "a2", "timestamp": "2026-06-03T01:20:00.000Z",
+         "sessionId": sid, "isSidechain": False, "isApiErrorMessage": True, "apiErrorStatus": 429,
+         "message": {"role": "assistant", "model": "<synthetic>", "id": "mmE",
+                     "content": [{"type": "text",
+                                  "text": "You've hit your session limit · resets 6pm (Asia/Taipei)"}]}},
+        # C：limit 後 +5 分（cold，成因 switch）
+        astep("a3", "e1", "2026-06-03T01:25:00.000Z", "mm3", 0, 0, 1_000_000, 0),
+        # D：+2 小時（cold，成因 expiry＝可避免；亦為閒置 ≥30 分的重暖事件）
+        astep("a4", "a3", "2026-06-03T03:25:00.000Z", "mm4", 0, 0, 500_000, 0),
+        # E：+10 分（cold，帶內 → 成因 evict＝提早失效；遵約樣本 miss）
+        astep("a5", "a4", "2026-06-03T03:35:00.000Z", "mm5", 0, 0, 1_000_000, 1_000),
+        # F：+90 秒，warm、寫 1h TTL——邊界前最後一次寫入刻意用 1h：若 boundary 未重置 lineage，
+        # G→H 會沿用 stale 1h cohort 而把 9 分 cold 誤判 evict＋誤進遵約樣本（下方三個斷言同時卡住）
+        astep("a6", "a5", "2026-06-03T03:36:30.000Z", "mm6", 0, 0, 10_000, 1_000_000),
+        # system 形態 401（重試記錄帶 error.status → auth 邊界；其後第一步歸因 switch）
+        {"type": "system", "subtype": "api_error", "uuid": "e2", "parentUuid": "a6",
+         "timestamp": "2026-06-03T03:36:35.000Z", "sessionId": sid, "isSidechain": False,
+         "level": "error", "retryAttempt": 1, "maxRetries": 10, "retryInMs": 1000,
+         "error": {"status": 401, "headers": {}}},
+        # G：401 後 +90 秒（cold → switch，不是回合內雜訊；本步無寫入）
+        astep("a7", "e2", "2026-06-03T03:38:00.000Z", "mm7", 200_000, 0, 0, 0),
+        # H：+9 分（cold；401 邊界已重置快取 lineage、G 又無寫入 → cohort=unknown（按 5 分下界）
+        #    → 9 分＝expiry，不是 evict、也不進 1h 遵約樣本——cohort 後備＋lineage 重置回歸）
+        astep("a8", "a7", "2026-06-03T03:47:00.000Z", "mm8", 0, 10_000, 0, 0),
+        # I：+2 分，warm（H 寫過 5m → 同 lineage 內的 5m cohort 樣本；存活表出現 5m 欄，
+        #    H 的 5m 寫入亦覆蓋成本 1.25× 路徑）
+        astep("a9", "a8", "2026-06-03T03:49:00.000Z", "mm9", 0, 0, 0, 1_000_000),
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={proj.parent}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+
+    index = (out / "index.html").read_text(encoding="utf-8")
+    assert "快取分析報告" in index, "索引應連到快取分析報告"
+    # 成本按 TTL 細分計價（1h=2×、5m=1.25×）：A$10 + B$0.6005 + C$10 + D$5 + E$10.0005
+    # + F$0.60 + G$1 + H$0.0625 + I$0.50 ＝ $37.7635 ≈ $37.76（全按 5 分假設會低估）
+    assert "$37.76" in index, "成本應按 TTL 細分計價（找不到 $37.76）"
+
+    rep = (out / "cache-report.html").read_text(encoding="utf-8")
+    checks = {
+        "TTL 遵約率": "KPI 應有 TTL 遵約率",
+        ">50%<": "遵約率應為 1/2＝50%（A→B 命中、D→E 失效）",
+        "limit/切帳號": "成因表應含 limit/切帳號",
+        "閒置過期": "成因表應含閒置過期",
+        "提早失效": "應含提早失效（evict）",
+        'svg class="viz"': "應有 SVG 圖表（存活曲線/dot plot）",
+        "cz-switch": "成因堆疊圖應有切帳號段",
+        "撞到 limit": "應有撞牆時刻小節",
+        "CI ": "比率應附 Wilson CI",
+    }
+    for needle, msg in checks.items():
+        assert needle in rep, f"{msg}（找不到 {needle!r}）"
+    assert "429" in rep and "污染" not in rep[:200], "撞牆說明應提及 429"
+
+    md = (out / "cache-report.md").read_text(encoding="utf-8")
+    assert "| limit/切帳號 | 2 |" in md, "md 成因表 switch 應為 2（429 assistant 形態＋401 system 形態）"
+    assert "| 閒置過期 | 2 |" in md, "md 成因表 expiry 應為 2（D＝1h 過期、H＝邊界後 unknown lineage 過期）"
+    assert "| 提早失效 | 1 |" in md, "md 成因表 evict 應為 1（H 不得因沿用邊界前 1h cohort 而誤算）"
+    assert "| session 第一句 | 1 |" in md, "md 成因表 first 應為 1"
+    assert "| 回合內雜訊 | 0 |" in md, "md 成因表 intra 應為 0（G 屬 401 邊界，非雜訊）"
+    assert "TTL 遵約率" in md and "50%" in md, "md 應有遵約率 50%（H 不得進 1h 遵約樣本）"
+    assert "5 分寫入" in md, "md 存活表應出現 5m cohort 欄"
+    # 直接卡 lineage 重置：G→H（540 秒）必須落在「TTL 未知」cohort 的 5–10 分桶
+    # （欄序＝1h、5m、未知各兩欄；沿用 stale 1h 或 5m cohort 都會使此列不符）
+    assert "| 5–10 分 | — | — | — | — | 1 |" in md, "H 應落在 unknown lineage 的 5–10 分桶"
+    print("OK: cache report test passed")
+
+
 if __name__ == "__main__":
     test_smoke()
     test_search()
     test_subagent_inline()
     test_day_divider()
     test_compact_marker()
+    test_cache_report()

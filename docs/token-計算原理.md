@@ -28,17 +28,19 @@
 "usage": {
   "input_tokens": 1200,
   "cache_creation_input_tokens": 18000,
+  "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 18000},
   "cache_read_input_tokens": 164000,
   "output_tokens": 350
 }
 ```
 
-四個欄位的**語意**（這是最常被誤解的地方）：
+主要欄位的**語意**（這是最常被誤解的地方）：
 
 | 欄位 | 意思 | 計費 |
 |---|---|---|
 | `input_tokens` | 這輪**未命中快取的新輸入**（注意：**不是**整段脈絡，是扣掉快取後的剩餘） | 全價 |
-| `cache_creation_input_tokens` | 這輪**寫進快取**的量（第一次看到、存起來下次用） | 約 1.25× 輸入價 |
+| `cache_creation_input_tokens` | 這輪**寫進快取**的量（第一次看到、存起來下次用） | 5 分 TTL 1.25×／1 小時 TTL 2×（見 §3） |
+| `cache_creation`（物件） | 上一列的 **TTL 細分**：寫進 5 分鐘快取、1 小時快取各多少（新版才有） | — |
 | `cache_read_input_tokens` | 這輪**從快取重用**的量（之前存過，直接讀） | 約 0.1× 輸入價 |
 | `output_tokens` | 模型**產出**的量（回答＋思考＋工具參數） | 輸出價 |
 
@@ -101,11 +103,14 @@ total_in = i + c1 + c2             # 這輪脈絡
 
 ### 快取有期限（TTL）
 
-快取不是永久的，有存活時間（TTL）：
-- **5 分鐘 TTL**：寫入約 **1.25×**（本工具預設假設這個）。
+快取不是永久的，有存活時間（TTL），且**每次使用會刷新**：
+- **5 分鐘 TTL**：寫入約 **1.25×**。
 - **1 小時 TTL**：寫入約 **2×**（存比較久所以寫入較貴）。
 
-JSONL 通常**不區分**你用哪種 TTL，所以本工具一律假設 5 分鐘。若你實際用 1 小時快取，估算會**略為低估**。
+新版 JSONL 的 `usage.cache_creation` 物件**會區分**兩種 TTL 各寫了多少
+（`ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`），本工具依細分**逐筆精算**
+（實測近期 Claude Code 幾乎全用 1 小時 TTL 寫入）。舊資料沒有這個細分，該部分按 5 分鐘（1.25×）估，
+若實際是 1 小時快取會**低估**。
 
 ---
 
@@ -172,34 +177,37 @@ seen.add(mid)
 金額不在 JSONL 裡，是**估算**出來的。每次呼叫：
 
 ```
-成本(USD) = ( input        × 輸入單價
-            + cache_create × 輸入單價 × 1.25     ← 寫快取
-            + cache_read   × 輸入單價 × 0.10     ← 讀快取
-            + output       × 輸出單價 ) ÷ 1,000,000
+成本(USD) = ( input          × 輸入單價
+            + 寫快取(5 分)   × 輸入單價 × 1.25    ← ephemeral_5m（無細分的舊資料也按此估）
+            + 寫快取(1 小時) × 輸入單價 × 2.00    ← ephemeral_1h
+            + cache_read     × 輸入單價 × 0.10    ← 讀快取
+            + output         × 輸出單價 ) ÷ 1,000,000
 ```
 
 - **單價**是「每 100 萬（1M）token」的美金價，依模型不同。例如 Claude Opus ＝ 輸入 \$5／輸出 \$25。
-- 三個輸入欄位**共用輸入單價**，只是快取部分各乘自己的倍率。
+- 三個輸入欄位**共用輸入單價**，只是快取部分各乘自己的倍率；寫入倍率依 `cache_creation` 物件的
+  TTL 細分逐筆套用（見 §3）。
 - 除以 1,000,000 是因為單價是「每 1M token」。
 
 ### 實例（Opus，輸入 \$5／輸出 \$25）
 
-某則：`input=1000`、`cache_create=20000`、`cache_read=180000`、`output=500`
+某則：`input=1000`、`cache_create=20000`（細分顯示全為 1 小時 TTL）、`cache_read=180000`、`output=500`
 
 ```
-= (1,000×5  +  20,000×5×1.25  +  180,000×5×0.10  +  500×25) ÷ 1,000,000
-= (5,000    +  125,000        +  90,000          +  12,500)  ÷ 1,000,000
-= 232,500 ÷ 1,000,000
-= $0.2325
+= (1,000×5  +  20,000×5×2.0  +  180,000×5×0.10  +  500×25) ÷ 1,000,000
+= (5,000    +  200,000       +  90,000          +  12,500)  ÷ 1,000,000
+= 307,500 ÷ 1,000,000
+= $0.3075
 ```
 
 注意：雖然 `cache_read` 高達 18 萬 token，但因為只算 0.1×，它的成本（\$0.09）反而比
-2 萬 token 的 `cache_create`（\$0.125）還低——**這就是快取的威力**。
+2 萬 token 的 `cache_create`（\$0.20）還低——**這就是快取的威力**。
 
 ### 估算的已知限制
 
 1. JSONL 只記 token、不記錢 → 金額純估算。
-2. 不分 5 分／1 小時 TTL，一律當 5 分（1 小時快取會低估）。
+2. TTL 細分（`cache_creation` 物件）只有新版資料才有；沒有細分的舊資料一律當 5 分（1.25×），
+   若實際是 1 小時快取會低估。
 3. 用公告定價，沒算批次折扣／企業折扣。
 4. 未知模型（沒有單價）只計已知部分並標 `+?`；完全沒價就標「不估價」。
 
@@ -250,14 +258,14 @@ Codex（OpenAI）的 JSONL 在 `event_msg` 的 `token_count.info.last_token_usag
 | input（輸入） | 模型讀進去的 token |
 | output（產出） | 模型寫出來的 token |
 | `input_tokens` | （Claude）未命中快取的**新**輸入；（Codex）含快取的整段輸入 |
-| `cache_creation` | 這輪**寫進**快取的 token（約 1.25×） |
+| `cache_creation` | 這輪**寫進**快取的 token（5 分 1.25×／1 小時 2×；同名物件記 TTL 細分） |
 | `cache_read` | 這輪**從快取重用**的 token（約 0.1×，便宜） |
 | 脈絡（context） | 這輪的完整輸入 ＝ input + cache_create + cache_read |
 | 脈絡峰值 | 整個 session 單輪脈絡的最大值 |
 | 快取命中率 | cache_read ÷ 脈絡，愈高愈省 |
 | 步驟（step） | 回合內的一次 API 呼叫（一個 message.id），各有自己的脈絡與命中率 |
 | 回合（turn） | 你一次提問後、到下次換你說話之前的所有步驟合計 |
-| TTL | 快取存活時間（5 分 / 1 小時），影響寫入倍率 |
+| TTL | 快取存活時間（5 分 / 1 小時，每次使用會刷新），影響寫入倍率 |
 | message.id 去重 | 同一則被拆多筆事件，靠 id 只算一次 |
 
 ---
@@ -301,8 +309,8 @@ for line in path.read_text(encoding="utf-8").splitlines():
 
 ## 延伸：本工具相關程式碼位置
 
-- `PRICE_PER_M` / `CACHE_WRITE_MULT` / `CACHE_READ_MULT`：單價與快取倍率。
-- `call_cost()`：第 6 節的成本公式。
+- `PRICE_PER_M` / `CACHE_WRITE_MULT` / `CACHE_WRITE_MULT_1H` / `CACHE_READ_MULT`：單價與快取倍率。
+- `call_cost()` / `_ephemeral_split()`：第 6 節的成本公式與 TTL 細分讀取。
 - `_collect_usage()`：第 2、5 節的彙整與 message.id 去重。
 - `_step_usage()` / `group_turns()` 的 `_step` 標記 / `render_step_meters()`：第 4 節「整段 vs 每一步」的逐步命中率。
 - `_codex_usage()` / `_codex_usage_sig()` / `load_codex_session()` 的 `token_count` 分支：第 7 節 Codex 處理。

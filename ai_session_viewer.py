@@ -23,10 +23,11 @@ import binascii
 import hashlib
 import html
 import json
+import math
 import re
 import sys
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 
 # ---- 讓 Windows 主控台能印 Unicode ----
@@ -46,7 +47,7 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 25  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 26  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 SOURCE_LABELS = {
@@ -119,7 +120,8 @@ PRICE_PER_M = {
     "claude-fable": (10.0, 50.0),
     "claude-mythos": (10.0, 50.0),
 }
-CACHE_WRITE_MULT = 1.25   # 快取寫入（假設 5 分鐘 TTL）
+CACHE_WRITE_MULT = 1.25      # 快取寫入（5 分鐘 TTL；無細分資訊的舊資料也按此計，1 小時寫入會低估）
+CACHE_WRITE_MULT_1H = 2.0    # 快取寫入（1 小時 TTL；usage.cache_creation 細分可辨識時精算）
 CACHE_READ_MULT = 0.10    # 快取讀取
 CACHE_COLD_PCT = 25       # 命中率低於此值視為「冷啟動」（該步幾乎整段重寫快取）→ 紅底白字標示。
 # 冷啟動成因不只一種：(1) 長時間閒置／resume 後快取 TTL 過期；(2) 回合內快取斷點的一次性 miss——
@@ -128,21 +130,34 @@ CACHE_COLD_PCT = 25       # 命中率低於此值視為「冷啟動」（該步�
 
 # ── 快取分析報告（cache-report.html）參數 ──
 # 思路：每次 API 呼叫都帶 usage，命中率＝cache_read/脈絡；把「與前一次呼叫的間隔」對上「這次是否冷啟」，
-# 就能反推「閒置多久快取會過期（有效 TTL）」；把冷啟（過期暖機）事件的本地時間做直方圖，就能看出
-# 使用者「平常都什麼時段重新開工」（早上上班第一次、午休後第一次…），平日／假日分開看。
+# 就能量測「閒置多久快取會失效」。新版 usage.cache_creation 有 5 分／1 小時 TTL 細分（實測本機資料
+# 幾乎全為 1 小時寫入），因此 TTL 是「量測」而非推估；每個冷啟依成因分解（見 REPORT_CAUSES），
+# 只有排除結構性成因（session 第一句、切帳號、換模型、壓縮）後的樣本才進 TTL 存活估計（競爭風險原則）。
 REPORT_MIN_CTX = 500          # 脈絡低於此 token 數的步驟不納入分析（暖機/瑣碎呼叫，命中率無參考意義）
-REPORT_BREAK_SEC = 30 * 60    # 全域閒置 ≥ 此秒數＝一次「中斷」，其後第一步＝快取必過期後的「重新開工」事件
-# 存活分析的間隔分桶（秒上界, 標籤）：用「同一 session 內相鄰步驟的間隔 vs 是否冷啟」估有效 TTL。
-# <1 分多為回合內連續呼叫（含快取斷點一次性 miss 的雜訊）；真正反映 TTL 的是較大間隔那幾桶。
+REPORT_BREAK_SEC = 30 * 60    # 全域閒置 ≥ 此秒數＝一次「中斷」，其後第一個冷啟步＝「重新開工」事件
+REPORT_INTRA_SEC = 2 * 60     # 間隔 < 此秒數＝回合內連續呼叫（快取斷點/20-block 回溯等一次性 miss 雜訊）
+REPORT_TTL_SAFE_SEC = 55 * 60  # 1h TTL 的「應命中」上界（留 5 分鐘餘裕）；band 內冷啟＝提早失效（異常）
+# 存活分析的間隔分桶（秒上界, 標籤）：對數尺度近似；曲線 x 座標取各桶幾何中點。
 REPORT_GAP_BUCKETS = [
     (60, "< 1 分"), (5 * 60, "1–5 分"), (10 * 60, "5–10 分"), (15 * 60, "10–15 分"),
     (30 * 60, "15–30 分"), (60 * 60, "30–60 分"), (2 * 3600, "1–2 時"),
     (6 * 3600, "2–6 時"), (float("inf"), "> 6 時"),
 ]
-# ③ 伺服器負載假設：快取會不會在全球尖峰時段較易過期？依 UTC（伺服器時間）分析。
-# 只看間隔落在此帶的相鄰步驟——超過 5 分（5 分 TTL 應已過期）但仍在 1 小時內，最能反映 TTL 是否隨負載變動。
-REPORT_TTL_BAND = (5 * 60, 60 * 60)
+# ③ 伺服器負載假設：快取會不會在全球尖峰時段較易「提早失效」？依 UTC（伺服器時間）分析。
+# 觀察帶＝1h 寫入 cohort 的「應命中帶」[REPORT_INTRA_SEC, REPORT_TTL_SAFE_SEC)——帶內冷啟即異常。
+# 時段與間隔長短相關（午休/夜間閒置較久），故檢定前先依 gap 分層（CMH），避免把「閒得久」誤讀成「尖峰失效」。
 REPORT_PEAK_UTC = set(range(13, 22))   # 13–21 UTC：歐洲午後＋美國上午，一般是 Anthropic 全球最重時段
+REPORT_CMH_STRATA = [15 * 60, 30 * 60, REPORT_TTL_SAFE_SEC]   # 帶內 gap 分層上界：2–15 / 15–30 / 30–55 分
+# 冷啟成因（優先序判定，每個冷啟恰好一個成因）；label/css 供報告呈現。
+REPORT_CAUSES = [
+    ("first",   "session 第一句", "不可避免：全新前綴"),
+    ("switch",  "limit/切帳號",   "不可避免：429/401 邊界後第一步（快取按組織隔離）"),
+    ("model",   "換模型",         "結構性：快取按模型隔離"),
+    ("compact", "壓縮後",         "結構性：/compact 或自動壓縮改寫前綴"),
+    ("expiry",  "閒置過期",       "可避免：間隔超過 TTL"),
+    ("evict",   "提早失效",       "異常：1h TTL 內（2–55 分）卻冷啟"),
+    ("intra",   "回合內雜訊",     "快取斷點/20-block 回溯的一次性 miss，非 TTL"),
+]
 
 
 def model_price(model):
@@ -173,14 +188,31 @@ def context_window(model):
     return None
 
 
-def call_cost(model, inp, cache_create, cache_read, out):
-    """單次 API 呼叫的估算成本（USD）；未知模型回 None。"""
+def _ephemeral_split(u):
+    """從 usage.cache_creation 物件取 (5 分, 1 小時) TTL 寫入細分；舊資料無此欄回 (0, 0)。"""
+    cc = u.get("cache_creation")
+    if not isinstance(cc, dict):
+        return 0, 0
+    out = []
+    for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"):
+        try:
+            out.append(int(cc.get(key) or 0))
+        except (TypeError, ValueError):
+            out.append(0)
+    return out[0], out[1]
+
+
+def call_cost(model, inp, cache_create, cache_read, out, cc_5m=0, cc_1h=0):
+    """單次 API 呼叫的估算成本（USD）；未知模型回 None。
+    快取寫入依 TTL 細分計價（5 分 1.25×、1 小時 2×）；細分未涵蓋的部分（舊資料）按 5 分計，會低估。"""
     p = model_price(model)
     if not p:
         return None
     pin, pout = p
+    legacy = max(cache_create - cc_5m - cc_1h, 0)      # 無細分資訊的寫入量
+    write = (legacy + cc_5m) * CACHE_WRITE_MULT + cc_1h * CACHE_WRITE_MULT_1H
     return (inp * pin
-            + cache_create * pin * CACHE_WRITE_MULT
+            + write * pin
             + cache_read * pin * CACHE_READ_MULT
             + out * pout) / 1_000_000
 
@@ -431,6 +463,8 @@ class Session:
         self.cost_partial = False
         self.cache_pct = 0
         self.cache_steps = []
+        self.cache_models = []
+        self.cache_events = []
         self.usage = {"input": 0, "cache_create": 0, "cache_read": 0, "output": 0, "total_in": 0}
         self.n_user = self.n_assistant = self.n_tools = 0
         self.out_html = ""
@@ -917,7 +951,8 @@ def _acc_turn_usage(acc, msg):
     o = usage_int(u, "output_tokens", "outputTokens")
     acc["input"] += i; acc["cache_create"] += c1; acc["cache_read"] += c2; acc["output"] += o
     acc["ctx_max"] = max(acc["ctx_max"], i + c1 + c2)
-    c = call_cost(msg.get("model"), i, c1, c2, o)
+    c5, c1h = _ephemeral_split(u)
+    c = call_cost(msg.get("model"), i, c1, c2, o, c5, c1h)
     if c is None:
         acc["unpriced"] = True
     else:
@@ -1037,7 +1072,7 @@ def analyze(s):
                     for b in g["blocks"] if b.get("type") == "tool_use")
     s.n_turns = len(s.main_groups) + len(s.side_groups)
     _collect_usage(s)
-    s.cache_steps = collect_cache_steps(s)
+    s.cache_steps, s.cache_models, s.cache_events = collect_cache_steps(s)
 
 
 def _collect_usage(s):
@@ -1073,7 +1108,8 @@ def _collect_usage(s):
         if not e.get("isSidechain") and (i + c1 + c2) > 0:
             resume_ctx = i + c1 + c2          # 主對話按時間在後者覆蓋前者 → 最終為最後一筆
             resume_model = mdl or resume_model
-        c = call_cost(mdl, i, c1, c2, o)
+        c5, c1h = _ephemeral_split(u)
+        c = call_cost(mdl, i, c1, c2, o, c5, c1h)
         if c is None:
             unpriced = True
         else:
@@ -1091,14 +1127,20 @@ def _collect_usage(s):
 
 
 def collect_cache_steps(s):
-    """主對話每次 assistant API 呼叫的時間序列 [[epoch, cache_read, 脈絡tokens], ...]（依時間排序、message.id 去重）。
-    存進 row、供 cache-report.html 統計「閒置多久快取會過期」與「平常都什麼時段重新暖機」。
+    """主對話每次 assistant API 呼叫的時間序列與快取邊界事件，供 cache-report 分析。回傳 (steps, models, events)：
+      steps  = [[epoch, cache_read, 脈絡tokens, 寫入總量, 寫入5分, 寫入1h, 模型idx], …]（依時間排序、
+               message.id 去重；寫入5分/1h 來自 usage.cache_creation 細分，舊資料無細分為 0；
+               模型idx 指向 models，未知 -1）
+      models = steps 用到的模型字串表（去重存一次，免每步重複存字串）
+      events = [[epoch, kind], …]，kind ∈ "limit"(429)／"auth"(401)／"compact"——快取邊界標記，
+               報告據此把其後第一步歸因為切帳號/登入/壓縮，而非 TTL 失效。
     存原始 cache_read（非預先四捨五入的命中率），冷啟判定才能精確、不會在門檻邊界因進位而誤分類。
     只取主對話：子代理有獨立的快取前綴，混進來會污染間隔判讀。
     Codex 略過：其 usage 只掛在某一筆事件、id 為合成，逐步序列不可靠（見 [[jsonl-transcript-format]]）。"""
     if s.source_kind == SOURCE_CODEX:
-        return []
+        return [], [], []
     steps, seen = [], set()
+    models, midx = [], {}
     evs = sorted((e for e in s.events
                   if e.get("type") == "assistant" and not e.get("isSidechain")),
                  key=ts_key)
@@ -1119,8 +1161,43 @@ def collect_cache_steps(s):
         dt = e.get("_dt")
         if total_in <= 0 or not dt:
             continue
-        steps.append([int(dt.timestamp()), c2, total_in])
-    return steps
+        c5, c1h = _ephemeral_split(u)
+        mdl = str(msg.get("model") or "")
+        if mdl and mdl not in midx:
+            midx[mdl] = len(models)
+            models.append(mdl)
+        steps.append([int(dt.timestamp()), c2, total_in, c1, c5, c1h, midx.get(mdl, -1)])
+    events = []
+    for e in s.events:
+        if e.get("isSidechain"):
+            continue
+        dt = e.get("_dt")
+        if not dt:
+            continue
+        kind = None
+        if e.get("isApiErrorMessage"):
+            status = str(e.get("apiErrorStatus") or "")
+            if status == "429":
+                kind = "limit"
+            elif status == "401":
+                kind = "auth"
+        elif e.get("type") == "system" and e.get("subtype") == "api_error":
+            # 重試迴圈的錯誤記錄：status 在 error.status。僅認證失效（401，之後要 /login／可能換帳號）
+            # 當快取邊界；5xx／逾時（status 常缺）是暫時性重試、快取未失效，不當邊界。實測無 429 此形態
+            #（plan limit 是上面的 isApiErrorMessage 終止形態）。
+            err = e.get("error")
+            status = str(err.get("status") or "") if isinstance(err, dict) else ""
+            if not status.isdigit():
+                m = re.search(r"""['"]?status['"]?\s*[:=]\s*(\d+)""", str(err or ""))
+                status = m.group(1) if m else ""
+            if status == "401":
+                kind = "auth"
+        elif e.get("type") == "system" and e.get("subtype") == "compact_boundary":
+            kind = "compact"
+        if kind:
+            events.append([int(dt.timestamp()), kind])
+    events.sort()
+    return steps, models, events
 
 
 def _step_cold(st):
@@ -2061,6 +2138,67 @@ def _gap_bucket_index(gap):
     return len(REPORT_GAP_BUCKETS) - 1
 
 
+def _wilson(k, n, z=1.96):
+    """二項比率的 Wilson 95% 信賴區間。回傳 (p, lo, hi)，皆 0..1；n=0 回 (0,0,0)。"""
+    if n <= 0:
+        return 0.0, 0.0, 0.0
+    p = k / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return p, max(0.0, center - half), min(1.0, center + half)
+
+
+def _ci_str(k, n):
+    """『xx%（CI a–b%）』字串；n=0 回 —。"""
+    if not n:
+        return "—"
+    p, lo, hi = _wilson(k, n)
+    return f"{round(100 * p)}%（CI {round(100 * lo)}–{round(100 * hi)}%）"
+
+
+def _cmh(strata):
+    """Cochran–Mantel–Haenszel 合併勝算比：分層 2×2 下比較兩組事件率（控制分層變數的混雜）。
+    每層 (a,b,c,d)＝(尖峰冷啟, 尖峰命中, 離峰冷啟, 離峰命中)。
+    回傳 {"or","lo","hi","p","n"}；資訊不足（任一方向無不一致樣本）回 None。
+    CI 用 Robins–Breslow–Greenland 變異數、p 用 CMH 卡方（連續性校正、1 自由度）——皆純 stdlib。"""
+    R = S = 0.0
+    num_rr = num_rs = num_ss = 0.0
+    a_sum = e_sum = v_sum = 0.0
+    total = 0
+    for a, b, c, d in strata:
+        n = a + b + c + d
+        if n < 2:
+            continue
+        total += n
+        r_i = a * d / n
+        s_i = b * c / n
+        p_i = (a + d) / n
+        q_i = (b + c) / n
+        R += r_i
+        S += s_i
+        num_rr += p_i * r_i
+        num_rs += p_i * s_i + q_i * r_i
+        num_ss += q_i * s_i
+        row1, col1 = a + b, a + c
+        a_sum += a
+        e_sum += row1 * col1 / n
+        v_sum += row1 * (n - row1) * col1 * (n - col1) / (n * n * (n - 1))
+    if R <= 0 or S <= 0 or v_sum <= 0:
+        return None
+    or_ = R / S
+    var_ln = num_rr / (2 * R * R) + num_rs / (2 * R * S) + num_ss / (2 * S * S)
+    half = 1.96 * math.sqrt(var_ln)
+    chi2 = max(abs(a_sum - e_sum) - 0.5, 0.0) ** 2 / v_sum
+    p = math.erfc(math.sqrt(chi2 / 2))
+    return {"or": or_, "lo": or_ * math.exp(-half), "hi": or_ * math.exp(half), "p": p, "n": total}
+
+
+_CAUSE_LABEL = {k: lbl for k, lbl, _ in REPORT_CAUSES}
+_CAUSE_DESC = {k: desc for k, _, desc in REPORT_CAUSES}
+_AVOIDABLE_CAUSES = ("expiry", "evict")   # 「可避免/異常」：非結構性、與閒置行為相關
+
+
 def _top_hours(counts, k=3):
     """取活躍時段（count>0）裡最高的 k 個小時，回傳由小到大排序的整數小時清單。"""
     active = sorted((h for h in range(24) if counts[h] > 0),
@@ -2079,136 +2217,244 @@ def _break_category(gap):
 
 
 def build_cache_report(rows):
-    """從各 session 的 cache_steps 彙整快取分析。回傳 dict（has_data=False 代表沒有可分析的資料）。
-    三條主線：
-      (A) 有效 TTL──同一 session 內相鄰步驟「間隔 vs 是否冷啟」分桶，看間隔多大後幾乎必冷啟。
-      (B) 重新暖機時段──各帳號活動時間軸上，閒置 ≥ REPORT_BREAK_SEC 後且確實冷啟的第一步＝
-          快取過期的「重新開工」，取本地時段做直方圖（平日／假日、含／不含 session 第一句分開），反映作息。
-      (C) 伺服器負載假設──同 (A) 的相鄰步驟，依 cur 的 UTC 小時看觀察帶內冷啟率，
-          測「全球尖峰是否較易過期」（跨帳號匯總；樣本受作息偏置，僅供探索）。"""
+    """從各 session 的 cache_steps／cache_events 彙整快取分析（v2）。回傳 dict（has_data=False 代表沒資料）。
+    四條主線：
+      (A) 成因分解──每個冷啟依 REPORT_CAUSES 優先序恰好歸一因；結構性成因（第一句/切帳號/換模型/壓縮）
+          的相鄰步 pair 不進 TTL 估計（競爭風險：它們死於別的原因，混入會污染 TTL 曲線）。
+      (B) TTL 存活──分桶命中率＋Wilson CI；cohort 依「最近一次有寫入的步」之 TTL 分
+          「1h／5m／未知(舊資料無細分)」——cur 讀的快取是那次寫入存的。
+          KPI「TTL 遵約率」＝1h cohort 在應命中帶 [REPORT_INTRA_SEC, REPORT_TTL_SAFE_SEC) 的命中率，
+          其補數＝「提早失效率」（1h 快取理論上帶內必命中；TTL 每次使用會刷新，gap＝距上次使用）。
+      (C) 重暖作息──各帳號時間軸閒置 ≥ REPORT_BREAK_SEC 後的冷啟，本地時段直方圖
+          （平日/假日 × 可避免/不可避免，正規化為 次/活躍日）。
+      (D) 尖峰假設──應命中帶內（1h cohort）依 UTC 分時看提早失效率；依 gap 分層做 CMH 勝算比＋卡方，
+          控制「午休/夜間本來就閒得久」的混雜。"""
     claude = [r for r in rows
               if r.get("source_kind", SOURCE_CLAUDE) == SOURCE_CLAUDE and r.get("cache_steps")]
     accounts = sorted({r.get("account", "") for r in claude})
+    cause_keys = [k for k, _, _ in REPORT_CAUSES]
 
-    # ── (A) TTL 存活：同 session 相鄰步驟 ──（順便累計 ③ 的 UTC 分時統計）
-    buckets = [{"label": lbl, "n": 0, "cold": 0} for _, lbl in REPORT_GAP_BUCKETS]
-    warm_max = 0          # 仍命中（warm）的最久間隔 → TTL 下界
-    warm_long = []        # (間隔秒, cur epoch)：間隔 ≥ 1 分卻仍命中的「例外」，供列出存活最久前幾名
-    # ③：依 cur 的 UTC 小時，只統計觀察帶 [5分,1時) 內的冷啟率＋帶內最久 warm；ts 留一筆代表時戳供換算本地
-    utc = [{"n": 0, "cold": 0, "warm": 0, "ts": 0} for _ in range(24)]
-    band_lo, band_hi = REPORT_TTL_BAND
-    n_pairs = 0
+    n_buckets = len(REPORT_GAP_BUCKETS)
+    cohort_bins = {c: [{"n": 0, "hit": 0} for _ in range(n_buckets)] for c in ("1h", "5m", "unknown")}
+    comply_n = comply_hit = 0                       # 1h cohort 應命中帶
+    utc = [{"n": 0, "cold": 0, "ts": 0} for _ in range(24)]
+    strata = [[0, 0, 0, 0] for _ in REPORT_CMH_STRATA]   # [尖峰冷, 尖峰命中, 離峰冷, 離峰命中]／gap 層
+    causes_total = {k: 0 for k in cause_keys}
+    cold_events = []                                # (epoch, cause)：供分期堆疊圖
+    warm_max = 0
+    top_warm = []                                   # (gap, epoch)：gap ≥ 1 小時仍命中的異常
+    n_pairs = neg_gaps = 0
+    avoid_usd = 0.0
+    avoid_partial = False
+    tok_read = tok_in = 0
+    mode_n = {"1h": 0, "5m": 0, "unknown": 0}       # 資料世代組成（步數）
+    timelines = {}                                  # account -> [(epoch, 冷啟, 成因 or None)]
+    all_ts = []
+    limit_ts = []                                   # 撞牆時刻（429；同 session 10 分內折疊為一次）
+
     for r in claude:
-        steps = sorted((st for st in r["cache_steps"] if st[2] >= REPORT_MIN_CTX),
-                       key=lambda st: st[0])
-        for prev, cur in zip(steps, steps[1:]):
+        raw = r["cache_steps"]
+        models = r.get("cache_models") or []
+        events = r.get("cache_events") or []
+        for st in raw:
+            tok_read += st[1]
+            tok_in += st[2]
+            mode_n["1h" if st[5] > 0 else ("5m" if st[4] > 0 else "unknown")] += 1
+        steps = [(i, st) for i, st in enumerate(raw) if st[2] >= REPORT_MIN_CTX]
+        last_lim = None
+        for t, kind in events:
+            if kind == "limit" and (last_lim is None or t - last_lim > 600):
+                limit_ts.append(t)
+                last_lim = t
+        cause_by_t = {}
+        if steps and steps[0][0] == 0 and _step_cold(steps[0][1]):   # 原始第 0 步＝session 第一句
+            t0 = steps[0][1][0]
+            causes_total["first"] += 1
+            cold_events.append((t0, "first"))
+            cause_by_t[t0] = "first"
+        ei, n_ev = 0, len(events)
+        last_write = None      # 最近一次有寫入的可分析步之 TTL（"1h"/"5m"）——cur 讀的快取以此為準；
+        for (_, prev), (_, cur) in zip(steps, steps[1:]):   # 舊資料無細分則一路 None → cohort=unknown
+            if prev[5] > 0:
+                last_write = "1h"
+            elif prev[4] > 0:
+                last_write = "5m"
             gap = cur[0] - prev[0]
             if gap < 0:
+                neg_gaps += 1
                 continue
-            cold = _step_cold(cur)
-            b = buckets[_gap_bucket_index(gap)]
-            b["n"] += 1
             n_pairs += 1
+            while ei < n_ev and events[ei][0] <= prev[0]:
+                ei += 1
+            kinds = set()
+            j = ei
+            while j < n_ev and events[j][0] <= cur[0]:
+                kinds.add(events[j][1])
+                j += 1
+            cold = _step_cold(cur)
+            boundary = ("switch" if ("limit" in kinds or "auth" in kinds) else
+                        "model" if (prev[6] >= 0 and cur[6] >= 0 and prev[6] != cur[6]) else
+                        "compact" if "compact" in kinds else None)
+            cohort = last_write or "unknown"
+            ttl_bound = REPORT_TTL_SAFE_SEC if cohort == "1h" else 5 * 60
             if cold:
-                b["cold"] += 1
-            else:
+                if boundary:
+                    cause = boundary
+                elif gap >= ttl_bound:
+                    cause = "expiry"
+                elif gap >= REPORT_INTRA_SEC:
+                    cause = "evict"
+                else:
+                    cause = "intra"
+                causes_total[cause] += 1
+                cold_events.append((cur[0], cause))
+                cause_by_t[cur[0]] = cause
+                if cause == "expiry":    # 可避免的重暖成本 ≈ 本步實際寫入成本 −（若命中）同量讀取成本
+                    mi = cur[6]
+                    price = model_price(models[mi]) if 0 <= mi < len(models) else None
+                    if price:            # 寫入依本步自己的 TTL 細分計價（同 call_cost 規則）
+                        legacy = max(cur[3] - cur[4] - cur[5], 0)
+                        write = (legacy + cur[4]) * CACHE_WRITE_MULT + cur[5] * CACHE_WRITE_MULT_1H
+                        avoid_usd += (write - cur[3] * CACHE_READ_MULT) * price[0] / 1_000_000
+                    else:
+                        avoid_partial = True
+            if boundary:
+                # 結構性成因：不進 TTL 存活／帶內統計（競爭風險）。並重置快取 lineage——
+                # 切帳號/換模型/壓縮後是全新前綴，邊界前的寫入 TTL 不再適用；
+                # 新 lineage 的 TTL 由邊界後第一個有寫入的步重新建立（其前皆視為 unknown）。
+                last_write = None
+                continue
+            cb = cohort_bins[cohort][_gap_bucket_index(gap)]
+            cb["n"] += 1
+            if not cold:
+                cb["hit"] += 1
                 if gap > warm_max:
                     warm_max = gap
-                if gap >= 60:
-                    warm_long.append((gap, cur[0]))
-            if band_lo <= gap < band_hi:        # ③ 只看觀察帶內的相鄰步驟
-                uh = datetime.fromtimestamp(cur[0], timezone.utc).hour   # 伺服器時間（負載與本地時區無關）
+                if gap >= 3600:          # 1h TTL＋每次使用刷新之下，gap>1h 仍命中＝異常，列出供對照
+                    top_warm.append((gap, cur[0]))
+            if cohort == "1h" and REPORT_INTRA_SEC <= gap < REPORT_TTL_SAFE_SEC:
+                comply_n += 1
+                if not cold:
+                    comply_hit += 1
+                uh = datetime.fromtimestamp(cur[0], timezone.utc).hour   # 伺服器時間（與本地時區無關）
                 u = utc[uh]
                 u["n"] += 1
                 u["ts"] = cur[0]
                 if cold:
                     u["cold"] += 1
-                elif gap > u["warm"]:
-                    u["warm"] = gap
-    top_warm = sorted(warm_long, reverse=True)[:6]
-    peak_n = sum(utc[h]["n"] for h in REPORT_PEAK_UTC)
-    peak_c = sum(utc[h]["cold"] for h in REPORT_PEAK_UTC)
-    off_n = sum(utc[h]["n"] for h in range(24) if h not in REPORT_PEAK_UTC)
-    off_c = sum(utc[h]["cold"] for h in range(24) if h not in REPORT_PEAK_UTC)
-    # 「超過約多久幾乎必冷啟」：從間隔 ≥ 1 分的桶往大找第一個冷啟率高（樣本夠）的桶下界
-    expire_gap = None
-    for i in range(len(REPORT_GAP_BUCKETS)):
-        lo = REPORT_GAP_BUCKETS[i - 1][0] if i else 0
-        if lo < 60:           # 跳過 < 1 分（回合內連續呼叫、快取斷點雜訊）
-            continue
-        b = buckets[i]
-        if b["n"] >= 3 and b["cold"] / b["n"] >= 0.8:
-            expire_gap = lo
-            break
+                si = 0
+                while si < len(REPORT_CMH_STRATA) - 1 and gap >= REPORT_CMH_STRATA[si]:
+                    si += 1
+                col = 0 if uh in REPORT_PEAK_UTC else 2
+                strata[si][col + (0 if cold else 1)] += 1
+        acct = r.get("account", "")
+        tl = timelines.setdefault(acct, [])
+        for _, st in steps:
+            tl.append((st[0], _step_cold(st), cause_by_t.get(st[0])))
+        all_ts.extend(st[0] for _, st in steps)
 
-    # ── (B) 重新暖機時段：各帳號時間軸上 ≥ REPORT_BREAK_SEC 的閒置後第一步 ──
-    # 每步標記「是否為其 session 的第一步」：session 第一句的冷啟避不掉（全新前綴），
-    # 之後才中斷的冷啟才是「可避免」（沒閒置過久就能續用快取）→ 兩者分開做圖。
-    resumes = []          # 每個 = {"hour","weekend","gap","date","first":bool}
-    all_ts = []
-    for acc in accounts:
-        timeline = []     # (epoch, 是否為該 session 第一步, 是否冷啟)
-        for r in claude:
-            if r.get("account", "") != acc:
-                continue
-            qs = sorted((st[0], _step_cold(st)) for st in r["cache_steps"] if st[2] >= REPORT_MIN_CTX)
-            for i, (t, cold) in enumerate(qs):
-                timeline.append((t, i == 0, cold))
-        timeline.sort()
-        all_ts.extend(t for t, _, _ in timeline)
-        for (pt, _, _), (ct, cfirst, ccold) in zip(timeline, timeline[1:]):
+    # ── (C) 重暖作息：各帳號時間軸上 ≥ REPORT_BREAK_SEC 的閒置後、確實冷啟的第一步 ──
+    resumes = []
+    for tl in timelines.values():
+        tl.sort()
+        for (pt, _, _), (ct, ccold, ccause) in zip(tl, tl[1:]):
             gap = ct - pt
-            if gap < REPORT_BREAK_SEC:
+            if gap < REPORT_BREAK_SEC or not ccold:   # 閒置夠久卻仍命中（1h 快取還活著）→ 不算重暖
                 continue
-            if not ccold:      # 閒置夠久卻仍命中（撞到 1 小時快取）→ 沒過期，不算重新暖機
-                continue
-            loc = datetime.fromtimestamp(ct)         # epoch → 本地時間
-            resumes.append({"hour": loc.hour, "weekend": loc.weekday() >= 5,
-                            "gap": gap, "date": loc.strftime("%Y-%m-%d"), "first": cfirst})
-
-    wd_all, we_all = [0] * 24, [0] * 24      # 含 session 第一句
-    wd_mid, we_mid = [0] * 24, [0] * 24      # 不含 session 第一句（mid-session＝可避免）
-    wd_dates, we_dates = set(), set()
+            loc = datetime.fromtimestamp(ct)
+            resumes.append({"hour": loc.hour, "weekend": loc.weekday() >= 5, "gap": gap,
+                            "avoid": ccause in _AVOIDABLE_CAUSES})
+    wd = [{"a": 0, "u": 0} for _ in range(24)]
+    we = [{"a": 0, "u": 0} for _ in range(24)]
     break_cats = {}
     for ev in resumes:
-        we = ev["weekend"]
-        (we_all if we else wd_all)[ev["hour"]] += 1
-        if not ev["first"]:
-            (we_mid if we else wd_mid)[ev["hour"]] += 1
-        (we_dates if we else wd_dates).add(ev["date"])
+        (we if ev["weekend"] else wd)[ev["hour"]]["a" if ev["avoid"] else "u"] += 1
         cat = _break_category(ev["gap"])
         break_cats[cat] = break_cats.get(cat, 0) + 1
+    act_wd, act_we = set(), set()                    # 活躍日數（有任何步驟的日子），供 次/日 正規化
+    for t in all_ts:
+        loc = datetime.fromtimestamp(t)
+        (act_we if loc.weekday() >= 5 else act_wd).add(loc.strftime("%Y-%m-%d"))
+
+    # ── 分期成因堆疊：預設按週（週一起算）；期間太長改按月 ──
+    periods = []
+    if cold_events:
+        cold_events.sort()
+        grp = {}
+        for t, cause in cold_events:
+            loc = datetime.fromtimestamp(t)
+            monday = loc - timedelta(days=loc.weekday())
+            grp.setdefault(monday.strftime("%Y-%m-%d"), {k: 0 for k in cause_keys})[cause] += 1
+        if len(grp) > 16:
+            grp = {}
+            for t, cause in cold_events:
+                grp.setdefault(datetime.fromtimestamp(t).strftime("%Y-%m"),
+                               {k: 0 for k in cause_keys})[cause] += 1
+            periods = [{"label": k, "counts": v} for k, v in sorted(grp.items())]
+        else:
+            periods = [{"label": f"{k[5:].replace('-', '/')} 週", "counts": v}
+                       for k, v in sorted(grp.items())]
 
     span = ""
+    span_weeks = 1.0
     if all_ts:
-        lo = datetime.fromtimestamp(min(all_ts)).strftime("%Y-%m-%d")
-        hi = datetime.fromtimestamp(max(all_ts)).strftime("%Y-%m-%d")
-        span = lo if lo == hi else f"{lo} ～ {hi}"
+        lo_t, hi_t = min(all_ts), max(all_ts)
+        lo_s = datetime.fromtimestamp(lo_t).strftime("%Y-%m-%d")
+        hi_s = datetime.fromtimestamp(hi_t).strftime("%Y-%m-%d")
+        span = lo_s if lo_s == hi_s else f"{lo_s} ～ {hi_s}"
+        span_weeks = max((hi_t - lo_t) / 86400 / 7, 1 / 7)
+
+    cmh = _cmh([tuple(sx) for sx in strata])
+    peak_n = sum(sx[0] + sx[1] for sx in strata)
+    peak_c = sum(sx[0] for sx in strata)
+    off_n = sum(sx[2] + sx[3] for sx in strata)
+    off_c = sum(sx[2] for sx in strata)
+
+    lim_hours = [0] * 24
+    lim_wd = lim_we = 0
+    for t in limit_ts:
+        loc = datetime.fromtimestamp(t)
+        lim_hours[loc.hour] += 1
+        if loc.weekday() >= 5:
+            lim_we += 1
+        else:
+            lim_wd += 1
 
     return {
-        "has_data": bool(n_pairs or resumes),
+        "has_data": bool(n_pairs or cold_events or resumes),
         "accounts": accounts,
         "n_sessions": len(claude),
         "span": span,
-        # (A)
-        "buckets": buckets,
+        "span_weeks": span_weeks,
+        "mode_n": mode_n,
+        "kpi": {
+            "hit": (tok_read / tok_in) if tok_in else 0.0,
+            "tok_in": tok_in,
+            "comply_n": comply_n, "comply_hit": comply_hit,
+            "avoid_usd": avoid_usd, "avoid_partial": avoid_partial,
+            "avoid_week": causes_total["expiry"] / span_weeks,
+        },
+        # (B) 存活
+        "cohort_bins": cohort_bins,
         "n_pairs": n_pairs,
         "warm_max": warm_max,
-        "expire_gap": expire_gap,
-        "top_warm": top_warm,
-        # (B)
-        "resumes": len(resumes),
-        "wd_all": wd_all, "we_all": we_all,
-        "wd_mid": wd_mid, "we_mid": we_mid,
-        "n_wd": sum(wd_all), "n_we": sum(we_all),
-        "n_wd_mid": sum(wd_mid), "n_we_mid": sum(we_mid),
-        "wd_days": len(wd_dates), "we_days": len(we_dates),
-        "top_wd": _top_hours(wd_all), "top_we": _top_hours(we_all),
-        "top_wd_mid": _top_hours(wd_mid), "top_we_mid": _top_hours(we_mid),
+        "top_warm": sorted(top_warm, reverse=True)[:6],
+        # (A) 成因
+        "causes_total": causes_total,
+        "cause_periods": periods,
+        # (C) 作息
+        "clock_wd": wd, "clock_we": we,
+        "wd_days": len(act_wd), "we_days": len(act_we),
+        "n_resumes": len(resumes),
         "break_cats": break_cats,
-        # (C) 伺服器負載假設
+        # (D) 尖峰假設
         "utc": utc,
+        "cmh": cmh,
         "peak_n": peak_n, "peak_c": peak_c, "off_n": off_n, "off_c": off_c,
+        # 撞牆時刻與資料品質
+        "limits_n": len(limit_ts), "limit_hours": lim_hours,
+        "limits_wd": lim_wd, "limits_we": lim_we,
+        "neg_gaps": neg_gaps,
     }
 
 
@@ -2222,17 +2468,140 @@ def _active_hours(series):
     return (lo, hi) if hi >= 0 else (8, 18)
 
 
-def _hour_chart_html(counts, mx, lo, hi):
-    """時段直方圖（橫條，依傳入的 mx 正規化好讓同組圖共用刻度；只畫 lo..hi 小時）。"""
+def _pct(x, digits=0):
+    return f"{100 * x:.{digits}f}%"
+
+
+def _hour_chart2(cells, days, mx, lo, hi):
+    """時段圖（每列一小時）：bar 分兩段＝可避免（實色）＋不可避免（同色調淡），
+    寬度＝次/活躍日、依傳入 mx 正規化讓平日/假日共用刻度；只畫 lo..hi 小時。"""
     mx = mx or 1
+    days = days or 1
     rows = []
     for h in range(lo, hi + 1):
-        c = counts[h]
-        w = max(3, round(200 * c / mx)) if c else 0
-        rows.append(f'<div class="hrow"><span class="hh">{h:02d} 時</span>'
-                    f'<span class="hbar" style="width:{w}px"></span>'
-                    f'<span class="hn">{c or ""}</span></div>')
+        a, u = cells[h]["a"], cells[h]["u"]
+        wa = max(3, round(200 * (a / days) / mx)) if a else 0
+        wu = max(3, round(200 * (u / days) / mx)) if u else 0
+        rows.append(
+            f'<div class="hrow"><span class="hh">{h:02d} 時</span>'
+            f'<span class="hbarwrap">'
+            f'<span class="hseg a" style="width:{wa}px" title="可避免（閒置過期/提早失效）：{a} 次"></span>'
+            f'<span class="hseg u" style="width:{wu}px" title="不可避免（第一句/切帳號/換模型/壓縮）：{u} 次"></span>'
+            f'</span><span class="hn">{(a + u) or ""}</span></div>')
     return "".join(rows)
+
+
+def _cause_bars_html(periods):
+    """分期成因堆疊橫條：列寬∝該期冷啟總數（跨期可比），列內按成因比例分段（2px 底色縫）。"""
+    mx = max((sum(p["counts"].values()) for p in periods), default=0) or 1
+    rows = []
+    for p in periods:
+        total = sum(p["counts"].values())
+        segs = "".join(
+            f'<span class="cseg cz-{k}" style="flex:{p["counts"][k]}"'
+            f' title="{esc(_CAUSE_LABEL[k])}：{p["counts"][k]} 次"></span>'
+            for k, _, _ in REPORT_CAUSES if p["counts"].get(k))
+        w = max(4, round(100 * total / mx))
+        rows.append(f'<div class="crow"><span class="clab">{esc(p["label"])}</span>'
+                    f'<span class="cbar" style="width:{w}%">{segs}</span>'
+                    f'<span class="hn">{total}</span></div>')
+    return "".join(rows)
+
+
+def _cause_legend_html(counts):
+    return ('<div class="legend">' + "".join(
+        f'<span><span class="sw cz-{k}"></span>{esc(lbl)}　<span class="hn">{counts.get(k, 0)}</span></span>'
+        for k, lbl, _ in REPORT_CAUSES) + "</div>")
+
+
+_GAP_X_MIN, _GAP_X_MAX = 30.0, 24 * 3600.0     # 存活曲線 x 軸（秒，log 尺度）
+
+
+def _bucket_mid(i):
+    """第 i 個間隔桶的幾何中點（曲線 x 座標）。"""
+    lo = REPORT_GAP_BUCKETS[i - 1][0] if i else _GAP_X_MIN
+    hi = REPORT_GAP_BUCKETS[i][0]
+    if hi == float("inf"):
+        hi = _GAP_X_MAX
+    return math.sqrt(max(lo, _GAP_X_MIN) * hi)
+
+
+def _svg_survival(cohorts):
+    """TTL 存活曲線：命中率 vs 閒置間隔（log x）折線＋Wilson CI 帶；5 分／1 時參考線。
+    cohorts=[{"label","css","bins":[(n,hit)…依 REPORT_GAP_BUCKETS]}]，空桶跳過。"""
+    W, H, L, R, T, B = 660, 250, 46, 14, 14, 40
+    x0, x1 = math.log(_GAP_X_MIN), math.log(_GAP_X_MAX)
+
+    def X(v):
+        return L + (math.log(min(max(v, _GAP_X_MIN), _GAP_X_MAX)) - x0) / (x1 - x0) * (W - L - R)
+
+    def Y(p):
+        return T + (1 - p) * (H - T - B)
+
+    parts = [f'<svg class="viz" viewBox="0 0 {W} {H}" role="img" aria-label="快取命中率對閒置間隔">']
+    for frac in (0, .25, .5, .75, 1):
+        y = Y(frac)
+        parts.append(f'<line x1="{L}" y1="{y:.1f}" x2="{W - R}" y2="{y:.1f}" class="grid"/>')
+        parts.append(f'<text x="{L - 6}" y="{y + 4:.1f}" text-anchor="end">{round(frac * 100)}%</text>')
+    for sec, lab in ((60, "1 分"), (300, "5 分"), (900, "15 分"), (3600, "1 時"), (6 * 3600, "6 時")):
+        x = X(sec)
+        cls = "guide" if sec in (300, 3600) else "grid"
+        parts.append(f'<line x1="{x:.1f}" y1="{T}" x2="{x:.1f}" y2="{H - B}" class="{cls}"/>')
+        parts.append(f'<text x="{x:.1f}" y="{H - B + 16}" text-anchor="middle">{lab}</text>')
+    for co in cohorts:
+        pts = []
+        for i, (n, hit) in enumerate(co["bins"]):
+            if not n:
+                continue
+            p, lo, hi = _wilson(hit, n)
+            pts.append((X(_bucket_mid(i)), p, lo, hi, n, hit, i))
+        if not pts:
+            continue
+        band = " ".join(f"{x:.1f},{Y(hi):.1f}" for x, _, _, hi, *_ in pts)
+        band += " " + " ".join(f"{x:.1f},{Y(lo):.1f}" for x, _, lo, *_ in reversed(pts))
+        parts.append(f'<polygon points="{band}" class="band {co["css"]}"/>')
+        line = " ".join(f"{x:.1f},{Y(p):.1f}" for x, p, *_ in pts)
+        parts.append(f'<polyline points="{line}" class="curve {co["css"]}"/>')
+        for x, p, lo, hi, n, hit, i in pts:
+            parts.append(
+                f'<circle cx="{x:.1f}" cy="{Y(p):.1f}" r="4.5" class="dot {co["css"]}">'
+                f'<title>{esc(co["label"])}｜{esc(REPORT_GAP_BUCKETS[i][1])}：命中 {hit}/{n}（{_ci_str(hit, n)}）</title>'
+                f'</circle>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _svg_dotplot(rows):
+    """各 UTC 小時的帶內提早失效率：點＋Wilson CI whisker；尖峰帶（13–21 UTC）淡底標示。
+    rows=[{"h","n","cold","local"}]，僅含 n>0 的小時。"""
+    RH, W, L, R, TOP = 24, 660, 132, 52, 26
+    H = TOP + RH * len(rows) + 8
+
+    def X(p):
+        return L + p * (W - L - R)
+
+    parts = [f'<svg class="viz" viewBox="0 0 {W} {H}" role="img" aria-label="各 UTC 小時的提早失效率">']
+    for ri, row in enumerate(rows):        # 先鋪尖峰底色，再畫格線與點
+        if row["h"] in REPORT_PEAK_UTC:
+            y = TOP + RH * ri
+            parts.append(f'<rect x="{L}" y="{y:.1f}" width="{W - L - R}" height="{RH}" class="peak"/>')
+    for frac in (0, .25, .5, .75, 1):
+        x = X(frac)
+        parts.append(f'<line x1="{x:.1f}" y1="{TOP - 4}" x2="{x:.1f}" y2="{H - 6}" class="grid"/>')
+        parts.append(f'<text x="{x:.1f}" y="{TOP - 8}" text-anchor="middle">{round(frac * 100)}%</text>')
+    for ri, row in enumerate(rows):
+        y = TOP + RH * ri + RH / 2
+        p, lo, hi = _wilson(row["cold"], row["n"])
+        peak = "🔺" if row["h"] in REPORT_PEAK_UTC else ""
+        parts.append(f'<text x="{L - 8}" y="{y + 4:.1f}" text-anchor="end">'
+                     f'{row["h"]:02d} UTC｜本地≈{esc(row["local"])}{peak}</text>')
+        parts.append(f'<line x1="{X(lo):.1f}" y1="{y:.1f}" x2="{X(hi):.1f}" y2="{y:.1f}" class="whisk"/>')
+        parts.append(f'<circle cx="{X(p):.1f}" cy="{y:.1f}" r="5" class="dot co-evict">'
+                     f'<title>{row["h"]:02d} UTC：帶內冷啟 {row["cold"]}/{row["n"]}（{_ci_str(row["cold"], row["n"])}）</title>'
+                     f'</circle>')
+        parts.append(f'<text x="{W - R + 6}" y="{y + 4:.1f}">n={row["n"]}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 def _hours_label(hours):
@@ -2246,208 +2615,317 @@ def render_cache_report_html(d) -> str:
     parts.append('<div class="topbar"><span><a class="back" href="index.html">← 回索引</a></span></div>')
     parts.append("<h1>⚡ 快取分析報告</h1>")
     parts.append(
-        '<div class="lead">用每次 API 呼叫的快取命中率＋時間間隔，反推「閒置多久快取會過期」、'
-        '「你平常都在什麼時段重新暖機（冷啟動）」，並試驗「過期是否跟伺服器時段有關」。'
-        '僅統計 Claude 主對話（子代理／Codex 不納入）。'
-        '官方宣稱 prompt cache TTL 約 5 分鐘——以下用你的實際紀錄檢驗。</div>')
-    cover = [f"{d['n_sessions']} 個 session"]
+        '<div class="lead">用每次 API 呼叫的 usage（含 cache_creation 的 5 分／1 小時 TTL 細分）量測：'
+        '快取實際能撐多久、每個冷啟（整段重新暖機）是什麼成因、以及「1 小時內就失效」的異常有多常見。'
+        '僅統計 Claude 主對話（子代理／Codex 不納入）；所有比率附 Wilson 95% 信賴區間（CI）。</div>')
+    cover = [f"{d['n_sessions']} 個 session", f"{d['n_pairs']} 個相鄰步樣本"]
     if d["span"]:
         cover.append(d["span"])
     if d["accounts"]:
         cover.append("帳號：" + "、".join(a or "default" for a in d["accounts"]))
+    m = d["mode_n"]
+    if m["1h"] or m["5m"]:
+        gen = f"TTL 細分：1h 寫入 {m['1h']} 步"
+        if m["5m"]:
+            gen += f"、5 分 {m['5m']} 步"
+        if m["unknown"]:
+            gen += f"、未知（舊資料）{m['unknown']} 步"
+        cover.append(gen)
     parts.append(f'<div class="lead">涵蓋範圍：{esc(" · ".join(cover))}</div>')
 
-    # ── (A) 有效 TTL ──
-    parts.append("<h2>① 快取能撐多久（有效 TTL）</h2>")
+    # ── KPI 列 ──
+    k = d["kpi"]
+    tiles = [("整體命中率", _pct(k["hit"]) if k["tok_in"] else "—", "token 加權：讀取 ÷ 全部脈絡")]
+    if k["comply_n"]:
+        p, lo, hi = _wilson(k["comply_hit"], k["comply_n"])
+        tiles.append(("TTL 遵約率", _pct(p),
+                      f"1h 快取、閒置 2–55 分內回來仍命中；CI {_pct(lo)}–{_pct(hi)}，n={k['comply_n']}"))
+        tiles.append(("提早失效", f"{k['comply_n'] - k['comply_hit']} 次",
+                      f"應命中帶內卻冷啟＝{_pct(1 - p)}（1h TTL 下理論上應為 0）"))
+    tiles.append(("可避免冷啟", f"{d['causes_total']['expiry']} 次",
+                  f"閒置過期；約 {k['avoid_week']:.1f} 次/週"))
+    tiles.append(("可避免浪費", fmt_money(k["avoid_usd"]) + ("+?" if k["avoid_partial"] else ""),
+                  "過期重暖的估算額外成本（重寫 −0.1× 讀取）"))
+    parts.append('<div class="kpis">' + "".join(
+        f'<div class="kpi"><div class="kv2">{esc(v)}</div><div class="kl">{esc(t)}</div>'
+        f'<div class="ks">{esc(s)}</div></div>' for t, v, s in tiles) + "</div>")
+
+    # ── ① TTL 存活曲線 ──
+    parts.append("<h2>① 快取能撐多久（TTL 存活曲線）</h2>")
     ins = []
+    if k["comply_n"]:
+        p, lo, hi = _wilson(k["comply_hit"], k["comply_n"])
+        ins.append(f"1 小時快取在「應命中帶」（閒置 2–55 分）的命中率 <b>{_pct(p)}</b>"
+                   f"（CI {_pct(lo)}–{_pct(hi)}，n={k['comply_n']}）——距 100% 的缺口就是「提早失效」。")
     if d["warm_max"]:
-        ins.append(f"紀錄中閒置最久仍命中快取：<b>{fmt_dur(d['warm_max'])}</b>"
-                   + ("（已超過官方 5 分鐘）" if d["warm_max"] > 5 * 60 else "") + "。")
-    if d["expire_gap"]:
-        ins.append(f"間隔一旦超過約 <b>{fmt_dur(d['expire_gap'])}</b>，多半就得冷啟（整段重新暖機）"
-                   "——但仍有例外（見下方「存活最久」）。")
-    else:
-        ins.append("目前樣本還不足以判定明確的過期上限（長間隔相鄰步驟太少）。")
+        ins.append(f"閒置最久仍命中：<b>{fmt_dur(d['warm_max'])}</b>。")
+    if not ins:
+        ins.append("尚無足夠的相鄰步樣本。")
     parts.append(f'<div class="insight">{"".join(ins)}</div>')
-    parts.append('<table class="rep"><thead><tr><th>閒置間隔</th><th class="num">樣本</th>'
-                 '<th>下一步冷啟比例</th></tr></thead><tbody>')
-    for b in d["buckets"]:
-        if not b["n"]:
-            parts.append(f'<tr><td>{esc(b["label"])}</td><td class="num">0</td><td>—</td></tr>')
-            continue
-        rate = b["cold"] / b["n"]
-        w = round(180 * rate)
-        parts.append(
-            f'<tr><td>{esc(b["label"])}</td><td class="num">{b["n"]}</td>'
-            f'<td><span class="coldbar" style="width:{w}px"></span>{round(100 * rate)}%'
-            f' <span class="hn">({b["cold"]}/{b["n"]})</span></td></tr>')
-    parts.append("</tbody></table>")
-    parts.append('<div class="lead">「&lt; 1 分」那桶多為同一回合連續呼叫，'
-                 '其冷啟多半是回合內快取斷點的一次性 miss，不代表 TTL；看大間隔那幾桶才準。</div>')
-    parts.append('<div class="lead">為何超過 1 小時仍可能命中？Claude Code 對不同前綴會用'
-                 '<b>5 分鐘</b>或<b>1 小時</b>兩種快取 TTL，命中 1 小時版的就能撐很久——'
-                 '所以「過期上限」不是一刀切。</div>')
+    cohort_defs = [("1h", "1h 寫入", "co-1h"), ("5m", "5 分寫入", "co-5m"), ("unknown", "TTL 未知（舊資料）", "co-unk")]
+    cohorts = [{"label": lbl, "css": css, "bins": [(b["n"], b["hit"]) for b in d["cohort_bins"][key]]}
+               for key, lbl, css in cohort_defs if any(b["n"] for b in d["cohort_bins"][key])]
+    if cohorts:
+        parts.append(_svg_survival(cohorts))
+        if len(cohorts) > 1:
+            parts.append('<div class="legend">' + "".join(
+                f'<span><span class="sw {c["css"]}"></span>{esc(c["label"])}</span>' for c in cohorts) + "</div>")
+        parts.append('<div class="lead">結構性冷啟（session 第一句／切帳號／換模型／壓縮後）已從曲線樣本排除'
+                     '（它們不是 TTL 造成的）；「&lt; 1 分」桶的 miss 多為回合內快取斷點雜訊。'
+                     'TTL 每次使用會刷新，故 x 軸＝距上一次使用的閒置時間。</div>')
+        head = "".join(f'<th colspan="2">{esc(c["label"])}</th>' for c in cohorts)
+        sub = "".join('<th class="num">樣本</th><th>命中率（CI）</th>' for _ in cohorts)
+        rows = []
+        for i, (_, lbl) in enumerate(REPORT_GAP_BUCKETS):
+            cells = ""
+            row_n = 0
+            for c in cohorts:
+                n, hit = c["bins"][i]
+                row_n += n
+                cells += (f'<td class="num">{n or "—"}</td><td>{_ci_str(hit, n) if n else "—"}</td>')
+            if row_n:
+                rows.append(f"<tr><td>{esc(lbl)}</td>{cells}</tr>")
+        parts.append(f'<table class="rep"><thead><tr><th rowspan="2">閒置間隔</th>{head}</tr>'
+                     f"<tr>{sub}</tr></thead><tbody>{''.join(rows)}</tbody></table>")
     if d["top_warm"]:
         items = "".join(
             f'<div class="kv"><b>{fmt_dur(g)}</b> 後仍命中　'
             f'<span class="hn">{esc(datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M"))}</span></div>'
             for g, ts in d["top_warm"])
-        parts.append(f'<h3>存活最久的命中（超乎一般預期的例外）</h3>{items}')
+        parts.append("<h3>異常存活（閒置超過 1 小時仍命中）</h3>"
+                     '<div class="lead">1h TTL＋每次使用刷新之下理論上不該發生；可能是量測空窗內'
+                     "另有同前綴使用（分支/重試）或時鐘偏移，列出供對照。</div>" + items)
 
-    # ── (B) 重新暖機時段 ──
-    parts.append("<h2>② 你都什麼時段重新暖機（冷啟動作息）</h2>")
-    parts.append(f'<div class="lead">把各帳號活動軸上「閒置 ≥ {fmt_dur(REPORT_BREAK_SEC)} 後、'
-                 "且該步確實冷啟（命中率&lt;25%）的第一步」當成一次快取過期後的重新開工，共 "
-                 f"<b>{d['resumes']}</b> 次（撞到 1 小時快取仍命中者不算）。"
-                 "下面分「含／不含 session 第一句」兩組：第一句的冷啟避不掉"
-                 "（全新前綴），<b>不含第一句的才是可避免的</b>（沒閒置過久就能續用快取）。</div>")
-    ins2 = []
-    if d["n_wd"]:
-        avg = d["n_wd"] / d["wd_days"] if d["wd_days"] else 0
-        ins2.append(f"平日 <b>{d['n_wd']}</b> 次／{d['wd_days']} 天（每天約 {avg:.1f} 次），"
-                    f"最常在 <b>{_hours_label(d['top_wd'])}</b>前後（通常是上班開工與午休後第一次）；"
-                    f"其中「可避免」（非第一句）<b>{d['n_wd_mid']}</b> 次，集中在 {_hours_label(d['top_wd_mid'])}。")
-    if d["n_we"]:
-        avg = d["n_we"] / d["we_days"] if d["we_days"] else 0
-        ins2.append(f"假日 <b>{d['n_we']}</b> 次／{d['we_days']} 天（每天約 {avg:.1f} 次），"
-                    f"最常在 <b>{_hours_label(d['top_we'])}</b>前後；可避免 <b>{d['n_we_mid']}</b> 次。")
-    if not ins2:
-        ins2.append("尚無足夠的長閒置事件可分析。")
-    parts.append(f'<div class="insight">{"".join(ins2)}</div>')
+    # ── ② 冷啟成因分解 ──
+    parts.append("<h2>② 冷啟成因分解</h2>")
+    total_cold = sum(d["causes_total"].values())
+    if total_cold:
+        ct = d["causes_total"]
+        avoid = ct["expiry"] + ct["evict"]
+        struct = ct["first"] + ct["switch"] + ct["model"] + ct["compact"]
+        ins2 = (f"共 <b>{total_cold}</b> 次冷啟：結構性（避不掉）<b>{struct}</b>、"
+                f"可避免/異常 <b>{avoid}</b>（閒置過期 {ct['expiry']}＋提早失效 {ct['evict']}）、"
+                f"回合內雜訊 {ct['intra']}。")
+        if ct["switch"]:
+            ins2 += f"「limit/切帳號」{ct['switch']} 次已自動偵測（429/401 邊界），不會污染 TTL 統計。"
+        parts.append(f'<div class="insight">{ins2}</div>')
+        parts.append(_cause_legend_html(ct))
+        if d["cause_periods"]:
+            parts.append('<div class="causes">' + _cause_bars_html(d["cause_periods"]) + "</div>")
+        rows = "".join(f"<tr><td><span class='sw cz-{key}'></span>{esc(lbl)}</td>"
+                       f"<td class='num'>{d['causes_total'][key]}</td><td class='hn'>{esc(desc)}</td></tr>"
+                       for key, lbl, desc in REPORT_CAUSES)
+        parts.append('<table class="rep"><thead><tr><th>成因</th><th class="num">次數</th>'
+                     f"<th>說明</th></tr></thead><tbody>{rows}</tbody></table>")
+    else:
+        parts.append('<div class="insight">期間內沒有冷啟。</div>')
 
-    lo, hi = _active_hours([d["wd_all"], d["we_all"], d["wd_mid"], d["we_mid"]])
-    mx_wd, mx_we = max(d["wd_all"]) or 1, max(d["we_all"]) or 1   # 同組（平日/假日）的含與不含共用刻度
-
-    def chart(title, counts, mx, we=False):
-        cls = "chart we" if we else "chart"
-        return (f'<div class="{cls}"><h4>{esc(title)}（{sum(counts)} 次）</h4>'
-                f'{_hour_chart_html(counts, mx, lo, hi)}</div>')
-
-    parts.append("<h3>含每個 session 第一句（整體重新開工節奏）</h3>")
+    # ── ③ 重暖作息 ──
+    parts.append("<h2>③ 你都什麼時段重新暖機（冷啟作息）</h2>")
+    n_res = d["n_resumes"]
+    parts.append(f'<div class="lead">各帳號活動軸上「閒置 ≥ {fmt_dur(REPORT_BREAK_SEC)} 後、確實冷啟的第一步」'
+                 f"＝一次重新開工，共 <b>{n_res}</b> 次（閒置夠久卻仍命中 1h 快取者不算）。"
+                 "bar 分兩段：<b>實色＝可避免</b>（閒置過期/提早失效——早點回來或先 ping 就能省）、"
+                 "淡色＝不可避免（session 第一句/切帳號/換模型/壓縮）。已正規化為「次/活躍日」，平日假日可直接比。</div>")
+    wd_tot = [c["a"] + c["u"] for c in d["clock_wd"]]
+    we_tot = [c["a"] + c["u"] for c in d["clock_we"]]
+    ins3 = []
+    if sum(wd_tot):
+        avg = sum(wd_tot) / d["wd_days"] if d["wd_days"] else 0
+        ins3.append(f"平日 <b>{sum(wd_tot)}</b> 次／{d['wd_days']} 個活躍日（{avg:.1f} 次/日），"
+                    f"集中在 <b>{_hours_label(_top_hours(wd_tot))}</b>；")
+    if sum(we_tot):
+        avg = sum(we_tot) / d["we_days"] if d["we_days"] else 0
+        ins3.append(f"假日 <b>{sum(we_tot)}</b> 次／{d['we_days']} 個活躍日（{avg:.1f} 次/日），"
+                    f"集中在 <b>{_hours_label(_top_hours(we_tot))}</b>。")
+    if ins3:
+        parts.append(f'<div class="insight">{"".join(ins3)}</div>')
+    lo_h, hi_h = _active_hours([wd_tot, we_tot])
+    mx = max([(wd_tot[h] / d["wd_days"]) if d["wd_days"] else 0 for h in range(24)] +
+             [(we_tot[h] / d["we_days"]) if d["we_days"] else 0 for h in range(24)] + [0.001])
     parts.append('<div class="charts">'
-                 + chart("平日", d["wd_all"], mx_wd)
-                 + chart("假日", d["we_all"], mx_we, we=True) + "</div>")
-    parts.append("<h3>不含 session 第一句（可避免的冷啟：閒置過久才發生）</h3>")
-    parts.append('<div class="charts">'
-                 + chart("平日", d["wd_mid"], mx_wd)
-                 + chart("假日", d["we_mid"], mx_we, we=True) + "</div>")
+                 f'<div class="chart"><h4>平日（{sum(wd_tot)} 次）</h4>'
+                 f'{_hour_chart2(d["clock_wd"], d["wd_days"], mx, lo_h, hi_h)}</div>'
+                 f'<div class="chart we"><h4>假日（{sum(we_tot)} 次）</h4>'
+                 f'{_hour_chart2(d["clock_we"], d["we_days"], mx, lo_h, hi_h)}</div></div>')
     if d["break_cats"]:
         order = ["30–60 分", "1–3 時（午休級）", "3–6 時", "> 6 時（隔夜／長假級）"]
-        items = "".join(f'<div class="kv">{esc(k)}：{d["break_cats"][k]} 次</div>'
-                        for k in order if k in d["break_cats"])
+        items = "".join(f'<div class="kv">{esc(x)}：{d["break_cats"][x]} 次</div>'
+                        for x in order if x in d["break_cats"])
         parts.append(f"<h3>中斷長度分佈</h3>{items}")
 
-    # ── (C) 伺服器負載假設（依 UTC）──
-    parts.append("<h2>③ 過期會不會跟伺服器時段有關？（實驗性）</h2>")
-    parts.append('<div class="lead">假設：全球尖峰時段快取較易被擠掉、提早過期。要驗就得看 '
-                 f'<b>UTC（伺服器時間）</b>，且只取間隔落在 '
-                 f'<b>{fmt_dur(REPORT_TTL_BAND[0])}–{fmt_dur(REPORT_TTL_BAND[1])}</b> 的相鄰步驟'
-                 '（超過 5 分 TTL 應已過期、但仍在 1 小時內，最能反映 TTL 是否隨負載變動）。跨帳號匯總。</div>')
-    if d["peak_n"] >= 5 and d["off_n"] >= 5:
-        pr, orr = round(100 * d["peak_c"] / d["peak_n"]), round(100 * d["off_c"] / d["off_n"])
-        verdict = ("支持假設（尖峰較易過期）" if pr > orr + 10
-                   else "反而相反" if orr > pr + 10 else "看不出明顯差異")
-        ins3 = (f"尖峰(13–21 UTC) 冷啟率 <b>{pr}%</b>（{d['peak_c']}/{d['peak_n']}）"
-                f" vs 離峰 <b>{orr}%</b>（{d['off_c']}/{d['off_n']}）→ <b>{verdict}</b>。")
+    # ── ④ 尖峰假設 ──
+    parts.append("<h2>④ 提早失效會不會跟伺服器時段有關？（實驗性）</h2>")
+    parts.append('<div class="lead">假設：全球尖峰時段快取較易被擠掉、提早失效。樣本＝1h 快取的「應命中帶」'
+                 f'（閒置 {fmt_dur(REPORT_INTRA_SEC)}–{fmt_dur(REPORT_TTL_SAFE_SEC)}）相鄰步，帶內冷啟即異常；'
+                 '依 <b>UTC（伺服器時間）</b>分時、跨帳號匯總。時段和「閒多久」相關（午休/夜間閒得久），'
+                 '所以檢定先依間隔分層（2–15／15–30／30–55 分）再合併（CMH），避免把「閒得久」誤讀成「尖峰失效」。</div>')
+    if d["cmh"] and d["peak_n"] >= 10 and d["off_n"] >= 10:
+        c = d["cmh"]
+        verdict = ("支持假設（尖峰的提早失效勝算顯著較高）" if c["p"] < .05 and c["or"] > 1 else
+                   "與假設相反（尖峰反而較低）" if c["p"] < .05 and c["or"] < 1 else
+                   "看不出顯著差異")
+        ins4 = (f"控制間隔後，尖峰(13–21 UTC) vs 離峰的提早失效勝算比 <b>OR={c['or']:.2f}</b>"
+                f"（95% CI {c['lo']:.2f}–{c['hi']:.2f}，p={c['p']:.3f}，n={c['n']}）→ <b>{verdict}</b>。"
+                f"<span class='hn'>粗率：尖峰 {_ci_str(d['peak_c'], d['peak_n'])}、"
+                f"離峰 {_ci_str(d['off_c'], d['off_n'])}。</span>")
     else:
-        ins3 = (f"尖峰(13–21 UTC) 樣本 <b>{d['peak_n']}</b> 筆、離峰 <b>{d['off_n']}</b> 筆，"
-                "其中一邊不足 5 筆，暫不比較——你的活動多在離峰。"
-                "同步家用電腦資料後（台北晚上 ≈ 11–16 UTC，正落在歐洲午後尖峰），尖峰那段就會補上。")
-    parts.append(f'<div class="insight">{ins3}</div>')
-    urows = []
-    for h in range(24):
-        u = d["utc"][h]
-        if not u["n"]:                  # 只列觀察帶內有樣本的小時
-            continue
-        rate = u["cold"] / u["n"]
-        cell = (f'<span class="coldbar" style="width:{round(160 * rate)}px"></span>'
-                f'{round(100 * rate)}% <span class="hn">({u["cold"]}/{u["n"]})</span>')
-        peak = " 🔺" if h in REPORT_PEAK_UTC else ""
-        local = datetime.fromtimestamp(u["ts"]).strftime("%H:%M") if u["ts"] else ""
-        urows.append(f'<tr><td>{h:02d} UTC{peak}</td><td class="hn">≈本地 {esc(local)}</td>'
-                     f'<td class="num">{u["n"]}</td><td>{cell}</td>'
-                     f'<td class="hn">{fmt_dur(u["warm"]) if u["warm"] else ""}</td></tr>')
+        ins4 = (f"帶內樣本：尖峰(13–21 UTC) <b>{d['peak_n']}</b> 筆、離峰 <b>{d['off_n']}</b> 筆——"
+                "樣本不足以做分層檢定，暫不下結論。合併家用電腦／朋友的資料後（台北晚上正落在"
+                "歐洲午後尖峰），尖峰樣本就會補上。")
+    parts.append(f'<div class="insight">{ins4}</div>')
+    urows = [{"h": h, "n": d["utc"][h]["n"], "cold": d["utc"][h]["cold"],
+              "local": datetime.fromtimestamp(d["utc"][h]["ts"]).strftime("%H時") if d["utc"][h]["ts"] else ""}
+             for h in range(24) if d["utc"][h]["n"]]
     if urows:
-        parts.append('<table class="rep"><thead><tr><th>UTC 時</th><th>本地</th>'
-                     '<th class="num">樣本</th><th>觀察帶冷啟率</th><th>帶內最久 warm</th></tr></thead><tbody>'
-                     + "".join(urows) + "</tbody></table>")
-    parts.append('<div class="lead">🔺＝全球尖峰參考帶（13–21 UTC）。注意：樣本受你作息偏置、N 偏小，'
-                 '且 5 分／1 小時雙 TTL 與前綴差異都會干擾——這段僅供探索，別當定論。</div>')
+        parts.append(_svg_dotplot(urows))
+        parts.append('<div class="lead">🔺＝全球尖峰參考帶（13–21 UTC，底色標示）。'
+                     'whisker＝95% CI；n 小時區間很寬，看重疊程度而非點值。</div>')
 
-    parts.append('<div class="lead" style="margin-top:24px">※ 全為估算：命中率取自各次呼叫 usage，'
-                 "時間①②為本機時區、③為 UTC；TTL 以同 session 相鄰步驟推估，僅供了解自身快取狀況參考。</div>")
+    # ── ⑤ 撞牆時刻 ──
+    if d["limits_n"]:
+        parts.append("<h2>⑤ 什麼時候撞到 limit（附帶觀察）</h2>")
+        parts.append(f'<div class="lead">紀錄中共 <b>{d["limits_n"]}</b> 次撞到用量上限'
+                     f"（429；同 session 10 分鐘內折疊為一次）：平日 {d['limits_wd']}、假日 {d['limits_we']}。"
+                     "撞牆後切帳號續聊的冷啟已在②歸為「limit/切帳號」。</div>")
+        hrs = [(h, n) for h, n in enumerate(d["limit_hours"]) if n]
+        if hrs:
+            cells = "".join(f"<tr><td>{h:02d} 時</td><td class='num'>{n}</td></tr>" for h, n in hrs)
+            parts.append('<table class="rep"><thead><tr><th>本地時段</th><th class="num">次數</th>'
+                         f"</tr></thead><tbody>{cells}</tbody></table>")
+
+    tail = ("※ 全為估算：命中率取自各次呼叫 usage；③時間為本機時區、④為 UTC；成本按公告價與 TTL 細分倍率估。"
+            "冷啟門檻＝命中率 < 25%。")
+    if d["neg_gaps"]:
+        tail += f"另有 {d['neg_gaps']} 對相鄰步時間倒退（時鐘偏移），已跳過。"
+    parts.append(f'<div class="lead" style="margin-top:24px">{tail}</div>')
     parts.append("</div>")
     return html_page("快取分析報告", "".join(parts), body_class="report")
 
 
 def render_cache_report_md(d) -> str:
     out = ["# ⚡ 快取分析報告", "",
-           "用每次 API 呼叫的快取命中率＋時間間隔，反推「閒置多久快取會過期」與"
-           "「平常都在什麼時段重新暖機」。僅統計 Claude 主對話。官方宣稱 TTL 約 5 分鐘。", ""]
-    cover = [f"{d['n_sessions']} 個 session"]
+           "用每次 API 呼叫的 usage（含 cache_creation 的 5 分／1 小時 TTL 細分）量測：快取實際能撐多久、"
+           "每個冷啟的成因、以及「1 小時內就失效」的異常。僅統計 Claude 主對話；比率附 Wilson 95% CI。", ""]
+    cover = [f"{d['n_sessions']} 個 session", f"{d['n_pairs']} 個相鄰步樣本"]
     if d["span"]:
         cover.append(d["span"])
     if d["accounts"]:
         cover.append("帳號 " + "、".join(a or "default" for a in d["accounts"]))
+    m = d["mode_n"]
+    if m["1h"] or m["5m"]:
+        cover.append(f"TTL 細分：1h {m['1h']} 步／5 分 {m['5m']}／未知 {m['unknown']}")
     out.append("涵蓋範圍：" + " · ".join(cover))
-    out += ["", "## ① 快取能撐多久（有效 TTL）", ""]
+
+    k = d["kpi"]
+    out += ["", "## 總覽（KPI）", ""]
+    out.append(f"- 整體命中率（token 加權）：**{_pct(k['hit'])}**")
+    if k["comply_n"]:
+        p, lo, hi = _wilson(k["comply_hit"], k["comply_n"])
+        out.append(f"- TTL 遵約率（1h 快取、閒置 2–55 分仍命中）：**{_pct(p)}**"
+                   f"（CI {_pct(lo)}–{_pct(hi)}，n={k['comply_n']}）；提早失效 {k['comply_n'] - k['comply_hit']} 次")
+    out.append(f"- 可避免冷啟（閒置過期）：**{d['causes_total']['expiry']} 次**（約 {k['avoid_week']:.1f} 次/週）"
+               f"；估算可避免浪費 **{fmt_money(k['avoid_usd'])}{'+?' if k['avoid_partial'] else ''}**")
+
+    out += ["", "## ① 快取能撐多久（TTL 存活）", ""]
     if d["warm_max"]:
-        out.append(f"- 閒置最久仍命中：**{fmt_dur(d['warm_max'])}**"
-                   + ("（已超過官方 5 分鐘）" if d["warm_max"] > 5 * 60 else ""))
-    out.append("- 過期上限："
-               + (f"間隔超過約 **{fmt_dur(d['expire_gap'])}** 幾乎必冷啟" if d["expire_gap"]
-                  else "樣本不足以判定"))
-    out += ["", "| 閒置間隔 | 樣本 | 下一步冷啟 |", "|---|---:|---|"]
-    for b in d["buckets"]:
-        cell = f"{round(100 * b['cold'] / b['n'])}% ({b['cold']}/{b['n']})" if b["n"] else "—"
-        out.append(f"| {b['label']} | {b['n']} | {cell} |")
-    out.append("")
-    out.append("> 「< 1 分」桶多為回合內連續呼叫，冷啟多屬快取斷點一次性 miss，非 TTL；看大間隔桶才準。")
-    out.append("> 超過 1 小時仍可能命中：Claude Code 對不同前綴用 5 分鐘或 1 小時兩種快取 TTL，故過期上限非一刀切。")
+        out.append(f"- 閒置最久仍命中：**{fmt_dur(d['warm_max'])}**")
+    cohort_defs = [("1h", "1h 寫入"), ("5m", "5 分寫入"), ("unknown", "TTL 未知（舊資料）")]
+    active = [(key, lbl) for key, lbl in cohort_defs if any(b["n"] for b in d["cohort_bins"][key])]
+    if active:
+        head = " | ".join(f"{lbl}：樣本 | 命中率（CI）" for _, lbl in active)
+        out += ["", f"| 閒置間隔 | {head} |",
+                "|---|" + "---:|---|" * len(active)]
+        for i, (_, lbl) in enumerate(REPORT_GAP_BUCKETS):
+            cells = []
+            row_n = 0
+            for key, _ in active:
+                n, hit = d["cohort_bins"][key][i]["n"], d["cohort_bins"][key][i]["hit"]
+                row_n += n
+                cells.append(f"{n or '—'} | {_ci_str(hit, n) if n else '—'}")
+            if row_n:
+                out.append(f"| {lbl} | " + " | ".join(cells) + " |")
+        out.append("")
+        out.append("> 結構性冷啟（第一句/切帳號/換模型/壓縮）已排除；「< 1 分」桶多為回合內快取斷點雜訊。"
+                   "TTL 每次使用會刷新，間隔＝距上一次使用。")
     if d["top_warm"]:
-        out += ["", "存活最久的命中（例外）："]
+        out += ["", "異常存活（>1 小時仍命中；理論上不該發生，供對照）："]
         for g, ts in d["top_warm"]:
             out.append(f"- {fmt_dur(g)} 後仍命中 · {datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')}")
-    out += ["", "## ② 重新暖機時段（冷啟動作息）", "",
-            f"閒置 ≥ {fmt_dur(REPORT_BREAK_SEC)} 後、且確實冷啟（命中率<25%）的第一步＝重新開工，"
-            f"共 {d['resumes']} 次（撞到 1 小時快取仍命中者不算）。「不含 session 第一句」者才是可避免的冷啟。"]
-    if d["n_wd"]:
-        out.append(f"- 平日 {d['n_wd']} 次／{d['wd_days']} 天，常見時段 {_hours_label(d['top_wd'])}"
-                   f"；可避免 {d['n_wd_mid']} 次，集中 {_hours_label(d['top_wd_mid'])}")
-    if d["n_we"]:
-        out.append(f"- 假日 {d['n_we']} 次／{d['we_days']} 天，常見時段 {_hours_label(d['top_we'])}"
-                   f"；可避免 {d['n_we_mid']} 次")
-    out += ["", "| 時 | 平日全部 | 平日可避免 | 假日全部 | 假日可避免 |", "|---|---:|---:|---:|---:|"]
+
+    out += ["", "## ② 冷啟成因分解", ""]
+    total_cold = sum(d["causes_total"].values())
+    if total_cold:
+        ct = d["causes_total"]
+        out.append(f"共 {total_cold} 次冷啟；結構性 {ct['first'] + ct['switch'] + ct['model'] + ct['compact']}、"
+                   f"可避免/異常 {ct['expiry'] + ct['evict']}、回合內雜訊 {ct['intra']}。")
+        out += ["", "| 成因 | 次數 | 說明 |", "|---|---:|---|"]
+        for key, lbl, desc in REPORT_CAUSES:
+            out.append(f"| {lbl} | {d['causes_total'][key]} | {desc} |")
+        if d["cause_periods"]:
+            keys = [key for key, _, _ in REPORT_CAUSES]
+            out += ["", "| 期間 | " + " | ".join(_CAUSE_LABEL[x] for x in keys) + " | 合計 |",
+                    "|---|" + "---:|" * (len(keys) + 1)]
+            for p in d["cause_periods"]:
+                cells = " | ".join(str(p["counts"].get(x, 0) or "") for x in keys)
+                out.append(f"| {p['label']} | {cells} | {sum(p['counts'].values())} |")
+    else:
+        out.append("期間內沒有冷啟。")
+
+    out += ["", "## ③ 重暖作息（冷啟時段）", "",
+            f"閒置 ≥ {fmt_dur(REPORT_BREAK_SEC)} 後、確實冷啟的第一步＝重新開工，共 {d['n_resumes']} 次"
+            "（可避免＝閒置過期/提早失效；不可避免＝第一句/切帳號/換模型/壓縮）。"]
+    wd_tot = [c["a"] + c["u"] for c in d["clock_wd"]]
+    we_tot = [c["a"] + c["u"] for c in d["clock_we"]]
+    if sum(wd_tot):
+        out.append(f"- 平日 {sum(wd_tot)} 次／{d['wd_days']} 個活躍日，集中 {_hours_label(_top_hours(wd_tot))}")
+    if sum(we_tot):
+        out.append(f"- 假日 {sum(we_tot)} 次／{d['we_days']} 個活躍日，集中 {_hours_label(_top_hours(we_tot))}")
+    out += ["", "| 時 | 平日可避免 | 平日不可避免 | 假日可避免 | 假日不可避免 |", "|---|---:|---:|---:|---:|"]
     for h in range(24):
-        if d["wd_all"][h] or d["we_all"][h]:
-            out.append(f"| {h:02d} | {d['wd_all'][h] or ''} | {d['wd_mid'][h] or ''} "
-                       f"| {d['we_all'][h] or ''} | {d['we_mid'][h] or ''} |")
+        if wd_tot[h] or we_tot[h]:
+            out.append(f"| {h:02d} | {d['clock_wd'][h]['a'] or ''} | {d['clock_wd'][h]['u'] or ''} "
+                       f"| {d['clock_we'][h]['a'] or ''} | {d['clock_we'][h]['u'] or ''} |")
     if d["break_cats"]:
         out += ["", "中斷長度分佈："]
-        for k in ["30–60 分", "1–3 時（午休級）", "3–6 時", "> 6 時（隔夜／長假級）"]:
-            if k in d["break_cats"]:
-                out.append(f"- {k}：{d['break_cats'][k]} 次")
-    out += ["", "## ③ 過期 vs 伺服器時段（實驗性，依 UTC）", "",
-            f"假設：全球尖峰時段快取較易提早過期。只取間隔 {fmt_dur(REPORT_TTL_BAND[0])}–"
-            f"{fmt_dur(REPORT_TTL_BAND[1])} 的相鄰步驟、依 UTC（伺服器時間）匯總。"]
-    if d["peak_n"] >= 5 and d["off_n"] >= 5:
-        pr, orr = round(100 * d["peak_c"] / d["peak_n"]), round(100 * d["off_c"] / d["off_n"])
-        verdict = ("支持假設" if pr > orr + 10 else "相反" if orr > pr + 10 else "無明顯差異")
-        out.append(f"- 尖峰(13–21 UTC) 冷啟率 {pr}%（{d['peak_c']}/{d['peak_n']}）"
-                   f" vs 離峰 {orr}%（{d['off_c']}/{d['off_n']}）→ {verdict}")
+        for x in ["30–60 分", "1–3 時（午休級）", "3–6 時", "> 6 時（隔夜／長假級）"]:
+            if x in d["break_cats"]:
+                out.append(f"- {x}：{d['break_cats'][x]} 次")
+
+    out += ["", "## ④ 提早失效 vs 伺服器時段（實驗性，依 UTC）", "",
+            f"樣本＝1h 快取的應命中帶（閒置 {fmt_dur(REPORT_INTRA_SEC)}–{fmt_dur(REPORT_TTL_SAFE_SEC)}）"
+            "相鄰步；依間隔分層（2–15/15–30/30–55 分）做 CMH，控制「閒多久」的混雜。"]
+    if d["cmh"] and d["peak_n"] >= 10 and d["off_n"] >= 10:
+        c = d["cmh"]
+        verdict = ("支持假設" if c["p"] < .05 and c["or"] > 1 else
+                   "與假設相反" if c["p"] < .05 and c["or"] < 1 else "無顯著差異")
+        out.append(f"- 尖峰(13–21 UTC) vs 離峰：OR={c['or']:.2f}（95% CI {c['lo']:.2f}–{c['hi']:.2f}，"
+                   f"p={c['p']:.3f}，n={c['n']}）→ **{verdict}**"
+                   f"；粗率 尖峰 {_ci_str(d['peak_c'], d['peak_n'])}、離峰 {_ci_str(d['off_c'], d['off_n'])}")
     else:
-        out.append(f"- 尖峰(13–21 UTC) {d['peak_n']} 筆、離峰 {d['off_n']} 筆，一邊不足 5 筆，"
-                   "暫不比較；同步家用電腦資料後再看。")
-    out += ["", "| UTC 時 | 樣本 | 觀察帶冷啟率 | 帶內最久warm |", "|---|---:|---:|---|"]
+        out.append(f"- 尖峰 {d['peak_n']} 筆、離峰 {d['off_n']} 筆——樣本不足以分層檢定；"
+                   "合併家用電腦／朋友資料後再看。")
+    out += ["", "| UTC 時 | 樣本 | 帶內提早失效率（CI） |", "|---|---:|---|"]
     for h in range(24):
         u = d["utc"][h]
-        if not u["n"]:                  # 只列觀察帶內有樣本的小時
+        if not u["n"]:
             continue
-        rate = f"{round(100 * u['cold'] / u['n'])}% ({u['cold']}/{u['n']})"
         mark = " 🔺" if h in REPORT_PEAK_UTC else ""
-        out.append(f"| {h:02d}{mark} | {u['n']} | {rate} | {fmt_dur(u['warm']) if u['warm'] else ''} |")
-    out.append("> 🔺＝全球尖峰參考帶。樣本受作息偏置、N 小、雙 TTL 干擾，僅供探索。")
-    out += ["", "※ 全為估算，僅供參考。"]
+        out.append(f"| {h:02d}{mark} | {u['n']} | {_ci_str(u['cold'], u['n'])} |")
+    out.append("> 🔺＝全球尖峰參考帶（13–21 UTC）。n 小時 CI 很寬，看重疊而非點值。")
+
+    if d["limits_n"]:
+        out += ["", "## ⑤ 什麼時候撞到 limit（附帶觀察）", "",
+                f"共 {d['limits_n']} 次（429；同 session 10 分內折疊）：平日 {d['limits_wd']}、假日 {d['limits_we']}。"]
+        hrs = [(h, n) for h, n in enumerate(d["limit_hours"]) if n]
+        if hrs:
+            out += ["", "| 本地時段 | 次數 |", "|---|---:|"]
+            out += [f"| {h:02d} 時 | {n} |" for h, n in hrs]
+
+    tail = "※ 全為估算：成本按公告價與 TTL 細分倍率；冷啟門檻＝命中率 < 25%。"
+    if d["neg_gaps"]:
+        tail += f"另有 {d['neg_gaps']} 對相鄰步時間倒退（時鐘偏移），已跳過。"
+    out += ["", tail]
     return "\n".join(out)
 
 
@@ -2582,17 +3060,56 @@ border-radius:8px;padding:10px 14px;margin:12px 0;font-size:14px;line-height:1.7
 .report table.rep{width:auto;min-width:min(420px,100%);border-collapse:collapse;font-size:13px;margin:10px 0}
 .report table.rep th,.report table.rep td{border-bottom:1px solid var(--border);padding:6px 12px;text-align:left}
 .report table.rep th{position:static;cursor:default;color:var(--muted);font-weight:600}
-.report .coldbar{display:inline-block;height:11px;border-radius:4px;background:var(--err);
-vertical-align:middle;margin-right:7px}
 .report .charts{display:flex;gap:28px;flex-wrap:wrap;margin:10px 0}
 .report .chart{flex:1 1 280px}
 .report .hrow{display:flex;align-items:center;gap:7px;line-height:1.85}
 .report .hh{color:var(--muted);font-family:ui-monospace,Consolas,monospace;font-size:12px;width:46px;flex:none}
-.report .hbar{display:inline-block;height:12px;border-radius:3px;background:var(--assistant)}
-.report .chart.we .hbar{background:var(--accent)}
+.report .hbarwrap{display:flex;gap:2px;align-items:center}
+.report .hseg{display:inline-block;height:12px;border-radius:3px}
+.report .hseg.a{background:var(--assistant)}
+.report .hseg.u{background:var(--assistant);opacity:.35}
+.report .chart.we .hseg{background:var(--accent)}
 .report .hn{color:var(--muted);font-size:11px}
 .report .kv{font-size:13px;margin:.25em 0}
 .report .num{text-align:right}
+.report .kpis{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
+.report .kpi{flex:1 1 150px;min-width:150px;background:var(--panel);border:1px solid var(--border);
+border-radius:8px;padding:10px 12px}
+.report .kpi .kv2{font-size:23px;font-weight:600;line-height:1.2}
+.report .kpi .kl{font-size:12px;margin-top:3px}
+.report .kpi .ks{color:var(--muted);font-size:11px;margin-top:2px;line-height:1.5}
+.report .causes{margin:10px 0}
+.report .crow{display:flex;align-items:center;gap:8px;line-height:2.1;font-size:12px}
+.report .clab{color:var(--muted);width:74px;flex:none;text-align:right;
+font-family:ui-monospace,Consolas,monospace}
+.report .cbar{display:flex;gap:2px;height:14px}
+.report .cseg{min-width:2px;border-radius:3px}
+.report .sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:4px;vertical-align:-1px}
+.report .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:8px 0}
+.report .cz-first{background:rgba(139,148,158,.6)}
+.report .cz-switch{background:#9d7bd8}
+.report .cz-model{background:#39c5cf}
+.report .cz-compact{background:#d2963c}
+.report .cz-expiry{background:var(--accent)}
+.report .cz-evict{background:var(--err)}
+.report .cz-intra{background:rgba(139,148,158,.28)}
+/* 報告 SVG 圖表（存活曲線 / dot plot） */
+.report svg.viz{width:100%;height:auto;max-width:680px;display:block;margin:8px 0}
+.report svg.viz text{font:11px -apple-system,"Segoe UI",system-ui,sans-serif;fill:var(--muted)}
+.report svg.viz .grid{stroke:var(--border);stroke-width:1}
+.report svg.viz .guide{stroke:var(--muted);stroke-width:1}
+.report svg.viz .curve{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.report svg.viz .band{stroke:none;opacity:.13}
+.report svg.viz .dot{stroke:var(--bg);stroke-width:2}
+.report svg.viz .whisk{stroke:var(--muted);stroke-width:2;stroke-linecap:round}
+.report svg.viz .peak{fill:var(--muted);opacity:.10}
+.report svg.viz .curve.co-1h{stroke:var(--accent)}
+.report svg.viz .band.co-1h,.report svg.viz .dot.co-1h,.report .sw.co-1h{fill:var(--accent);background:var(--accent)}
+.report svg.viz .curve.co-5m{stroke:var(--assistant)}
+.report svg.viz .band.co-5m,.report svg.viz .dot.co-5m,.report .sw.co-5m{fill:var(--assistant);background:var(--assistant)}
+.report svg.viz .curve.co-unk{stroke:var(--muted)}
+.report svg.viz .band.co-unk,.report svg.viz .dot.co-unk,.report .sw.co-unk{fill:var(--muted);background:var(--muted)}
+.report svg.viz .dot.co-evict{fill:var(--err)}
 /* 全文搜尋（--search）結果頁 + 錨點跳轉高亮 */
 mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1px}
 .hl{outline:2px solid var(--accent);outline-offset:2px}
@@ -2683,7 +3200,9 @@ def session_to_row(s: "Session") -> dict:
         "cost": s.cost,
         "cost_partial": s.cost_partial,
         "cache_pct": s.cache_pct,
-        "cache_steps": getattr(s, "cache_steps", []),   # cache-report.html 的原料：[[epoch, cache_read, 脈絡tokens], …]
+        "cache_steps": getattr(s, "cache_steps", []),   # cache-report 原料：[[epoch, cache_read, 脈絡, 寫總量, 寫5分, 寫1h, 模型idx], …]
+        "cache_models": getattr(s, "cache_models", []),
+        "cache_events": getattr(s, "cache_events", []),  # [[epoch, "limit"|"auth"|"compact"], …]
         "ctx_peak": s.ctx_peak,
         "tok_out": s.tok_out,
         "out_html": s.out_html,

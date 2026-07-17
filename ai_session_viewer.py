@@ -2642,24 +2642,41 @@ def _svg_survival(cohorts):
     return "".join(parts)
 
 
+def _dotplot_scale(rows):
+    """dot plot 的 x 軸上限與刻度步長（整數百分比）：0 起、涵蓋所有列的 Wilson CI 上界、
+    3–5 段 nice 刻度——失效率通常只有個位數 %，固定 0–100% 會把點全擠在左端。"""
+    hi_max = 0.0
+    for row in rows:
+        _, _, hi = _wilson(row["cold"], row["n"])
+        hi_max = max(hi_max, hi)
+    pct = max(hi_max * 100, 1.0)
+    for step in (1, 2, 5, 10, 20):    # pct ≤ 100 → step 20 必成立（ceil(100/20)=5），無需更粗的階
+        k = math.ceil(pct / step)
+        if k <= 5:
+            return min(step * k, 100), step
+    return 100, 20
+
+
 def _svg_dotplot(rows, aria):
     """帶內提早失效率 dot plot：每列一類別，點＋Wilson CI whisker；row["peak"] 的列鋪淡底強調。
-    rows=[{"label","n","cold","peak"}]，僅含 n>0 的列；label 直接作列首文字（含任何標記）。"""
+    rows=[{"label","n","cold","peak"}]，僅含 n>0 的列；label 直接作列首文字（含任何標記）。
+    x 軸依資料範圍縮放（_dotplot_scale），每條格線都標值。"""
     RH, W, L, R, TOP = 24, 660, 132, 52, 26
     H = TOP + RH * len(rows) + 8
+    axis_max, step = _dotplot_scale(rows)
 
     def X(p):
-        return L + p * (W - L - R)
+        return L + min(p * 100 / axis_max, 1.0) * (W - L - R)
 
     parts = [f'<svg class="viz" viewBox="0 0 {W} {H}" role="img" aria-label="{esc(aria)}">']
     for ri, row in enumerate(rows):        # 先鋪強調底色，再畫格線與點
         if row.get("peak"):
             y = TOP + RH * ri
             parts.append(f'<rect x="{L}" y="{y:.1f}" width="{W - L - R}" height="{RH}" class="peak"/>')
-    for frac in (0, .25, .5, .75, 1):
-        x = X(frac)
+    for t in range(0, axis_max + 1, step):
+        x = X(t / 100)
         parts.append(f'<line x1="{x:.1f}" y1="{TOP - 4}" x2="{x:.1f}" y2="{H - 6}" class="grid"/>')
-        parts.append(f'<text x="{x:.1f}" y="{TOP - 8}" text-anchor="middle">{round(frac * 100)}%</text>')
+        parts.append(f'<text x="{x:.1f}" y="{TOP - 8}" text-anchor="middle">{t}%</text>')
     for ri, row in enumerate(rows):
         y = TOP + RH * ri + RH / 2
         p, lo, hi = _wilson(row["cold"], row["n"])
@@ -3006,7 +3023,8 @@ def render_cache_hypotheses_html(d) -> str:
     if urows:
         parts.append(_svg_dotplot(urows, "各 UTC 小時的提早失效率"))
         parts.append('<div class="lead">🔺＝全球尖峰參考帶（13–21 UTC，底色標示）。'
-                     'whisker＝95% CI；n 小時區間很寬，看重疊程度而非點值。</div>')
+                     '點＝該時段的提早失效率、whisker＝95% CI；n 小時區間很寬，看重疊程度而非點值。'
+                     '橫軸依資料範圍縮放（讀刻度標示）。</div>')
 
     # ── ② 脈絡大小假說 ──
     parts.append("<h2>② 累積脈絡：context 越大越容易被擠掉？</h2>")
@@ -3034,6 +3052,8 @@ def render_cache_hypotheses_html(d) -> str:
              for b, (_, lbl) in zip(d["ctx_bins"], REPORT_CTX_BINS) if b["n"]]
     if crows:
         parts.append(_svg_dotplot(crows, "各脈絡大小的提早失效率"))
+        parts.append('<div class="lead">點＝該脈絡箱的提早失效率、whisker＝95% CI，看重疊程度而非點值；'
+                     '橫軸依資料範圍縮放（讀刻度標示）。</div>')
         rows = "".join(f"<tr><td>{esc(lbl)}</td><td class='num'>{b['n']}</td>"
                        f"<td>{_ci_str(b['cold'], b['n'])}</td></tr>"
                        for b, (_, lbl) in zip(d["ctx_bins"], REPORT_CTX_BINS) if b["n"])

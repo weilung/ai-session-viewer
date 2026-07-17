@@ -47,7 +47,7 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 26  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 27  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 SOURCE_LABELS = {
@@ -685,7 +685,8 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     raw = load_events(path)
     s.events = []
     current_model = ""
-    last_assistant_event = None
+    step_first_event = None     # 本次呼叫（上個 token_count 之後）的第一筆事件＝步驟起點
+    last_usage_target = None    # 上一次 usage 掛載點：呼叫無可呈現事件時的後備（重播去重靠它）
     attached_usage: dict[str, set[tuple[int, ...]]] = {}
 
     for i, e in enumerate(raw):
@@ -729,13 +730,22 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                     "message": {"role": "user", "content": str(text)},
                 })
             elif ptype == "token_count":
+                # usage 掛在該次呼叫的「第一筆」事件＝步驟起點（group_turns 據此切步，對齊 Claude
+                # 的逐步語意）。呼叫沒有可呈現事件時退回上一個掛載點（該步徽章成為兩次呼叫合計）；
+                # resume/重播重發的 token_count 會因「同掛載點＋同簽章」被去重——此語意經 173 個
+                # 本機 rollout 對帳，與 Codex 自身 total_token_usage 累計吻合。
                 info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
                 usage = info.get("last_token_usage")
-                msg = (last_assistant_event or {}).get("message") or {}
-                mid, sig = msg.get("id"), _codex_usage_sig(usage)
-                if mid and sig is not None and sig not in attached_usage.setdefault(mid, set()):
-                    _attach_codex_usage(last_assistant_event, usage, current_model)
-                    attached_usage[mid].add(sig)
+                sig = _codex_usage_sig(usage)
+                if sig is not None:
+                    target = step_first_event or last_usage_target
+                    mid = ((target or {}).get("message") or {}).get("id")
+                    if mid and sig not in attached_usage.setdefault(mid, set()):
+                        _attach_codex_usage(target, usage, current_model)
+                        attached_usage[mid].add(sig)
+                    if target is not None:
+                        last_usage_target = target
+                    step_first_event = None     # 呼叫結束；下一筆事件是新步驟起點
             continue
 
         if e.get("type") != "response_item":
@@ -762,11 +772,12 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                             "model": current_model, "content": [{"type": "text", "text": text}]},
             }
             s.events.append(ev)
-            last_assistant_event = ev
+            if step_first_event is None:
+                step_first_event = ev
         elif ptype == "reasoning":
             text = _codex_content_text(payload.get("summary"), "summary_text")
             if text.strip():
-                s.events.append({
+                ev = {
                     "type": "assistant",
                     "uuid": f"codex-reasoning-{i}",
                     "timestamp": ts, "_dt": dt, "_i": i,
@@ -774,7 +785,10 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                     "sessionId": s.session_id,
                     "message": {"role": "assistant", "id": f"codex-reason-{i}", "model": current_model,
                                 "content": [{"type": "thinking", "thinking": text}]},
-                })
+                }
+                s.events.append(ev)
+                if step_first_event is None:
+                    step_first_event = ev
         elif ptype in ("function_call", "custom_tool_call"):
             call_id = payload.get("call_id") or f"codex-call-{i}"
             inp = payload.get("arguments") if ptype == "function_call" else payload.get("input")
@@ -794,7 +808,8 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                                          "input": _json_obj_maybe(inp)}]},
             }
             s.events.append(ev)
-            last_assistant_event = ev
+            if step_first_event is None:
+                step_first_event = ev
         elif ptype in ("function_call_output", "custom_tool_call_output"):
             call_id = payload.get("call_id") or f"codex-call-{i}"
             s.events.append({
@@ -964,7 +979,8 @@ def _acc_turn_usage(acc, msg):
 
 
 def _step_usage(msg):
-    """單一步驟（＝一次 API 呼叫、一個 message.id）的 usage，供回合內 per-step 徽章使用。
+    """單一步驟（＝一次 API 呼叫；Claude 為一個 message.id，Codex 為帶 usage 的步驟起點事件）的
+    usage，供回合內 per-step 徽章使用。
     只取顯示需要的三項：cache_read（命中分子）、total_in（脈絡＝命中分母/ctx）、output（產出）。"""
     if not isinstance(msg, dict):
         return None
@@ -981,15 +997,16 @@ def _step_usage(msg):
     return {"cache_read": c2, "total_in": total_in, "output": o}
 
 
-def group_turns(events, per_step=True):
+def group_turns(events, per_step=True, step_by_usage=False):
     """events 須為已排序、去重的訊息事件。
     新版把 assistant 的 thinking/text/tool_use 拆成多筆事件，這裡併回單一回合；
     純 tool_result 的 user 事件不另起回合（其輸出已附在對應的 tool_use 內）。
 
-    per_step：是否在回合內插入「步驟」分隔標記（逐步快取命中率）。僅適用於 Claude——
-    它一次 API 呼叫的多筆事件共用同一個 message.id 且每筆都帶 usage。Codex 不適用：
-    每個事件都有獨立合成 id（會過度切碎），且 usage 只掛在某一筆（多數步驟會空白），
-    故 Codex 傳 False，只保留整段彙總。"""
+    「步驟」＝一次 API 呼叫，兩種切法擇一（逐步快取命中率）：
+    - per_step（Claude）：每個新 message.id 起一步——一次呼叫拆成的多筆事件共用同一 id 且每筆都帶 usage。
+    - step_by_usage（Codex）：事件 id 為逐筆合成、不能當步界；改以「帶 usage 的事件」起一步——
+      載入器把每次呼叫的 usage（token_count）掛在該呼叫的第一筆事件上，該事件即步驟起點。
+      呼叫沒有可呈現事件時 usage 已併回上一步（該步徽章為兩次呼叫合計）。"""
     turns, cur = [], None
     for e in events:
         role = e.get("type")
@@ -1032,6 +1049,11 @@ def group_turns(events, per_step=True):
                     cur["n_steps"] += 1
                     cur["blocks"].append({"type": "_step", "idx": cur["n_steps"],
                                           "u": _step_usage(msg)})
+            elif step_by_usage:
+                su = _step_usage(msg)
+                if su:
+                    cur["n_steps"] += 1
+                    cur["blocks"].append({"type": "_step", "idx": cur["n_steps"], "u": su})
             cur["blocks"].extend(blocks)
             _acc_turn_usage(cur["u"], msg)
     if cur:
@@ -1044,8 +1066,8 @@ def analyze(s):
     msg = [e for e in s.events if e.get("type") in ("user", "assistant")]
     main = dedup(sorted([e for e in msg if not e.get("isSidechain")], key=ts_key))
     side = dedup(sorted([e for e in msg if e.get("isSidechain")], key=ts_key))
-    per_step = s.source_kind != SOURCE_CODEX   # 逐步快取命中率僅適用 Claude（見 group_turns 說明）
-    s.main_groups = group_turns(main, per_step=per_step)
+    codex = s.source_kind == SOURCE_CODEX      # 逐步切法依來源而異（見 group_turns 說明）
+    s.main_groups = group_turns(main, per_step=not codex, step_by_usage=codex)
     # 子代理依「父 Task tool_use id」分組，之後就地接在該 Task 底下（無法對應者退回頁尾）
     by_parent = {}
     for e in side:
@@ -1053,7 +1075,7 @@ def analyze(s):
     s.subagent_map = {}        # tool_use_id -> [turn groups]
     s.subagent_meta = {}       # tool_use_id -> {"type":..., "desc":...}
     for tid, evs in by_parent.items():
-        groups = group_turns(evs, per_step=per_step)
+        groups = group_turns(evs, per_step=not codex, step_by_usage=codex)
         if groups:
             s.subagent_map[tid] = groups
             s.subagent_meta[tid] = {"type": evs[0].get("_agent_type", ""),
@@ -1140,7 +1162,8 @@ def collect_cache_steps(s):
                報告據此把其後第一步歸因為切帳號/登入/壓縮，而非 TTL 失效。
     存原始 cache_read（非預先四捨五入的命中率），冷啟判定才能精確、不會在門檻邊界因進位而誤分類。
     只取主對話：子代理有獨立的快取前綴，混進來會污染間隔判讀。
-    Codex 略過：其 usage 只掛在某一筆事件、id 為合成，逐步序列不可靠（見 [[jsonl-transcript-format]]）。"""
+    Codex 略過：非因序列問題（usage 已按呼叫掛在步驟起點），而是本報告的 TTL 細分、計價與成因模型
+    是 Anthropic 專屬——OpenAI 自動快取無 cache_creation/TTL 資料可對應。"""
     if s.source_kind == SOURCE_CODEX:
         return [], [], []
     steps, seen = [], set()

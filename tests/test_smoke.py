@@ -535,6 +535,73 @@ def test_cache_report(tmp_path=None):
     print("OK: cache report test passed")
 
 
+def test_codex_step_badges(tmp_path=None):
+    # Codex 逐步快取徽章：token_count 掛在該次呼叫的第一筆事件＝步驟起點；
+    # 冷啟步驟有紅標與 ❄最低；重播的 token_count 去重；孤兒 token_count（無任何事件前）安全丟棄。
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    sess_dir = tmp / "sessions" / "2026" / "06" / "05"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    csid = "019f0000-0000-7000-8000-000000000001"
+
+    def line(sec, typ, payload):
+        return json.dumps({"timestamp": f"2026-06-05T01:00:{sec:02d}.000Z",
+                           "type": typ, "payload": payload}, ensure_ascii=False)
+
+    def tc(sec, inp, cached, out):
+        return line(sec, "event_msg", {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+                                  "reasoning_output_tokens": 0, "total_tokens": 0},
+            "last_token_usage": {"input_tokens": inp, "cached_input_tokens": cached,
+                                 "output_tokens": out, "reasoning_output_tokens": 0,
+                                 "total_tokens": inp + out},
+            "model_context_window": 272000}})
+
+    rows = [
+        line(0, "session_meta", {"id": csid, "cwd": "/x/CodexProj",
+                                 "cli_version": "0.29.0", "git": {"branch": "main"}}),
+        line(1, "turn_context", {"cwd": "/x/CodexProj", "model": "gpt-5.5"}),
+        tc(2, 500, 0, 0),                                   # 孤兒：無任何事件可掛 → 丟棄不計
+        line(3, "event_msg", {"type": "user_message", "message": "幫我改一個東西CODEXQMARK。"}),
+        line(4, "response_item", {"type": "reasoning",
+                                  "summary": [{"type": "summary_text", "text": "想想怎麼做CODEXTHINK。"}]}),
+        line(5, "response_item", {"type": "message", "role": "assistant",
+                                  "content": [{"type": "output_text", "text": "我先看檔案。"}]}),
+        tc(6, 2000, 0, 10),                                 # 步驟1：0%（冷啟，掛在 reasoning 事件）
+        line(7, "response_item", {"type": "function_call", "name": "shell_command",
+                                  "arguments": "{\"command\":[\"ls\"]}", "call_id": "call_demo_1"}),
+        tc(8, 2200, 2000, 20),                              # 步驟2：91%
+        line(9, "response_item", {"type": "function_call_output", "call_id": "call_demo_1",
+                                  "output": "{\"output\":\"README.md\"}"}),
+        line(10, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "完成CODEXDONE。"}]}),
+        tc(11, 2500, 2400, 30),                             # 步驟3：96%
+        tc(12, 2500, 2400, 30),                             # 重播（同簽章、其間無事件）→ 去重不重計
+    ]
+    (sess_dir / f"rollout-2026-06-05T01-00-00-{csid}.jsonl").write_text(
+        "\n".join(rows), encoding="utf-8")
+
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--codex-source", f"demo={tmp / 'sessions'}",
+         "--no-claude", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+
+    htmls = list((out / "sessions").rglob("*.html"))
+    assert htmls, "應產生 Codex session HTML"
+    html = htmls[0].read_text(encoding="utf-8")
+    assert "CODEXQMARK" in html and "CODEXDONE" in html, "對話內容應照常呈現"
+    # 三步都應有步驟分隔列；步驟1 冷啟紅標；❄最低徽章指向步驟1
+    assert "步驟 1</span>" in html and "步驟 3</span>" in html, "多步回合應有逐步分隔列"
+    assert '步驟 1</span><span class="meter m-cache cold"' in html, "冷啟步驟應紅標（m-cache cold）"
+    assert "❄最低 0%·步驟1" in html, "回合徽章應標出最低步驟"
+    # 總帳：孤兒丟棄、重播去重 → total_in=6700、cache_read=4400 → 66%
+    #（孤兒未丟會成 61%；重播重計會成 74%）
+    assert "⚡快取 66%" in html, "session 頁命中率應為 66%（孤兒丟棄＋重播去重）"
+    assert "gpt-5.5" in html, "應顯示模型"
+    print("OK: codex step badges test passed")
+
+
 if __name__ == "__main__":
     test_smoke()
     test_search()
@@ -542,3 +609,4 @@ if __name__ == "__main__":
     test_day_divider()
     test_compact_marker()
     test_cache_report()
+    test_codex_step_badges()

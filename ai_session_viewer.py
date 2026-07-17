@@ -128,7 +128,7 @@ CACHE_COLD_PCT = 25       # 命中率低於此值視為「冷啟動」（該步�
 # 不需長間隔，實測同一晚連續步驟（間隔 18s、同 model）也會 0% 後立刻復原，多與 prompt cache 斷點/
 # 20-block 回溯限制、模型切換、前綴變動有關。本工具只標「該步很冷」這個事實，不臆測成因。
 
-# ── 快取分析報告（cache-report.html）參數 ──
+# ── 快取分析報告（健檢 cache-report.html ＋ 假說檢定 cache-hypotheses.html）參數 ──
 # 思路：每次 API 呼叫都帶 usage，命中率＝cache_read/脈絡；把「與前一次呼叫的間隔」對上「這次是否冷啟」，
 # 就能量測「閒置多久快取會失效」。新版 usage.cache_creation 有 5 分／1 小時 TTL 細分（實測本機資料
 # 幾乎全為 1 小時寫入），因此 TTL 是「量測」而非推估；每個冷啟依成因分解（見 REPORT_CAUSES），
@@ -148,6 +148,10 @@ REPORT_GAP_BUCKETS = [
 # 時段與間隔長短相關（午休/夜間閒置較久），故檢定前先依 gap 分層（CMH），避免把「閒得久」誤讀成「尖峰失效」。
 REPORT_PEAK_UTC = set(range(13, 22))   # 13–21 UTC：歐洲午後＋美國上午，一般是 Anthropic 全球最重時段
 REPORT_CMH_STRATA = [15 * 60, 30 * 60, REPORT_TTL_SAFE_SEC]   # 帶內 gap 分層上界：2–15 / 15–30 / 30–55 分
+# ④ 脈絡大小假設：逐出機率會不會隨累積脈絡變大而上升？帶內樣本依「前一步脈絡」（＝前一步寫進快取、
+# 這次要能活著回來的量）分箱；檢定以帶內中位數切大/小、沿用同一套 gap 分層 CMH（輸出在假說頁）。
+REPORT_CTX_BINS = [(50_000, "< 50k"), (150_000, "50–150k"), (300_000, "150–300k"),
+                   (500_000, "300–500k"), (float("inf"), "≥ 500k")]
 # 冷啟成因（優先序判定，每個冷啟恰好一個成因）；label/css 供報告呈現。
 REPORT_CAUSES = [
     ("first",   "session 第一句", "不可避免：全新前綴"),
@@ -2042,7 +2046,7 @@ def render_index_html(rows, show_account=False, cache_report=False) -> str:
 <div class="wrap">
   <h1>AI 對話紀錄</h1>
   <div class="smeta">{len(rows)} 個 session · {len(sources) or 1} 種工具 · {len(accounts) or 1} 個帳號 · {len(projects)} 個專案{grand} · 產生於 {esc(local_str(datetime.now()))}</div>
-  {'<div class="smeta"><a href="cache-report.html">⚡ 快取分析報告 →</a></div>' if cache_report else ''}
+  {'<div class="smeta"><a href="cache-report.html">⚡ 快取分析報告 →</a>　<a href="cache-hypotheses.html">🧪 快取假說檢定 →</a></div>' if cache_report else ''}
   <div class="filters">
     <input id="q" class="search" placeholder="🔍 搜尋標題 / 專案 / 分支…" oninput="af()">
     {src_select}
@@ -2113,7 +2117,7 @@ def render_index_md(rows, show_account=False, cache_report=False) -> str:
     out = ["# AI 對話紀錄", "",
            f"{len(rows)} 個 session · {len(sources) or 1} 種工具 · {n_acc} 個帳號 · {len({p for _, p in by_source_proj})} 個專案{cost_summary(rows)}", ""]
     if cache_report:
-        out += ["⚡ [快取分析報告](cache-report.md)", ""]
+        out += ["⚡ [快取分析報告](cache-report.md) · 🧪 [快取假說檢定](cache-hypotheses.md)", ""]
     for src, proj in sorted(by_source_proj, key=lambda x: (source_label(x[0]), x[1])):
         out.append(f"## {source_label(src)} / {proj}")
         out.append("")
@@ -2136,6 +2140,13 @@ def _gap_bucket_index(gap):
         if gap < hi:
             return i
     return len(REPORT_GAP_BUCKETS) - 1
+
+
+def _ctx_bucket_index(v):
+    for i, (hi, _) in enumerate(REPORT_CTX_BINS):
+        if v < hi:
+            return i
+    return len(REPORT_CTX_BINS) - 1
 
 
 def _wilson(k, n, z=1.96):
@@ -2194,6 +2205,24 @@ def _cmh(strata):
     return {"or": or_, "lo": or_ * math.exp(-half), "hi": or_ * math.exp(half), "p": p, "n": total}
 
 
+def _ca_trend(bins):
+    """Cochran–Armitage 趨勢檢定（等距分數）：bins=[(冷啟數, 樣本數), …] 依分箱序。
+    回傳 {"z","p"}，z>0＝率隨序上升；單箱或全冷/全熱（變異數 0）回 None。純 stdlib。"""
+    N = sum(n for _, n in bins)
+    K = sum(k for k, _ in bins)
+    if len(bins) < 2 or N <= 0 or K <= 0 or K >= N:
+        return None
+    pbar = K / N
+    T = sum(i * k for i, (k, _) in enumerate(bins))
+    s1 = sum(i * n for i, (_, n) in enumerate(bins))
+    s2 = sum(i * i * n for i, (_, n) in enumerate(bins))
+    var = pbar * (1 - pbar) * (s2 - s1 * s1 / N)
+    if var <= 0:
+        return None
+    z = (T - pbar * s1) / math.sqrt(var)
+    return {"z": z, "p": math.erfc(abs(z) / math.sqrt(2))}
+
+
 _CAUSE_LABEL = {k: lbl for k, lbl, _ in REPORT_CAUSES}
 _CAUSE_DESC = {k: desc for k, _, desc in REPORT_CAUSES}
 _AVOIDABLE_CAUSES = ("expiry", "evict")   # 「可避免/異常」：非結構性、與閒置行為相關
@@ -2228,7 +2257,10 @@ def build_cache_report(rows):
       (C) 重暖作息──各帳號時間軸閒置 ≥ REPORT_BREAK_SEC 後的冷啟，本地時段直方圖
           （平日/假日 × 可避免/不可避免，正規化為 次/活躍日）。
       (D) 尖峰假設──應命中帶內（1h cohort）依 UTC 分時看提早失效率；依 gap 分層做 CMH 勝算比＋卡方，
-          控制「午休/夜間本來就閒得久」的混雜。"""
+          控制「午休/夜間本來就閒得久」的混雜。
+      (E) 脈絡假設──同一批帶內樣本依「前一步脈絡」分箱看失效率（Cochran–Armitage 趨勢），
+          並以帶內中位數切大/小脈絡、沿用 (D) 的 gap 分層 CMH；另記帶內失效的形態（殘餘命中、
+          是否整段重寫）供機制判讀。(D)(E) 屬假說檢定，輸出在 cache-hypotheses.html（健檢頁另出）。"""
     claude = [r for r in rows
               if r.get("source_kind", SOURCE_CLAUDE) == SOURCE_CLAUDE and r.get("cache_steps")]
     accounts = sorted({r.get("account", "") for r in claude})
@@ -2239,6 +2271,8 @@ def build_cache_report(rows):
     comply_n = comply_hit = 0                       # 1h cohort 應命中帶
     utc = [{"n": 0, "cold": 0, "ts": 0} for _ in range(24)]
     strata = [[0, 0, 0, 0] for _ in REPORT_CMH_STRATA]   # [尖峰冷, 尖峰命中, 離峰冷, 離峰命中]／gap 層
+    band_pairs = []                                 # 應命中帶樣本：(前步脈絡, gap 層 idx, 冷啟)──假說 (E) 用
+    evict_form = []                                 # 帶內冷啟形態：(殘餘 cache_read, 寫入量, 本步脈絡, 前步脈絡)
     causes_total = {k: 0 for k in cause_keys}
     cold_events = []                                # (epoch, cause)：供分期堆疊圖
     warm_max = 0
@@ -2347,6 +2381,9 @@ def build_cache_report(rows):
                     si += 1
                 col = 0 if uh in REPORT_PEAK_UTC else 2
                 strata[si][col + (0 if cold else 1)] += 1
+                band_pairs.append((prev[2], si, cold))
+                if cold:
+                    evict_form.append((cur[1], cur[3], cur[2], prev[2]))
         acct = r.get("account", "")
         tl = timelines.setdefault(acct, [])
         for _, st in steps:
@@ -2410,6 +2447,37 @@ def build_cache_report(rows):
     off_n = sum(sx[2] + sx[3] for sx in strata)
     off_c = sum(sx[2] for sx in strata)
 
+    # ── (E) 脈絡大小假設：帶內樣本依前步脈絡分箱＋趨勢；中位數切大/小、同一 gap 分層 CMH ──
+    ctx_bins = [{"n": 0, "cold": 0} for _ in REPORT_CTX_BINS]
+    ctx_med = 0
+    ctx_cmh = ctx_trend = None
+    ctx_big = {"n": 0, "cold": 0}
+    ctx_small = {"n": 0, "cold": 0}
+    if band_pairs:
+        for pctx, _, was_cold in band_pairs:
+            b = ctx_bins[_ctx_bucket_index(pctx)]
+            b["n"] += 1
+            b["cold"] += 1 if was_cold else 0
+        ctx_med = sorted(p for p, _, _ in band_pairs)[len(band_pairs) // 2]
+        strata_ctx = [[0, 0, 0, 0] for _ in REPORT_CMH_STRATA]   # [大冷, 大命中, 小冷, 小命中]／gap 層
+        for pctx, si, was_cold in band_pairs:
+            grp = ctx_big if pctx >= ctx_med else ctx_small
+            grp["n"] += 1
+            grp["cold"] += 1 if was_cold else 0
+            col = 0 if pctx >= ctx_med else 2
+            strata_ctx[si][col + (0 if was_cold else 1)] += 1
+        ctx_cmh = _cmh([tuple(sx) for sx in strata_ctx])
+        ctx_trend = _ca_trend([(b["cold"], b["n"]) for b in ctx_bins if b["n"]])
+    ev_n = len(evict_form)
+    ev_stats = {
+        "n": ev_n,
+        # 幾乎整段重寫（寫入 ≥ 75% 本步脈絡）＝快取真的不見了，非部分斷點雜訊
+        "full": sum(1 for _, cc_w, ctx, _ in evict_form if cc_w * 4 >= ctx * 3),
+        # 前後脈絡量相當（本步 ≥ 90% 前步）＝可排除壓縮/裁剪造成的假失效
+        "same": sum(1 for _, _, ctx, pctx in evict_form if ctx * 10 >= pctx * 9),
+        "res_med": sorted(cr for cr, _, _, _ in evict_form)[ev_n // 2] if ev_n else 0,
+    }
+
     lim_hours = [0] * 24
     lim_wd = lim_we = 0
     for t in limit_ts:
@@ -2451,6 +2519,9 @@ def build_cache_report(rows):
         "utc": utc,
         "cmh": cmh,
         "peak_n": peak_n, "peak_c": peak_c, "off_n": off_n, "off_c": off_c,
+        # (E) 脈絡假設與帶內失效形態（假說頁）
+        "ctx_bins": ctx_bins, "ctx_med": ctx_med, "ctx_cmh": ctx_cmh, "ctx_trend": ctx_trend,
+        "ctx_big": ctx_big, "ctx_small": ctx_small, "evict_form": ev_stats,
         # 撞牆時刻與資料品質
         "limits_n": len(limit_ts), "limit_hours": lim_hours,
         "limits_wd": lim_wd, "limits_we": lim_we,
@@ -2571,18 +2642,18 @@ def _svg_survival(cohorts):
     return "".join(parts)
 
 
-def _svg_dotplot(rows):
-    """各 UTC 小時的帶內提早失效率：點＋Wilson CI whisker；尖峰帶（13–21 UTC）淡底標示。
-    rows=[{"h","n","cold","local"}]，僅含 n>0 的小時。"""
+def _svg_dotplot(rows, aria):
+    """帶內提早失效率 dot plot：每列一類別，點＋Wilson CI whisker；row["peak"] 的列鋪淡底強調。
+    rows=[{"label","n","cold","peak"}]，僅含 n>0 的列；label 直接作列首文字（含任何標記）。"""
     RH, W, L, R, TOP = 24, 660, 132, 52, 26
     H = TOP + RH * len(rows) + 8
 
     def X(p):
         return L + p * (W - L - R)
 
-    parts = [f'<svg class="viz" viewBox="0 0 {W} {H}" role="img" aria-label="各 UTC 小時的提早失效率">']
-    for ri, row in enumerate(rows):        # 先鋪尖峰底色，再畫格線與點
-        if row["h"] in REPORT_PEAK_UTC:
+    parts = [f'<svg class="viz" viewBox="0 0 {W} {H}" role="img" aria-label="{esc(aria)}">']
+    for ri, row in enumerate(rows):        # 先鋪強調底色，再畫格線與點
+        if row.get("peak"):
             y = TOP + RH * ri
             parts.append(f'<rect x="{L}" y="{y:.1f}" width="{W - L - R}" height="{RH}" class="peak"/>')
     for frac in (0, .25, .5, .75, 1):
@@ -2592,12 +2663,10 @@ def _svg_dotplot(rows):
     for ri, row in enumerate(rows):
         y = TOP + RH * ri + RH / 2
         p, lo, hi = _wilson(row["cold"], row["n"])
-        peak = "🔺" if row["h"] in REPORT_PEAK_UTC else ""
-        parts.append(f'<text x="{L - 8}" y="{y + 4:.1f}" text-anchor="end">'
-                     f'{row["h"]:02d} UTC｜本地≈{esc(row["local"])}{peak}</text>')
+        parts.append(f'<text x="{L - 8}" y="{y + 4:.1f}" text-anchor="end">{esc(row["label"])}</text>')
         parts.append(f'<line x1="{X(lo):.1f}" y1="{y:.1f}" x2="{X(hi):.1f}" y2="{y:.1f}" class="whisk"/>')
         parts.append(f'<circle cx="{X(p):.1f}" cy="{y:.1f}" r="5" class="dot co-evict">'
-                     f'<title>{row["h"]:02d} UTC：帶內冷啟 {row["cold"]}/{row["n"]}（{_ci_str(row["cold"], row["n"])}）</title>'
+                     f'<title>{esc(row["label"])}：帶內冷啟 {row["cold"]}/{row["n"]}（{_ci_str(row["cold"], row["n"])}）</title>'
                      f'</circle>')
         parts.append(f'<text x="{W - R + 6}" y="{y + 4:.1f}">n={row["n"]}</text>')
     parts.append("</svg>")
@@ -2608,16 +2677,8 @@ def _hours_label(hours):
     return "、".join(f"{h:02d}" for h in hours) + " 時" if hours else "—"
 
 
-def render_cache_report_html(d) -> str:
-    parts = []
-    # 導言
-    parts.append('<div class="report">')
-    parts.append('<div class="topbar"><span><a class="back" href="index.html">← 回索引</a></span></div>')
-    parts.append("<h1>⚡ 快取分析報告</h1>")
-    parts.append(
-        '<div class="lead">用每次 API 呼叫的 usage（含 cache_creation 的 5 分／1 小時 TTL 細分）量測：'
-        '快取實際能撐多久、每個冷啟（整段重新暖機）是什麼成因、以及「1 小時內就失效」的異常有多常見。'
-        '僅統計 Claude 主對話（子代理／Codex 不納入）；所有比率附 Wilson 95% 信賴區間（CI）。</div>')
+def _cover_items(d):
+    """報告頁「涵蓋範圍」條目——健檢頁與假說頁共用，兩頁引用的樣本數字必一致。"""
     cover = [f"{d['n_sessions']} 個 session", f"{d['n_pairs']} 個相鄰步樣本"]
     if d["span"]:
         cover.append(d["span"])
@@ -2631,7 +2692,22 @@ def render_cache_report_html(d) -> str:
         if m["unknown"]:
             gen += f"、未知（舊資料）{m['unknown']} 步"
         cover.append(gen)
-    parts.append(f'<div class="lead">涵蓋範圍：{esc(" · ".join(cover))}</div>')
+    return cover
+
+
+def render_cache_report_html(d) -> str:
+    parts = []
+    # 導言
+    parts.append('<div class="report">')
+    parts.append('<div class="topbar"><span><a class="back" href="index.html">← 回索引</a></span>'
+                 '<span><a class="back" href="cache-hypotheses.html">🧪 假說檢定 →</a></span></div>')
+    parts.append("<h1>⚡ 快取分析報告</h1>")
+    parts.append(
+        '<div class="lead">用每次 API 呼叫的 usage（含 cache_creation 的 5 分／1 小時 TTL 細分）量測：'
+        '快取實際能撐多久、每個冷啟（整段重新暖機）是什麼成因、以及「1 小時內就失效」的異常有多常見。'
+        '僅統計 Claude 主對話（子代理／Codex 不納入）；所有比率附 Wilson 95% 信賴區間（CI）。'
+        '「提早失效」的成因假說（伺服器時段／脈絡大小）另在 <a href="cache-hypotheses.html">假說檢定頁</a> 逐一檢定。</div>')
+    parts.append(f'<div class="lead">涵蓋範圍：{esc(" · ".join(_cover_items(d)))}</div>')
 
     # ── KPI 列 ──
     k = d["kpi"]
@@ -2754,37 +2830,9 @@ def render_cache_report_html(d) -> str:
                         for x in order if x in d["break_cats"])
         parts.append(f"<h3>中斷長度分佈</h3>{items}")
 
-    # ── ④ 尖峰假設 ──
-    parts.append("<h2>④ 提早失效會不會跟伺服器時段有關？（實驗性）</h2>")
-    parts.append('<div class="lead">假設：全球尖峰時段快取較易被擠掉、提早失效。樣本＝1h 快取的「應命中帶」'
-                 f'（閒置 {fmt_dur(REPORT_INTRA_SEC)}–{fmt_dur(REPORT_TTL_SAFE_SEC)}）相鄰步，帶內冷啟即異常；'
-                 '依 <b>UTC（伺服器時間）</b>分時、跨帳號匯總。時段和「閒多久」相關（午休/夜間閒得久），'
-                 '所以檢定先依間隔分層（2–15／15–30／30–55 分）再合併（CMH），避免把「閒得久」誤讀成「尖峰失效」。</div>')
-    if d["cmh"] and d["peak_n"] >= 10 and d["off_n"] >= 10:
-        c = d["cmh"]
-        verdict = ("支持假設（尖峰的提早失效勝算顯著較高）" if c["p"] < .05 and c["or"] > 1 else
-                   "與假設相反（尖峰反而較低）" if c["p"] < .05 and c["or"] < 1 else
-                   "看不出顯著差異")
-        ins4 = (f"控制間隔後，尖峰(13–21 UTC) vs 離峰的提早失效勝算比 <b>OR={c['or']:.2f}</b>"
-                f"（95% CI {c['lo']:.2f}–{c['hi']:.2f}，p={c['p']:.3f}，n={c['n']}）→ <b>{verdict}</b>。"
-                f"<span class='hn'>粗率：尖峰 {_ci_str(d['peak_c'], d['peak_n'])}、"
-                f"離峰 {_ci_str(d['off_c'], d['off_n'])}。</span>")
-    else:
-        ins4 = (f"帶內樣本：尖峰(13–21 UTC) <b>{d['peak_n']}</b> 筆、離峰 <b>{d['off_n']}</b> 筆——"
-                "樣本不足以做分層檢定，暫不下結論。合併家用電腦／朋友的資料後（台北晚上正落在"
-                "歐洲午後尖峰），尖峰樣本就會補上。")
-    parts.append(f'<div class="insight">{ins4}</div>')
-    urows = [{"h": h, "n": d["utc"][h]["n"], "cold": d["utc"][h]["cold"],
-              "local": datetime.fromtimestamp(d["utc"][h]["ts"]).strftime("%H時") if d["utc"][h]["ts"] else ""}
-             for h in range(24) if d["utc"][h]["n"]]
-    if urows:
-        parts.append(_svg_dotplot(urows))
-        parts.append('<div class="lead">🔺＝全球尖峰參考帶（13–21 UTC，底色標示）。'
-                     'whisker＝95% CI；n 小時區間很寬，看重疊程度而非點值。</div>')
-
-    # ── ⑤ 撞牆時刻 ──
+    # ── ④ 撞牆時刻 ──
     if d["limits_n"]:
-        parts.append("<h2>⑤ 什麼時候撞到 limit（附帶觀察）</h2>")
+        parts.append("<h2>④ 什麼時候撞到 limit（附帶觀察）</h2>")
         parts.append(f'<div class="lead">紀錄中共 <b>{d["limits_n"]}</b> 次撞到用量上限'
                      f"（429；同 session 10 分鐘內折疊為一次）：平日 {d['limits_wd']}、假日 {d['limits_we']}。"
                      "撞牆後切帳號續聊的冷啟已在②歸為「limit/切帳號」。</div>")
@@ -2794,7 +2842,7 @@ def render_cache_report_html(d) -> str:
             parts.append('<table class="rep"><thead><tr><th>本地時段</th><th class="num">次數</th>'
                          f"</tr></thead><tbody>{cells}</tbody></table>")
 
-    tail = ("※ 全為估算：命中率取自各次呼叫 usage；③時間為本機時區、④為 UTC；成本按公告價與 TTL 細分倍率估。"
+    tail = ("※ 全為估算：命中率取自各次呼叫 usage；③④時間為本機時區；成本按公告價與 TTL 細分倍率估。"
             "冷啟門檻＝命中率 < 25%。")
     if d["neg_gaps"]:
         tail += f"另有 {d['neg_gaps']} 對相鄰步時間倒退（時鐘偏移），已跳過。"
@@ -2806,16 +2854,9 @@ def render_cache_report_html(d) -> str:
 def render_cache_report_md(d) -> str:
     out = ["# ⚡ 快取分析報告", "",
            "用每次 API 呼叫的 usage（含 cache_creation 的 5 分／1 小時 TTL 細分）量測：快取實際能撐多久、"
-           "每個冷啟的成因、以及「1 小時內就失效」的異常。僅統計 Claude 主對話；比率附 Wilson 95% CI。", ""]
-    cover = [f"{d['n_sessions']} 個 session", f"{d['n_pairs']} 個相鄰步樣本"]
-    if d["span"]:
-        cover.append(d["span"])
-    if d["accounts"]:
-        cover.append("帳號 " + "、".join(a or "default" for a in d["accounts"]))
-    m = d["mode_n"]
-    if m["1h"] or m["5m"]:
-        cover.append(f"TTL 細分：1h {m['1h']} 步／5 分 {m['5m']}／未知 {m['unknown']}")
-    out.append("涵蓋範圍：" + " · ".join(cover))
+           "每個冷啟的成因、以及「1 小時內就失效」的異常。僅統計 Claude 主對話；比率附 Wilson 95% CI。"
+           "「提早失效」的成因假說檢定另見 [快取假說檢定](cache-hypotheses.md)。", ""]
+    out.append("涵蓋範圍：" + " · ".join(_cover_items(d)))
 
     k = d["kpi"]
     out += ["", "## 總覽（KPI）", ""]
@@ -2892,9 +2933,147 @@ def render_cache_report_md(d) -> str:
             if x in d["break_cats"]:
                 out.append(f"- {x}：{d['break_cats'][x]} 次")
 
-    out += ["", "## ④ 提早失效 vs 伺服器時段（實驗性，依 UTC）", "",
-            f"樣本＝1h 快取的應命中帶（閒置 {fmt_dur(REPORT_INTRA_SEC)}–{fmt_dur(REPORT_TTL_SAFE_SEC)}）"
-            "相鄰步；依間隔分層（2–15/15–30/30–55 分）做 CMH，控制「閒多久」的混雜。"]
+    if d["limits_n"]:
+        out += ["", "## ④ 什麼時候撞到 limit（附帶觀察）", "",
+                f"共 {d['limits_n']} 次（429；同 session 10 分內折疊）：平日 {d['limits_wd']}、假日 {d['limits_we']}。"]
+        hrs = [(h, n) for h, n in enumerate(d["limit_hours"]) if n]
+        if hrs:
+            out += ["", "| 本地時段 | 次數 |", "|---|---:|"]
+            out += [f"| {h:02d} 時 | {n} |" for h, n in hrs]
+
+    tail = "※ 全為估算：成本按公告價與 TTL 細分倍率；冷啟門檻＝命中率 < 25%。"
+    if d["neg_gaps"]:
+        tail += f"另有 {d['neg_gaps']} 對相鄰步時間倒退（時鐘偏移），已跳過。"
+    out += ["", tail]
+    return "\n".join(out)
+
+
+def _ctx_verdict(d):
+    """假說②（脈絡大小）的結論句素材。回傳 (has_test, verdict字串或None)。"""
+    cc = d["ctx_cmh"]
+    if cc and d["ctx_big"]["n"] >= 10 and d["ctx_small"]["n"] >= 10:
+        verdict = ("支持假設（大脈絡的提早失效勝算顯著較高）" if cc["p"] < .05 and cc["or"] > 1 else
+                   "與假設相反（大脈絡反而較低）" if cc["p"] < .05 and cc["or"] < 1 else
+                   "看不出顯著差異")
+        return True, verdict
+    return False, None
+
+
+def render_cache_hypotheses_html(d) -> str:
+    k = d["kpi"]
+    parts = ['<div class="report">']
+    parts.append('<div class="topbar"><span><a class="back" href="index.html">← 回索引</a></span>'
+                 '<span><a class="back" href="cache-report.html">⚡ 快取分析報告</a></span></div>')
+    parts.append("<h1>🧪 快取假說檢定</h1>")
+    parts.append(
+        '<div class="lead">健檢報告量到「<b>提早失效</b>」——1 小時快取在應命中帶'
+        f'（閒置 {fmt_dur(REPORT_INTRA_SEC)}–{fmt_dur(REPORT_TTL_SAFE_SEC)}，TTL 每次使用會刷新）'
+        '內卻冷啟的異常。這頁把它的候選成因一個假說一節逐一檢定；樣本、門檻與健檢頁同一套'
+        '（結構性冷啟已排除、比率附 Wilson 95% CI），拿自己的 JSONL 跑 viewer 就會得到同一組檢定，可直接對照。</div>')
+    parts.append(f'<div class="lead">涵蓋範圍：{esc(" · ".join(_cover_items(d)))}</div>')
+    if k["comply_n"]:
+        ev = k["comply_n"] - k["comply_hit"]
+        parts.append(f'<div class="insight">共用樣本：應命中帶相鄰步 <b>n={k["comply_n"]}</b>，'
+                     f'其中提早失效 <b>{ev}</b> 次（{_ci_str(ev, k["comply_n"])}）。</div>')
+    else:
+        parts.append('<div class="insight">尚無應命中帶樣本（需要 1h 快取寫入、閒置 2–55 分的相鄰步）；'
+                     '累積資料後這頁才有東西可檢定。</div>')
+
+    # ── ① 尖峰時段假說 ──
+    parts.append("<h2>① 伺服器時段：全球尖峰時較易被擠掉？</h2>")
+    parts.append('<div class="lead">假設：全球尖峰時段伺服器壓力大，快取較易被擠掉、提早失效。'
+                 '依 <b>UTC（伺服器時間）</b>分時、跨帳號匯總。時段和「閒多久」相關（午休/夜間閒得久），'
+                 '所以檢定先依間隔分層（2–15／15–30／30–55 分）再合併（CMH），避免把「閒得久」誤讀成「尖峰失效」。</div>')
+    if d["cmh"] and d["peak_n"] >= 10 and d["off_n"] >= 10:
+        c = d["cmh"]
+        verdict = ("支持假設（尖峰的提早失效勝算顯著較高）" if c["p"] < .05 and c["or"] > 1 else
+                   "與假設相反（尖峰反而較低）" if c["p"] < .05 and c["or"] < 1 else
+                   "看不出顯著差異")
+        ins1 = (f"控制間隔後，尖峰(13–21 UTC) vs 離峰的提早失效勝算比 <b>OR={c['or']:.2f}</b>"
+                f"（95% CI {c['lo']:.2f}–{c['hi']:.2f}，p={c['p']:.3f}，n={c['n']}）→ <b>{verdict}</b>。"
+                f"<span class='hn'>粗率：尖峰 {_ci_str(d['peak_c'], d['peak_n'])}、"
+                f"離峰 {_ci_str(d['off_c'], d['off_n'])}。</span>")
+    else:
+        ins1 = (f"帶內樣本：尖峰(13–21 UTC) <b>{d['peak_n']}</b> 筆、離峰 <b>{d['off_n']}</b> 筆——"
+                "樣本不足以做分層檢定，暫不下結論。合併家用電腦／朋友的資料後（台北晚上正落在"
+                "歐洲午後尖峰），尖峰樣本就會補上。")
+    parts.append(f'<div class="insight">{ins1}</div>')
+    urows = [{"label": f'{h:02d} UTC｜本地≈'
+                       + (datetime.fromtimestamp(d["utc"][h]["ts"]).strftime("%H時") if d["utc"][h]["ts"] else "")
+                       + ("🔺" if h in REPORT_PEAK_UTC else ""),
+              "n": d["utc"][h]["n"], "cold": d["utc"][h]["cold"], "peak": h in REPORT_PEAK_UTC}
+             for h in range(24) if d["utc"][h]["n"]]
+    if urows:
+        parts.append(_svg_dotplot(urows, "各 UTC 小時的提早失效率"))
+        parts.append('<div class="lead">🔺＝全球尖峰參考帶（13–21 UTC，底色標示）。'
+                     'whisker＝95% CI；n 小時區間很寬，看重疊程度而非點值。</div>')
+
+    # ── ② 脈絡大小假說 ──
+    parts.append("<h2>② 累積脈絡：context 越大越容易被擠掉？</h2>")
+    parts.append('<div class="lead">假設：脈絡（input＋cache）越大、快取佔用越多，越容易被提早逐出。'
+                 '依<b>前一步的脈絡</b>分箱——前一步寫進快取的量，正是這次要能活著回來的量。'
+                 '脈絡大小與「閒多久」可能相關，檢定同樣依間隔分層（2–15／15–30／30–55 分）做 CMH：'
+                 '以帶內脈絡<b>中位數</b>切「大／小」兩組比較。</div>')
+    big, small = d["ctx_big"], d["ctx_small"]
+    has_test, verdict = _ctx_verdict(d)
+    if has_test:
+        cc = d["ctx_cmh"]
+        ins2 = (f"控制間隔後，大脈絡（≥ 中位數 {fmt_tokens(d['ctx_med'])}）vs 小脈絡的提早失效勝算比 "
+                f"<b>OR={cc['or']:.2f}</b>（95% CI {cc['lo']:.2f}–{cc['hi']:.2f}，p={cc['p']:.3f}，"
+                f"n={cc['n']}）→ <b>{verdict}</b>。"
+                f"<span class='hn'>粗率：大脈絡 {_ci_str(big['cold'], big['n'])}、"
+                f"小脈絡 {_ci_str(small['cold'], small['n'])}。</span>")
+        t = d["ctx_trend"]
+        if t:
+            ins2 += f"<span class='hn'>分箱趨勢檢定（Cochran–Armitage）：z={t['z']:+.2f}、p={t['p']:.3f}。</span>"
+    else:
+        ins2 = (f"帶內樣本：大脈絡 <b>{big['n']}</b> 筆、小脈絡 <b>{small['n']}</b> 筆——"
+                "樣本不足以分層檢定，暫不下結論；累積更多資料後再看。")
+    parts.append(f'<div class="insight">{ins2}</div>')
+    crows = [{"label": lbl, "n": b["n"], "cold": b["cold"], "peak": False}
+             for b, (_, lbl) in zip(d["ctx_bins"], REPORT_CTX_BINS) if b["n"]]
+    if crows:
+        parts.append(_svg_dotplot(crows, "各脈絡大小的提早失效率"))
+        rows = "".join(f"<tr><td>{esc(lbl)}</td><td class='num'>{b['n']}</td>"
+                       f"<td>{_ci_str(b['cold'], b['n'])}</td></tr>"
+                       for b, (_, lbl) in zip(d["ctx_bins"], REPORT_CTX_BINS) if b["n"])
+        parts.append('<table class="rep"><thead><tr><th>前步脈絡（tokens）</th><th class="num">樣本</th>'
+                     f"<th>帶內提早失效率（CI）</th></tr></thead><tbody>{rows}</tbody></table>")
+    ef = d["evict_form"]
+    if ef["n"]:
+        parts.append("<h3>附帶觀察：失效當下的形態（機制線索）</h3>")
+        parts.append(f'<div class="lead">帶內提早失效共 <b>{ef["n"]}</b> 次：其中 {ef["same"]} 次前後脈絡量相當'
+                     '（本步 ≥ 90% 前步——可排除壓縮/裁剪造成的假失效）、'
+                     f'{ef["full"]} 次幾乎整段重寫（寫入 ≥ 75% 脈絡）＝快取真的不見了。'
+                     f'失效當下仍命中的殘餘量中位數 <b>{fmt_tokens(ef["res_med"])}</b> tokens——'
+                     '快取是前綴式的，殘餘＝請求最前端仍活著的一小段，與「跨 session 共用的開頭段'
+                     '（工具定義等）存活、session 專屬的對話大段被逐出」一致：'
+                     '逐出可能以快取斷點的 segment 為單位、與段落熱度相關，而非整條請求一起死。</div>')
+
+    tail = ("※ 門檻與樣本定義同 <a href='cache-report.html'>健檢頁</a>（冷啟＝該步命中率 < 25%）；"
+            "①時間為 UTC（伺服器時間）、與本地時區無關。假說清單會隨資料與想法擴充。")
+    parts.append(f'<div class="lead" style="margin-top:24px">{tail}</div>')
+    parts.append("</div>")
+    return html_page("快取假說檢定", "".join(parts), body_class="report")
+
+
+def render_cache_hypotheses_md(d) -> str:
+    k = d["kpi"]
+    out = ["# 🧪 快取假說檢定", "",
+           f"健檢報告量到「提早失效」——1 小時快取在應命中帶（閒置 {fmt_dur(REPORT_INTRA_SEC)}–"
+           f"{fmt_dur(REPORT_TTL_SAFE_SEC)}）內卻冷啟的異常。"
+           "這頁逐一檢定它的候選成因；樣本、門檻與健檢頁（[快取分析報告](cache-report.md)）同一套，"
+           "拿自己的 JSONL 跑 viewer 就會得到同一組檢定，可直接對照。", ""]
+    out.append("涵蓋範圍：" + " · ".join(_cover_items(d)))
+    if k["comply_n"]:
+        ev = k["comply_n"] - k["comply_hit"]
+        out += ["", f"共用樣本：應命中帶相鄰步 n={k['comply_n']}，其中提早失效 {ev} 次"
+                    f"（{_ci_str(ev, k['comply_n'])}）。"]
+    else:
+        out += ["", "尚無應命中帶樣本（需要 1h 快取寫入、閒置 2–55 分的相鄰步）。"]
+
+    out += ["", "## ① 伺服器時段：全球尖峰時較易被擠掉？", "",
+            "依 UTC（伺服器時間）分時；依間隔分層（2–15/15–30/30–55 分）做 CMH，控制「閒多久」的混雜。"]
     if d["cmh"] and d["peak_n"] >= 10 and d["off_n"] >= 10:
         c = d["cmh"]
         verdict = ("支持假設" if c["p"] < .05 and c["or"] > 1 else
@@ -2914,18 +3093,35 @@ def render_cache_report_md(d) -> str:
         out.append(f"| {h:02d}{mark} | {u['n']} | {_ci_str(u['cold'], u['n'])} |")
     out.append("> 🔺＝全球尖峰參考帶（13–21 UTC）。n 小時 CI 很寬，看重疊而非點值。")
 
-    if d["limits_n"]:
-        out += ["", "## ⑤ 什麼時候撞到 limit（附帶觀察）", "",
-                f"共 {d['limits_n']} 次（429；同 session 10 分內折疊）：平日 {d['limits_wd']}、假日 {d['limits_we']}。"]
-        hrs = [(h, n) for h, n in enumerate(d["limit_hours"]) if n]
-        if hrs:
-            out += ["", "| 本地時段 | 次數 |", "|---|---:|"]
-            out += [f"| {h:02d} 時 | {n} |" for h, n in hrs]
+    out += ["", "## ② 累積脈絡：context 越大越容易被擠掉？", "",
+            "依前一步的脈絡（前一步寫進快取、這次要能活著回來的量）分箱；"
+            "以帶內中位數切大/小、依間隔分層（2–15/15–30/30–55 分）做 CMH，控制「大脈絡剛好閒得久」的混雜。"]
+    big, small = d["ctx_big"], d["ctx_small"]
+    has_test, verdict = _ctx_verdict(d)
+    if has_test:
+        cc = d["ctx_cmh"]
+        line = (f"- 大脈絡（≥ 中位數 {fmt_tokens(d['ctx_med'])}）vs 小脈絡：OR={cc['or']:.2f}"
+                f"（95% CI {cc['lo']:.2f}–{cc['hi']:.2f}，p={cc['p']:.3f}，n={cc['n']}）→ **{verdict}**"
+                f"；粗率 大 {_ci_str(big['cold'], big['n'])}、小 {_ci_str(small['cold'], small['n'])}")
+        out.append(line)
+        t = d["ctx_trend"]
+        if t:
+            out.append(f"- 分箱趨勢檢定（Cochran–Armitage）：z={t['z']:+.2f}、p={t['p']:.3f}")
+    else:
+        out.append(f"- 大脈絡 {big['n']} 筆、小脈絡 {small['n']} 筆——樣本不足以分層檢定，暫不下結論。")
+    crows = [(lbl, b) for b, (_, lbl) in zip(d["ctx_bins"], REPORT_CTX_BINS) if b["n"]]
+    if crows:
+        out += ["", "| 前步脈絡（tokens） | 樣本 | 帶內提早失效率（CI） |", "|---|---:|---|"]
+        for lbl, b in crows:
+            out.append(f"| {lbl} | {b['n']} | {_ci_str(b['cold'], b['n'])} |")
+    ef = d["evict_form"]
+    if ef["n"]:
+        out += ["", f"附帶觀察（機制線索）：帶內提早失效 {ef['n']} 次——{ef['same']} 次前後脈絡量相當"
+                    f"（排除壓縮/裁剪假失效）、{ef['full']} 次幾乎整段重寫（寫入 ≥ 75% 脈絡）；"
+                    f"殘餘命中中位數 {fmt_tokens(ef['res_med'])} tokens（快取是前綴式的，殘餘＝最前端仍活著的一小段），"
+                    "與「共用開頭段存活、session 專屬對話大段被逐出」一致。"]
 
-    tail = "※ 全為估算：成本按公告價與 TTL 細分倍率；冷啟門檻＝命中率 < 25%。"
-    if d["neg_gaps"]:
-        tail += f"另有 {d['neg_gaps']} 對相鄰步時間倒退（時鐘偏移），已跳過。"
-    out += ["", tail]
+    out += ["", "※ 門檻與樣本定義同健檢頁；①時間為 UTC（伺服器時間）。假說清單會隨資料與想法擴充。"]
     return "\n".join(out)
 
 
@@ -3933,10 +4129,13 @@ def main():
     has_report = cache_data["has_data"]
     if has_report and want_html:
         (out / "cache-report.html").write_text(render_cache_report_html(cache_data), encoding="utf-8")
+        (out / "cache-hypotheses.html").write_text(render_cache_hypotheses_html(cache_data), encoding="utf-8")
     if has_report and want_md:
         (out / "cache-report.md").write_text(render_cache_report_md(cache_data), encoding="utf-8")
+        (out / "cache-hypotheses.md").write_text(render_cache_hypotheses_md(cache_data), encoding="utf-8")
     if not has_report:                       # 沒有可分析資料：清掉舊報告，避免索引指向過期檔
-        for stale in (out / "cache-report.html", out / "cache-report.md"):
+        for stale in (out / "cache-report.html", out / "cache-report.md",
+                      out / "cache-hypotheses.html", out / "cache-hypotheses.md"):
             try:
                 stale.unlink()
             except OSError:
@@ -3975,6 +4174,7 @@ def main():
         print(f"  索引： {index_path}")
         if has_report:
             print(f"  快取分析報告： {(out / 'cache-report.html').resolve()}")
+            print(f"  快取假說檢定： {(out / 'cache-hypotheses.html').resolve()}")
     if args.open and want_html:
         try:
             webbrowser.open(index_path.as_uri())

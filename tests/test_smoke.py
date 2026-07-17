@@ -479,6 +479,7 @@ def test_cache_report(tmp_path=None):
 
     index = (out / "index.html").read_text(encoding="utf-8")
     assert "快取分析報告" in index, "索引應連到快取分析報告"
+    assert "cache-hypotheses.html" in index, "索引應連到快取假說檢定頁"
     # 成本按 TTL 細分計價（1h=2×、5m=1.25×）：A$10 + B$0.6005 + C$10 + D$5 + E$10.0005
     # + F$0.60 + G$1 + H$0.0625 + I$0.50 ＝ $37.7635 ≈ $37.76（全按 5 分假設會低估）
     assert "$37.76" in index, "成本應按 TTL 細分計價（找不到 $37.76）"
@@ -498,6 +499,21 @@ def test_cache_report(tmp_path=None):
     for needle, msg in checks.items():
         assert needle in rep, f"{msg}（找不到 {needle!r}）"
     assert "429" in rep and "污染" not in rep[:200], "撞牆說明應提及 429"
+    # 拆頁：假說檢定（時段/脈絡）移到 cache-hypotheses，健檢頁只留連結
+    assert "尖峰" not in rep, "時段假說應已移出健檢頁"
+    assert "cache-hypotheses.html" in rep, "健檢頁應連到假說頁"
+    hyp = (out / "cache-hypotheses.html").read_text(encoding="utf-8")
+    hchecks = {
+        "伺服器時段": "假說①（尖峰時段）應在假說頁",
+        "累積脈絡": "假說②（context 大小）應在假說頁",
+        "cache-report.html": "假說頁應連回健檢頁",
+        "樣本不足": "小樣本應走「樣本不足」路徑而非硬出 verdict",
+        "附帶觀察": "應有失效形態機制線索（帶內有 evict）",
+        'svg class="viz"': "假說頁應有 dot plot",
+        "🔺": "UTC 尖峰參考帶標示應在假說頁",
+    }
+    for needle, msg in hchecks.items():
+        assert needle in hyp, f"{msg}（找不到 {needle!r}）"
 
     md = (out / "cache-report.md").read_text(encoding="utf-8")
     assert "| limit/切帳號 | 2 |" in md, "md 成因表 switch 應為 2（429 assistant 形態＋401 system 形態）"
@@ -507,6 +523,12 @@ def test_cache_report(tmp_path=None):
     assert "| 回合內雜訊 | 0 |" in md, "md 成因表 intra 應為 0（G 屬 401 邊界，非雜訊）"
     assert "TTL 遵約率" in md and "50%" in md, "md 應有遵約率 50%（H 不得進 1h 遵約樣本）"
     assert "5 分寫入" in md, "md 存活表應出現 5m cohort 欄"
+    hmd = (out / "cache-hypotheses.md").read_text(encoding="utf-8")
+    assert "## ① 伺服器時段" in hmd and "## ② 累積脈絡" in hmd, "md 假說頁應含兩個假說小節"
+    assert "| ≥ 500k | 2 | 50%（CI 9–91%） |" in hmd, \
+        "ctx 分箱：A→B 與 D→E 的前步脈絡皆落 ≥500k、失效 1/2（Wilson CI 9–91%）"
+    assert "殘餘命中中位數 1.0k" in hmd, "機制線索：E 失效時殘餘 cache_read=1000"
+    assert "| UTC 時 |" not in md and "尖峰" not in md, "UTC 表應已移出健檢 md"
     # 直接卡 lineage 重置：G→H（540 秒）必須落在「TTL 未知」cohort 的 5–10 分桶
     # （欄序＝1h、5m、未知各兩欄；沿用 stale 1h 或 5m cohort 都會使此列不符）
     assert "| 5–10 分 | — | — | — | — | 1 |" in md, "H 應落在 unknown lineage 的 5–10 分桶"

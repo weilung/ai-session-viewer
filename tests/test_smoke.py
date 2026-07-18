@@ -602,11 +602,81 @@ def test_codex_step_badges(tmp_path=None):
     print("OK: codex step badges test passed")
 
 
+def test_session_kind_tags(tmp_path=None):
+    # session 型態自動分類：review（首句 # Review）／exec（codex_exec 無頭）／一般；
+    # 索引有型態下拉與標題徽章、row 帶 data-kind、md twin 有型態標記、session 頁有 chip。
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    sess_dir = tmp / "sessions" / "2026" / "06" / "06"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+
+    def line(sec, typ, payload):
+        return json.dumps({"timestamp": f"2026-06-06T02:00:{sec:02d}.000Z",
+                           "type": typ, "payload": payload}, ensure_ascii=False)
+
+    def tc(sec, inp, cached, out):
+        return line(sec, "event_msg", {"type": "token_count", "info": {
+            "last_token_usage": {"input_tokens": inp, "cached_input_tokens": cached,
+                                 "output_tokens": out, "reasoning_output_tokens": 0,
+                                 "total_tokens": inp + out}}})
+
+    sid_a = "019f0000-0000-7000-8000-00000000000a"   # exec ＋ 首句 review → 型態 review
+    (sess_dir / f"rollout-2026-06-06T02-00-00-{sid_a}.jsonl").write_text("\n".join([
+        line(0, "session_meta", {"id": sid_a, "cwd": "/x/P", "cli_version": "0.29.0",
+                                 "originator": "codex_exec", "source": "exec"}),
+        line(1, "turn_context", {"cwd": "/x/P", "model": "gpt-5.5"}),
+        line(2, "event_msg", {"type": "user_message",
+                              "message": "# Review: demo-r1 — 2026-06-06 — P\n請唯讀審查REVIEWKINDMARK。"}),
+        line(3, "response_item", {"type": "message", "role": "assistant",
+                                  "content": [{"type": "output_text", "text": "CLEAN"}]}),
+        tc(4, 3000, 2000, 10),
+    ]), encoding="utf-8")
+
+    sid_b = "019f0001-0000-7000-8000-00000000000b"   # 無 originator、一般首句 → 型態 chat（無徽章）
+    # （sid 前 8 碼須與 sid_a 不同：輸出檔名含 sid[:8]，同分鐘＋同專案＋同前綴會互蓋）
+    (sess_dir / f"rollout-2026-06-06T02-10-00-{sid_b}.jsonl").write_text("\n".join([
+        line(10, "session_meta", {"id": sid_b, "cwd": "/x/P", "cli_version": "0.29.0"}),
+        line(11, "turn_context", {"cwd": "/x/P", "model": "gpt-5.5"}),
+        line(12, "event_msg", {"type": "user_message", "message": "一般對話CHATKINDMARK。"}),
+        line(13, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "好的。"}]}),
+        tc(14, 3000, 2500, 10),
+    ]), encoding="utf-8")
+
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--codex-source", f"demo={tmp / 'sessions'}",
+         "--no-claude", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+
+    index = (out / "index.html").read_text(encoding="utf-8")
+    assert 'id="fk"' in index, "索引應有型態下拉（兩種型態並存）"
+    assert ">review</option>" in index and ">一般</option>" in index, "下拉應列出 review 與 一般"
+    assert 'data-kind="review"' in index and 'data-kind="chat"' in index, "row 應帶 data-kind"
+    assert 'class="chip kind"' in index and ">review</span>" in index, "review 標題旁應有型態徽章"
+    assert "r.dataset.kind===k" in index and "k:FK?FK.value:''" in index, "篩選 JS 應納入型態並記憶狀態"
+
+    htmls = {p.name: p.read_text(encoding="utf-8") for p in (out / "sessions").rglob("*.html")}
+    page_a = next(v for v in htmls.values() if "REVIEWKINDMARK" in v)
+    page_b = next(v for v in htmls.values() if "CHATKINDMARK" in v)
+    assert 'class="chip kind"' in page_a and ">review</span>" in page_a, "review session 頁應有型態 chip"
+    assert 'class="chip kind"' not in page_b, "一般 session 頁不應有型態 chip"
+
+    imd = (out / "index.md").read_text(encoding="utf-8")
+    assert "型態:review" in imd, "md 索引應標 review 型態"
+    assert "型態:一般" not in imd, "一般型態不標（避免噪音）"
+    md_a = next(p.read_text(encoding="utf-8") for p in (out / "sessions").rglob("*.md")
+                if "REVIEWKINDMARK" in p.read_text(encoding="utf-8"))
+    assert "- 型態：review" in md_a, "session md 表頭應有型態列"
+    print("OK: session kind tags test passed")
+
+
 if __name__ == "__main__":
     test_smoke()
     test_search()
     test_subagent_inline()
     test_day_divider()
     test_compact_marker()
-    test_cache_report()
     test_codex_step_badges()
+    test_session_kind_tags()
+    test_cache_report()

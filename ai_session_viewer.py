@@ -47,9 +47,20 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 27  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 28  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
+
+# session 型態（自動分類）：review／exec／chat（一般互動）。快取統計上 review/exec 與互動
+# session 是不同母體（2026-07-18 以 175 個本機 rollout 實測：本語料 85% 為 exec），故標記＋可篩選。
+# - review：首句（去噪後）以 REVIEW_PREFIX 開頭——涵蓋 review runner 標頭「# Review: <label>」與
+#   review prompt 檔 H1「# Review Prompt：」；Claude/Codex 皆適用（反向流程 Claude 當審查者也會中）。
+# - exec：Codex 無頭執行（session_meta.originator == "codex_exec"／source == "exec"）。
+# - 首句為 review 的 exec session 歸 review（review 是更有資訊量的標籤）。
+REVIEW_PREFIX = "# Review"
+KIND_LABELS = {"review": "review", "exec": "exec", "chat": "一般"}
+KIND_TITLES = {"review": "首句為 review prompt（# Review 開頭）——cross-model review session",
+               "exec": "codex exec 無頭執行（session_meta.originator）"}
 SOURCE_LABELS = {
     SOURCE_CLAUDE: "Claude Code",
     SOURCE_CODEX: "Codex",
@@ -460,6 +471,8 @@ class Session:
         self.account = ""
         self.ai_title = ""
         self.rename = ""
+        self.exec_origin = False    # Codex 無頭執行（session_meta.originator == "codex_exec"）
+        self.kind = "chat"          # 型態 review/exec/chat（analyze 時判定，見 REVIEW_PREFIX 註解）
         self.models = []
         self.tok_out = 0
         self.ctx_peak = 0
@@ -701,6 +714,8 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             meta_id = (payload.get("id") or "").strip()
             if meta_id:
                 s.session_id = meta_id
+            if payload.get("originator") == "codex_exec" or payload.get("source") == "exec":
+                s.exec_origin = True
             s.cwd = payload.get("cwd") or s.cwd
             git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
             s.branch = git.get("branch") or s.branch
@@ -1099,6 +1114,9 @@ def analyze(s):
     s.n_turns = len(s.main_groups) + len(s.side_groups)
     _collect_usage(s)
     s.cache_steps, s.cache_models, s.cache_events = collect_cache_steps(s)
+    first_txt = first_user_text(s.events)
+    s.kind = ("review" if first_txt.startswith(REVIEW_PREFIX)
+              else "exec" if s.exec_origin else "chat")
 
 
 def _collect_usage(s):
@@ -1649,7 +1667,9 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
         w = context_window(getattr(s, "resume_model", "") or (s.models[-1] if s.models else ""))
         pct = f"（≈{round(100 * rc / w)}% / {fmt_tokens(w)}）" if w else ""
         usage += f" · ↩ resume 約 ~{fmt_tokens(rc)}{pct}"
-    stats = f"💬 {s.n_user} 問 / {s.n_assistant} 答 · 🔧 {s.n_tools} 次工具呼叫{usage}"
+    kind_chip = (f'<span class="chip kind" title="{esc_attr(KIND_TITLES.get(s.kind, ""))}">{esc(KIND_LABELS.get(s.kind, s.kind))}</span> · '
+                 if s.kind != "chat" else "")
+    stats = f"{kind_chip}💬 {s.n_user} 問 / {s.n_assistant} 答 · 🔧 {s.n_tools} 次工具呼叫{usage}"
     h1 = f'<span class="named">✎ {esc(s.title)}</span>' if s.rename else esc(s.title)
     sub = (f'<div class="smeta">自動標題：{esc(s.ai_title)}</div>'
            if (s.rename and s.ai_title and s.ai_title != s.title) else "")
@@ -1810,6 +1830,7 @@ def render_session_md(s: Session) -> str:
          if (s.usage.get("total_in") or s.tok_out) else None),
         (f"- 脈絡峰值：{fmt_tokens(s.ctx_peak)} · 產出 {fmt_tokens(s.tok_out)}"
          if (s.usage.get("total_in") or s.tok_out) else None),
+        (f"- 型態：{KIND_LABELS.get(s.kind, s.kind)}" if s.kind != "chat" else None),
         f"- Session：`{s.session_id}` · v{s.version}",
         "", "---",
     ]
@@ -1994,6 +2015,8 @@ def render_index_html(rows, show_account=False, cache_report=False) -> str:
     accounts = sorted({r.get("account", "") for r in rows if r.get("account")})
     sources = sorted({r.get("source_kind", SOURCE_CLAUDE) for r in rows})
     show_source = len(sources) > 1
+    kinds = sorted({r.get("kind") or "chat" for r in rows})
+    show_kind = len(kinds) > 1          # 單一型態（如全為一般互動）時不顯示型態下拉
     proj_opts = "".join(f'<option value="{esc_attr(p)}">{esc(p)}</option>' for p in projects)
     month_opts = "".join(f'<option value="{esc_attr(m)}">{esc(m)}</option>' for m in months)
     acc_opts = "".join(f'<option value="{esc_attr(a)}">{esc(a)}</option>' for a in accounts)
@@ -2002,6 +2025,9 @@ def render_index_html(rows, show_account=False, cache_report=False) -> str:
                   if show_account else "")
     src_select = (f'<select id="fs" onchange="af()"><option value="">全部工具</option>{src_opts}</select>'
                   if show_source else "")
+    kind_opts = "".join(f'<option value="{esc_attr(k)}">{esc(KIND_LABELS.get(k, k))}</option>' for k in kinds)
+    kind_select = (f'<select id="fk" onchange="af()"><option value="">全部型態</option>{kind_opts}</select>'
+                   if show_kind else "")
     acc_th = "<th>帳號/來源</th>" if show_account else ""
     src_th = "<th>工具</th>" if show_source else ""
     tr = []
@@ -2011,23 +2037,26 @@ def render_index_html(rows, show_account=False, cache_report=False) -> str:
         chip_title = (("夾 " + r.get("proj_munged", "") + (" · " + r["cwd"] if r.get("cwd") else ""))
                       if src == SOURCE_CLAUDE else r.get("cwd", ""))   # Codex 的 proj_munged 不是真夾，不標「夾」
         ai = r.get("ai_title", "")
+        kind = r.get("kind") or "chat"
         blob = (source_label(src) + " " + acc + " " + r["proj"] + " "
                 + r.get("cwd", "") + " " + r.get("proj_munged", "") + " "
-                + r["title"] + " " + ai + " " + r.get("branch", "")).lower()
+                + r["title"] + " " + ai + " " + r.get("branch", "") + " " + kind).lower()
         acc_td = f'<td><span class="chip acc">{esc(acc)}</span></td>' if show_account else ""
         src_td = f'<td><span class="chip src">{esc(source_label(src))}</span></td>' if show_source else ""
         ns = r.get("n_subagents") or 0
         nc = r.get("n_compacts") or 0
+        kind_badge = (f' <span class="chip kind" title="{esc_attr(KIND_TITLES.get(kind, ""))}">{esc(KIND_LABELS.get(kind, kind))}</span>'
+                      if kind != "chat" else "")
         sub_badge = (f' <span class="chip sub" title="包含 {ns} 個子代理對話（其他 JSONL 內容）">🧩 ×{ns}</span>'
                      if ns else "")
         sub_badge += (f' <span class="chip compact" title="此 session 發生 {nc} 次壓縮（手動 /compact 或自動）">✂ ×{nc}</span>'
                       if nc else "")
         if r.get("rename"):
-            title_html = f'<span class="named">✎ {esc(r["title"])}</span>{sub_badge}'
+            title_html = f'<span class="named">✎ {esc(r["title"])}</span>{kind_badge}{sub_badge}'
             if ai and ai != r["title"]:
                 title_html += f'<div class="subtitle">{esc(ai)}</div>'
         else:
-            title_html = esc(r["title"]) + sub_badge
+            title_html = esc(r["title"]) + kind_badge + sub_badge
         mem_link = (f'<a class="memlink" href="{esc_attr(r["mem_href"])}" title="此專案 memory">🧠</a>'
                     if r.get("mem_href") else "")
         cost_cell = cost_label(r.get("cost", 0) or 0, r.get("cost_partial"))
@@ -2038,7 +2067,7 @@ def render_index_html(rows, show_account=False, cache_report=False) -> str:
                        if rc else '<td class="num" data-sort="0"></td>')
         tr.append(
             f'<tr data-source="{esc_attr(src)}" data-acc="{esc_attr(acc)}" data-proj="{esc_attr(r["proj"])}" '
-            f'data-month="{esc_attr(r.get("month",""))}" data-text="{esc_attr(blob)}">'
+            f'data-month="{esc_attr(r.get("month",""))}" data-kind="{esc_attr(kind)}" data-text="{esc_attr(blob)}">'
             f'<td class="nowrap">{esc(r.get("date_str",""))}</td>'
             f'{src_td}'
             f'{acc_td}'
@@ -2074,6 +2103,7 @@ def render_index_html(rows, show_account=False, cache_report=False) -> str:
     <input id="q" class="search" placeholder="🔍 搜尋標題 / 專案 / 分支…" oninput="af()">
     {src_select}
     {acc_select}
+    {kind_select}
     <select id="fp" onchange="af()"><option value="">全部專案</option>{proj_opts}</select>
     <select id="fm" onchange="af()"><option value="">全部月份</option>{month_opts}</select>
     <button id="clr" class="clr" type="button" onclick="clearF()">清除</button>
@@ -2089,7 +2119,7 @@ def render_index_html(rows, show_account=False, cache_report=False) -> str:
   </table>
 </div>
 <script>
-var Q=document.getElementById('q'),FS=document.getElementById('fs'),FP=document.getElementById('fp'),FM=document.getElementById('fm'),FA=document.getElementById('fa'),CNT=document.getElementById('cnt');
+var Q=document.getElementById('q'),FS=document.getElementById('fs'),FP=document.getElementById('fp'),FM=document.getElementById('fm'),FA=document.getElementById('fa'),FK=document.getElementById('fk'),CNT=document.getElementById('cnt');
 var ROWS=[].slice.call(document.querySelectorAll('#tbl tbody tr'));
 var MEM={mem_js},MSTRIP=document.getElementById('memstrip');
 function updMem(p,s,a){{
@@ -2111,12 +2141,12 @@ function updMem(p,s,a){{
 function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
 function lsSet(k,v){{try{{localStorage.setItem(k,v);}}catch(e){{}}}}
 var FKEY='idx_filter_v1';
-function saveF(){{lsSet(FKEY,JSON.stringify({{q:Q.value,s:FS?FS.value:'',p:FP.value,m:FM.value,a:FA?FA.value:''}}));}}
+function saveF(){{lsSet(FKEY,JSON.stringify({{q:Q.value,s:FS?FS.value:'',p:FP.value,m:FM.value,a:FA?FA.value:'',k:FK?FK.value:''}}));}}
 function setSel(el,v){{if(!el||!v)return;for(var i=0;i<el.options.length;i++){{if(el.options[i].value===v){{el.value=v;return;}}}}}}
-function restoreF(){{var raw=lsGet(FKEY);if(!raw)return;try{{var f=JSON.parse(raw);if(f.q)Q.value=f.q;setSel(FS,f.s);setSel(FP,f.p);setSel(FM,f.m);setSel(FA,f.a);}}catch(e){{}}}}
-function clearF(){{Q.value='';if(FS)FS.value='';FP.value='';FM.value='';if(FA)FA.value='';af();}}
-function af(){{var q=Q.value.toLowerCase(),s=FS?FS.value:'',p=FP.value,m=FM.value,a=FA?FA.value:'',n=0;
- ROWS.forEach(function(r){{var ok=(!q||r.dataset.text.indexOf(q)>=0)&&(!s||r.dataset.source===s)&&(!p||r.dataset.proj===p)&&(!m||r.dataset.month===m)&&(!a||r.dataset.acc===a);
+function restoreF(){{var raw=lsGet(FKEY);if(!raw)return;try{{var f=JSON.parse(raw);if(f.q)Q.value=f.q;setSel(FS,f.s);setSel(FP,f.p);setSel(FM,f.m);setSel(FA,f.a);setSel(FK,f.k);}}catch(e){{}}}}
+function clearF(){{Q.value='';if(FS)FS.value='';FP.value='';FM.value='';if(FA)FA.value='';if(FK)FK.value='';af();}}
+function af(){{var q=Q.value.toLowerCase(),s=FS?FS.value:'',p=FP.value,m=FM.value,a=FA?FA.value:'',k=FK?FK.value:'',n=0;
+ ROWS.forEach(function(r){{var ok=(!q||r.dataset.text.indexOf(q)>=0)&&(!s||r.dataset.source===s)&&(!p||r.dataset.proj===p)&&(!m||r.dataset.month===m)&&(!a||r.dataset.acc===a)&&(!k||r.dataset.kind===k);
   r.style.display=ok?'':'none';if(ok)n++;}});
  CNT.textContent=n+' / '+ROWS.length;updMem(p,s,a);saveF();}}
 restoreF();af();
@@ -2148,8 +2178,10 @@ def render_index_md(rows, show_account=False, cache_report=False) -> str:
             acc = f"`{r.get('account','')}` · " if (show_account and r.get("account")) else ""
             mark = "✎ " if r.get("rename") else ""
             cost = cost_label(r.get("cost", 0) or 0, r.get("cost_partial"))
+            kind = r.get("kind") or "chat"
             out.append(f"- {acc}[{mark}{r['title']}](sessions/{r['out_md']}) — {r.get('date_str','?')} · "
                        f"~{cost} · {r['n_user']}問/{r['n_assistant']}答 · 🔧{r['n_tools']}"
+                       + (f" · 型態:{KIND_LABELS.get(kind, kind)}" if kind != "chat" else "")
                        + (f" · `{r['branch']}`" if r.get("branch") else ""))
         out.append("")
     return "\n".join(out)
@@ -3435,6 +3467,7 @@ def session_to_row(s: "Session") -> dict:
         "title": s.title,
         "rename": s.rename,
         "ai_title": s.ai_title,
+        "kind": s.kind,
         "models": [short_model(m) for m in s.models],
         "cost": s.cost,
         "cost_partial": s.cost_partial,

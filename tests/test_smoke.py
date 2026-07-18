@@ -671,6 +671,96 @@ def test_session_kind_tags(tmp_path=None):
     print("OK: session kind tags test passed")
 
 
+def test_codex_survival_report(tmp_path=None):
+    # Codex 快取存活統計獨立頁：相鄰呼叫 gap→命中，依型態分層；與 Claude 報告互相獨立
+    #（無 Claude 資料時 cache-report 不產生、cache-codex 照樣產生）。
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    sess_dir = tmp / "sessions" / "2026" / "06" / "07"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+
+    def mkline(base_h, n, typ, payload):
+        ts = f"2026-06-07T{base_h + n // 3600:02d}:{(n % 3600) // 60:02d}:{n % 60:02d}.000Z"
+        return json.dumps({"timestamp": ts, "type": typ, "payload": payload}, ensure_ascii=False)
+
+    def call(base_h, n, text, inp, cached, out_t):
+        # 一次 API 呼叫＝assistant message（步驟起點，usage 掛此事件、epoch 取此事件時間）＋token_count
+        return [
+            mkline(base_h, n, "response_item", {"type": "message", "role": "assistant",
+                                                "content": [{"type": "output_text", "text": text}]}),
+            mkline(base_h, n + 1, "event_msg", {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": inp, "cached_input_tokens": cached,
+                                     "output_tokens": out_t, "reasoning_output_tokens": 0,
+                                     "total_tokens": inp + out_t}}}),
+        ]
+
+    # A（exec＋首句 review → 型態 review）：30s 暖 → 480s 冷 → 5400s 暖（跨 1 小時仍 ≥25%）
+    sid_a = "019f0002-0000-7000-8000-00000000000a"
+    rows_a = [
+        mkline(1, 0, "session_meta", {"id": sid_a, "cwd": "/x/P", "cli_version": "0.29.0",
+                                      "originator": "codex_exec", "source": "exec"}),
+        mkline(1, 1, "turn_context", {"cwd": "/x/P", "model": "gpt-5.5"}),
+        mkline(1, 2, "event_msg", {"type": "user_message", "message": "# Review: surv-r1 — 審查SURVAMARK。"}),
+    ]
+    rows_a += call(1, 100, "步1", 2000, 1800, 10)
+    rows_a += call(1, 130, "步2", 2100, 1900, 20)        # gap 30s → <1 分，90% 暖
+    rows_a += call(1, 610, "步3", 2200, 100, 30)         # gap 480s → 5–10 分，5% 冷
+    rows_a += call(1, 6010, "步4", 2300, 800, 40)        # gap 5400s → 1–2 時，35% 暖（top_warm）
+    (sess_dir / f"rollout-2026-06-07T01-00-00-{sid_a}.jsonl").write_text(
+        "\n".join(rows_a), encoding="utf-8")
+
+    # B（一般互動）：40s 暖 → 1200s 冷
+    sid_b = "019f0003-0000-7000-8000-00000000000b"
+    rows_b = [
+        mkline(4, 0, "session_meta", {"id": sid_b, "cwd": "/x/P", "cli_version": "0.29.0"}),
+        mkline(4, 1, "turn_context", {"cwd": "/x/P", "model": "gpt-5.5"}),
+        mkline(4, 2, "event_msg", {"type": "user_message", "message": "一般對話SURVBMARK。"}),
+    ]
+    rows_b += call(4, 200, "步1", 2000, 1900, 10)
+    rows_b += call(4, 240, "步2", 2000, 1800, 20)        # gap 40s → <1 分，90% 暖
+    rows_b += call(4, 1440, "步3", 2500, 200, 30)        # gap 1200s → 15–30 分，8% 冷
+    (sess_dir / f"rollout-2026-06-07T04-00-00-{sid_b}.jsonl").write_text(
+        "\n".join(rows_b), encoding="utf-8")
+
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--codex-source", f"demo={tmp / 'sessions'}",
+         "--no-claude", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+
+    # 獨立性：無 Claude 資料 → 健檢頁不產生，Codex 頁照樣產生
+    assert (out / "cache-codex.html").exists() and (out / "cache-codex.md").exists(), "應產生 Codex 存活頁"
+    assert not (out / "cache-report.html").exists(), "無 Claude 資料不應產生健檢頁"
+
+    index = (out / "index.html").read_text(encoding="utf-8")
+    assert "cache-codex.html" in index, "索引應連到 Codex 存活頁"
+    assert "cache-report.html" not in index, "索引不應連到不存在的健檢頁"
+    imd = (out / "index.md").read_text(encoding="utf-8")
+    assert "[Codex 快取存活](cache-codex.md)" in imd, "md 索引應連到 Codex 存活頁"
+
+    md = (out / "cache-codex.md").read_text(encoding="utf-8")
+    assert "整體命中率（token 加權）：**56%**" in md, "token 加權命中率應為 8500/15100=56%"
+    assert "相鄰呼叫樣本：**5**" in md, "相鄰樣本應為 5（A 3 對＋B 2 對）"
+    assert "**0/2**" in md, "短間隔（<2 分）斷點冷啟應為 0/2"
+    assert "review：樣本" in md and "一般：樣本" in md, "分層欄應含 review 與 一般"
+    assert "exec：樣本" not in md, "無 exec 樣本不應出現該欄"
+    assert "| < 1 分 | 2 | 100%" in md and "| 90% |" in md, "<1 分桶：2 樣本全命中、中位 90%"
+    assert "| 5–10 分 | 1 | 0%" in md and "| 5% |" in md, "5–10 分桶：1 樣本冷啟、中位 5%"
+    assert "| 15–30 分 | 1 | 0%" in md, "15–30 分桶：1 樣本冷啟"
+    assert "| 1–2 時 | 1 | 100%" in md and "| 35% |" in md, "1–2 時桶：1 樣本命中、中位 35%"
+    assert "後仍 ≥ 25%" in md, "應列出 ≥1 小時仍命中的觀察"
+    assert "非 TTL 量測" in md, "md 應明示方法限制"
+
+    html = (out / "cache-codex.html").read_text(encoding="utf-8")
+    assert "Codex 快取存活統計" in html and 'svg class="viz"' in html, "應有標題與存活曲線 SVG"
+    assert 'class="sw co-1h"' in html, "legend 應有 sw 色塊"
+    assert ">review<" in html and ">一般<" in html, "legend/表頭應含 review 與 一般"
+    assert 'class="rep"' in html, "應有統計表"
+    assert "觀察" in html and "不是 TTL 量測" in html, "頁面應明示方法限制"
+    assert "cache-report.html" not in html, "無 Claude 報告時 Codex 頁不得殘留健檢頁連結（斷鏈）"
+    print("OK: codex survival report test passed")
+
+
 if __name__ == "__main__":
     test_smoke()
     test_search()
@@ -679,4 +769,5 @@ if __name__ == "__main__":
     test_compact_marker()
     test_codex_step_badges()
     test_session_kind_tags()
+    test_codex_survival_report()
     test_cache_report()

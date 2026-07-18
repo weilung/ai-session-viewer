@@ -96,6 +96,8 @@ out/
 ├─ cache-report.md   ← 同上，grep / 存檔用
 ├─ cache-hypotheses.html ← 快取假說檢定（與快取分析報告成對產生、互相連結）
 ├─ cache-hypotheses.md   ← 同上，grep / 存檔用
+├─ cache-codex.html ← Codex 快取存活統計（有 Codex 資料時產生；獨立頁，不與 Claude 統計相混）
+├─ cache-codex.md   ← 同上，grep / 存檔用
 ├─ sessions/
 │  ├─ claude-code/ ← 工具 namespace
 │  │  ├─ main/     ← 每個來源(帳號)一個資料夾
@@ -179,6 +181,13 @@ out/
 
 純估算、只統計 Claude 主對話（子代理／Codex 不納入）；健檢頁③④時間用本機時區、假說頁①用 UTC（伺服器
 時間）。資料存在每個 session 的 manifest row 裡，所以增量建置不必重讀 JSONL 就能更新報告。
+
+**Codex 呢？**兩家 TTL 機制不同（OpenAI 是自動快取：無寫入量/TTL 標記、前綴部分命中、快取在組織內
+跨 session 共享），所以 Codex **不混進上述統計**，另出獨立頁 `out/cache-codex.html/md`（有 Codex
+資料時產生、index 頂有連結）：相鄰呼叫的「閒置間隔 → 命中率」存活曲線，依 session 型態
+（review／exec／一般）分層對照，附短間隔斷點雜訊率、各間隔桶的中位命中%（看部分命中的衰減幅度）與
+長閒置仍命中的觀察清單。頁上明示方法限制：這是**觀察**，不是 TTL 量測——長閒置後的「命中」可能只是
+共享前綴殘餘或其他 session 恰好刷新。
 
 ## 專案 memory
 

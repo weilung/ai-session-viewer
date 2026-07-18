@@ -47,7 +47,7 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 28  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 29  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -145,6 +145,7 @@ CACHE_COLD_PCT = 25       # 命中率低於此值視為「冷啟動」（該步�
 # 幾乎全為 1 小時寫入），因此 TTL 是「量測」而非推估；每個冷啟依成因分解（見 REPORT_CAUSES），
 # 只有排除結構性成因（session 第一句、切帳號、換模型、壓縮）後的樣本才進 TTL 存活估計（競爭風險原則）。
 REPORT_MIN_CTX = 500          # 脈絡低於此 token 數的步驟不納入分析（暖機/瑣碎呼叫，命中率無參考意義）
+                              # ——與 REPORT_GAP_BUCKETS 同供 Codex 存活頁（cache-codex）重用
 REPORT_BREAK_SEC = 30 * 60    # 全域閒置 ≥ 此秒數＝一次「中斷」，其後第一個冷啟步＝「重新開工」事件
 REPORT_INTRA_SEC = 2 * 60     # 間隔 < 此秒數＝回合內連續呼叫（快取斷點/20-block 回溯等一次性 miss 雜訊）
 REPORT_TTL_SAFE_SEC = 55 * 60  # 1h TTL 的「應命中」上界（留 5 分鐘餘裕）；band 內冷啟＝提早失效（異常）
@@ -482,6 +483,7 @@ class Session:
         self.cache_steps = []
         self.cache_models = []
         self.cache_events = []
+        self.codex_steps = []
         self.usage = {"input": 0, "cache_create": 0, "cache_read": 0, "output": 0, "total_in": 0}
         self.n_user = self.n_assistant = self.n_tools = 0
         self.out_html = ""
@@ -1117,6 +1119,7 @@ def analyze(s):
     first_txt = first_user_text(s.events)
     s.kind = ("review" if first_txt.startswith(REVIEW_PREFIX)
               else "exec" if s.exec_origin else "chat")
+    s.codex_steps = collect_codex_steps(s)
 
 
 def _collect_usage(s):
@@ -1243,6 +1246,28 @@ def collect_cache_steps(s):
             events.append([int(dt.timestamp()), kind])
     events.sort()
     return steps, models, events
+
+
+def collect_codex_steps(s):
+    """Codex 每次 API 呼叫的 [epoch, cache_read, 脈絡] 序列，供 Codex 存活統計頁（cache-codex）使用。
+    與 Claude 的 cache_steps 刻意分開存：cache_steps 是 Anthropic TTL 報告的原料，兩家 TTL 機制不同，
+    不得混入同一組統計。步驟＝載入器把 token_count 掛在呼叫首事件上的 usage（見 load_codex_session）；
+    Codex 事件 id 逐筆合成且 usage 每呼叫恰掛一筆，故不需 message.id 去重。"""
+    if s.source_kind != SOURCE_CODEX:
+        return []
+    steps = []
+    for e in sorted((e for e in s.events if e.get("type") == "assistant"), key=ts_key):
+        msg = e.get("message") or {}
+        u = msg.get("usage") or {}
+        if not isinstance(u, dict):
+            continue
+        c2 = usage_int(u, "cache_read_input_tokens")
+        total_in = usage_int(u, "input_tokens") + c2
+        dt = e.get("_dt")
+        if total_in <= 0 or not dt:
+            continue
+        steps.append([int(dt.timestamp()), c2, total_in])
+    return steps
 
 
 def _step_cold(st):
@@ -2008,7 +2033,7 @@ def cost_summary(rows):
     return " · 估算花費：" + " · ".join(parts)
 
 
-def render_index_html(rows, show_account=False, cache_report=False) -> str:
+def render_index_html(rows, show_account=False, cache_report=False, codex_report=False) -> str:
     rows = sorted(rows, key=lambda r: r.get("start_ts") or 0, reverse=True)
     projects = sorted({r["proj"] for r in rows})
     months = sorted({r["month"] for r in rows if r.get("month")}, reverse=True)
@@ -2094,11 +2119,18 @@ def render_index_html(rows, show_account=False, cache_report=False) -> str:
               .replace("<", "\\u003c").replace(">", "\\u003e")
               .replace(" ", "\\u2028").replace(" ", "\\u2029"))
     grand = cost_summary(rows)
+    rlinks = []
+    if cache_report:
+        rlinks += ['<a href="cache-report.html">⚡ 快取分析報告 →</a>',
+                   '<a href="cache-hypotheses.html">🧪 快取假說檢定 →</a>']
+    if codex_report:
+        rlinks.append('<a href="cache-codex.html">📈 Codex 快取存活 →</a>')
+    report_links_div = f'<div class="smeta">{"　".join(rlinks)}</div>' if rlinks else ''
     body = f"""
 <div class="wrap">
   <h1>AI 對話紀錄</h1>
   <div class="smeta">{len(rows)} 個 session · {len(sources) or 1} 種工具 · {len(accounts) or 1} 個帳號 · {len(projects)} 個專案{grand} · 產生於 {esc(local_str(datetime.now()))}</div>
-  {'<div class="smeta"><a href="cache-report.html">⚡ 快取分析報告 →</a>　<a href="cache-hypotheses.html">🧪 快取假說檢定 →</a></div>' if cache_report else ''}
+  {report_links_div}
   <div class="filters">
     <input id="q" class="search" placeholder="🔍 搜尋標題 / 專案 / 分支…" oninput="af()">
     {src_select}
@@ -2161,7 +2193,7 @@ document.querySelectorAll('#tbl th').forEach(function(th,i){{th.onclick=function
     return html_page("Claude Code 對話紀錄", body)
 
 
-def render_index_md(rows, show_account=False, cache_report=False) -> str:
+def render_index_md(rows, show_account=False, cache_report=False, codex_report=False) -> str:
     by_source_proj = {}
     for r in rows:
         by_source_proj.setdefault((r.get("source_kind", SOURCE_CLAUDE), r["proj"]), []).append(r)
@@ -2169,8 +2201,13 @@ def render_index_md(rows, show_account=False, cache_report=False) -> str:
     n_acc = len({r.get("account", "") for r in rows if r.get("account")}) or 1
     out = ["# AI 對話紀錄", "",
            f"{len(rows)} 個 session · {len(sources) or 1} 種工具 · {n_acc} 個帳號 · {len({p for _, p in by_source_proj})} 個專案{cost_summary(rows)}", ""]
+    links = []
     if cache_report:
-        out += ["⚡ [快取分析報告](cache-report.md) · 🧪 [快取假說檢定](cache-hypotheses.md)", ""]
+        links += ["⚡ [快取分析報告](cache-report.md)", "🧪 [快取假說檢定](cache-hypotheses.md)"]
+    if codex_report:
+        links.append("📈 [Codex 快取存活](cache-codex.md)")
+    if links:
+        out += [" · ".join(links), ""]
     for src, proj in sorted(by_source_proj, key=lambda x: (source_label(x[0]), x[1])):
         out.append(f"## {source_label(src)} / {proj}")
         out.append("")
@@ -3201,6 +3238,219 @@ def render_cache_hypotheses_md(d) -> str:
 
 
 # =========================================================================
+# Codex 快取存活統計（cache-codex.html / cache-codex.md）
+# =========================================================================
+_CODEX_KINDS = ("review", "exec", "chat")
+_CODEX_KIND_CSS = {"review": "co-1h", "exec": "co-5m", "chat": "co-unk"}   # 沿用曲線三色
+
+
+def build_codex_survival(rows):
+    """Codex 快取存活統計：同一 session 內相鄰呼叫的「閒置間隔 → 是否冷啟」，依型態分層。
+    方法與 Claude 健檢頁刻意不同：OpenAI 自動快取沒有寫入 TTL 標記，無法分 TTL cohort、
+    也沒有成因分解可做；這裡只做通用存活觀察＋型態分層對照。
+    「命中」＝該步 cache_read/脈絡 ≥ CACHE_COLD_PCT%（與徽章同門檻）；樣本＝前後步脈絡皆
+    ≥ REPORT_MIN_CTX 的相鄰呼叫。OpenAI 為前綴部分命中且快取跨 session（組織內）共享，
+    長閒置後的「命中」可能只是共享前綴殘餘或其他 session 刷新——頁面明示此限制。
+    回傳 dict（has_data=False 代表沒資料）。"""
+    bins = {k: [[0, 0] for _ in REPORT_GAP_BUCKETS] for k in _CODEX_KINDS}   # [n, hit]
+    bins_all = [[0, 0] for _ in REPORT_GAP_BUCKETS]
+    med_all = [[] for _ in REPORT_GAP_BUCKETS]      # 各桶命中率%清單 → 中位數（部分命中的誠實呈現）
+    kind_counts = {k: 0 for k in _CODEX_KINDS}
+    n_sessions = n_calls = 0
+    tok_in = tok_read = 0
+    first_ts = last_ts = None
+    warm_max = 0
+    short_n = short_cold = 0                        # gap < REPORT_INTRA_SEC 的樣本：斷點雜訊率
+    top_warm = []                                   # (gap, epoch)：閒置 ≥ 1 小時仍 ≥ 門檻（觀察用）
+    for r in rows:
+        if r.get("source_kind") != SOURCE_CODEX:
+            continue
+        steps = r.get("codex_steps") or []
+        if not steps:
+            continue
+        kind = r.get("kind") or "chat"
+        if kind not in bins:
+            kind = "chat"
+        n_sessions += 1
+        kind_counts[kind] += 1
+        n_calls += len(steps)
+        prev = None
+        for st in steps:
+            tok_in += st[2]
+            tok_read += st[1]
+            first_ts = st[0] if first_ts is None else min(first_ts, st[0])
+            last_ts = st[0] if last_ts is None else max(last_ts, st[0])
+            if prev is not None and st[2] >= REPORT_MIN_CTX and prev[2] >= REPORT_MIN_CTX:
+                gap = st[0] - prev[0]
+                if gap >= 0:
+                    b = _gap_bucket_index(gap)
+                    cold = _step_cold(st)
+                    bins[kind][b][0] += 1
+                    bins_all[b][0] += 1
+                    if not cold:
+                        bins[kind][b][1] += 1
+                        bins_all[b][1] += 1
+                    med_all[b].append(round(100 * st[1] / st[2]))
+                    if gap < REPORT_INTRA_SEC:
+                        short_n += 1
+                        short_cold += 1 if cold else 0
+                    if not cold:
+                        warm_max = max(warm_max, gap)
+                        if gap >= 3600:
+                            top_warm.append((gap, st[0]))
+            prev = st
+    top_warm.sort(reverse=True)
+    span = ""
+    if first_ts and last_ts:
+        span = (datetime.fromtimestamp(first_ts).strftime("%Y-%m-%d") + " – "
+                + datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d"))
+    n_pairs = sum(n for n, _ in bins_all)
+    return {
+        "has_data": n_pairs > 0,
+        "n_sessions": n_sessions, "n_calls": n_calls, "n_pairs": n_pairs,
+        "kind_counts": kind_counts, "span": span,
+        "tok_in": tok_in, "tok_read": tok_read,
+        "bins": bins, "bins_all": bins_all,
+        "med_all": [sorted(x) for x in med_all],
+        "short_n": short_n, "short_cold": short_cold,
+        "warm_max": warm_max, "top_warm": top_warm[:8],
+        "claude_report": False,      # main() 依當次建置是否有 Claude 報告覆寫（互連連結用）
+    }
+
+
+def _codex_cover(d):
+    kc = d["kind_counts"]
+    kinds_txt = "、".join(f"{KIND_LABELS[k]} {kc[k]}" for k in _CODEX_KINDS if kc[k])
+    cover = [f"{d['n_sessions']} 個 Codex session（{kinds_txt}）",
+             f"{d['n_calls']} 次呼叫", f"{d['n_pairs']} 個相鄰呼叫樣本"]
+    if d["span"]:
+        cover.append(d["span"])
+    return cover
+
+
+def _codex_survival_cohorts(d):
+    return [{"label": KIND_LABELS[k], "css": _CODEX_KIND_CSS[k],
+             "bins": [(n, hit) for n, hit in d["bins"][k]]}
+            for k in _CODEX_KINDS if any(n for n, _ in d["bins"][k])]
+
+
+def render_codex_survival_html(d) -> str:
+    parts = ['<div class="report">']
+    back2 = ('<span><a class="back" href="cache-report.html">⚡ Claude 快取分析 →</a></span>'
+             if d.get("claude_report") else "")
+    parts.append(f'<div class="topbar"><span><a class="back" href="index.html">← 回索引</a></span>{back2}</div>')
+    parts.append("<h1>📈 Codex 快取存活統計</h1>")
+    parts.append(
+        '<div class="lead">同一 session 內相鄰兩次 API 呼叫，看「閒置多久之後回來，快取還在不在」。'
+        f'「命中」＝該步 cache_read ÷ 脈絡 ≥ {CACHE_COLD_PCT}%（與各頁徽章同門檻）；'
+        f'樣本＝前後步脈絡皆 ≥ {REPORT_MIN_CTX} tokens 的相鄰呼叫；依 session 型態'
+        '（review／exec／一般）分層——三個母體的使用節奏不同，混看會失真。'
+        '所有比率附 Wilson 95% CI。</div>')
+    claude_ref = ('<a href="cache-report.html">Claude 健檢頁</a>' if d.get("claude_report")
+                  else "Claude 健檢頁")     # 無 Claude 報告時不出連結（避免斷鏈）
+    parts.append(
+        f'<div class="lead">⚠ 方法限制（與 {claude_ref}的差異）：'
+        'OpenAI 是<b>自動快取</b>，usage 沒有寫入量與 TTL 標記，無法像 Claude 那樣分 TTL cohort、'
+        '做成因分解或遵約率；且快取是<b>前綴部分命中、組織內跨 session 共享</b>——長閒置後仍「命中」'
+        '可能只是共享前綴殘餘或其他 session 恰好刷新，未必是本 session 的快取存活。'
+        '本頁是<b>觀察</b>，不是 TTL 量測。</div>')
+    parts.append(f'<div class="lead">涵蓋範圍：{esc(" · ".join(_codex_cover(d)))}</div>')
+
+    hit_frac = d["tok_read"] / d["tok_in"] if d["tok_in"] else 0.0
+    tiles = [("整體命中率", _pct(hit_frac) if d["tok_in"] else "—", "token 加權：讀取 ÷ 全部脈絡"),
+             ("相鄰呼叫樣本", str(d["n_pairs"]), f"脈絡 ≥ {REPORT_MIN_CTX} tokens 的前後步")]
+    if d["short_n"]:
+        p, lo, hi = _wilson(d["short_cold"], d["short_n"])
+        tiles.append((f"短間隔（<{fmt_dur(REPORT_INTRA_SEC)}）冷啟", f"{d['short_cold']}/{d['short_n']}",
+                      f"回合內斷點雜訊，非閒置造成；比率 {_pct(p)}（CI {_pct(lo)}–{_pct(hi)}）"))
+    if d["warm_max"]:
+        tiles.append(("最長閒置仍命中", fmt_dur(d["warm_max"]),
+                      "含共享前綴殘餘效應，見上方方法限制"))
+    parts.append('<div class="kpis">' + "".join(
+        f'<div class="kpi"><div class="kv2">{esc(v)}</div><div class="kl">{esc(t)}</div>'
+        f'<div class="ks">{esc(s)}</div></div>' for t, v, s in tiles) + "</div>")
+
+    parts.append("<h2>存活曲線（依 session 型態分層）</h2>")
+    cohorts = _codex_survival_cohorts(d)
+    if cohorts:
+        parts.append(_svg_survival(cohorts))
+        if len(cohorts) > 1:
+            parts.append('<div class="legend">' + "".join(
+                f'<span><span class="sw {c["css"]}"></span>{esc(c["label"])}</span>' for c in cohorts) + "</div>")
+        parts.append('<div class="lead">「&lt; 1 分」桶的 miss 是回合內快取斷點雜訊（與閒置無關）；'
+                     '長間隔桶的「命中」含部分命中（≥ 門檻即算）——對照下表「中位命中%」看衰減幅度。</div>')
+        head = "".join(f'<th colspan="2">{esc(c["label"])}</th>' for c in cohorts)
+        sub = ('<th class="num">樣本</th><th>命中率（CI）</th><th class="num">中位命中%</th>'
+               + "".join('<th class="num">樣本</th><th>命中率（CI）</th>' for _ in cohorts))
+        body_rows = []
+        for i, (_, lbl) in enumerate(REPORT_GAP_BUCKETS):
+            n_all, hit_all = d["bins_all"][i]
+            if not n_all:
+                continue
+            meds = d["med_all"][i]
+            med = f"{meds[len(meds) // 2]}%" if meds else "—"
+            cells = (f'<td class="num">{n_all}</td><td>{_ci_str(hit_all, n_all)}</td>'
+                     f'<td class="num">{med}</td>')
+            for c in cohorts:
+                n, hit = c["bins"][i]
+                cells += f'<td class="num">{n or "—"}</td><td>{_ci_str(hit, n) if n else "—"}</td>'
+            body_rows.append(f"<tr><td>{esc(lbl)}</td>{cells}</tr>")
+        parts.append(f'<table class="rep"><thead><tr><th rowspan="2">閒置間隔</th><th colspan="3">全部</th>{head}</tr>'
+                     f"<tr>{sub}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>")
+    if d["top_warm"]:
+        items = "".join(
+            f'<div class="kv"><b>{fmt_dur(g)}</b> 後仍 ≥ {CACHE_COLD_PCT}%　'
+            f'<span class="hn">{esc(datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M"))}</span></div>'
+            for g, ts in d["top_warm"])
+        parts.append(f"<h3>長閒置仍命中（≥ 1 小時，觀察）</h3>"
+                     '<div class="lead">OpenAI 快取離峰保留可達 1 小時，且共享前綴可能被其他 session 刷新'
+                     "——這些不是異常，列出供對照。</div>" + items)
+    parts.append(f'<div class="lead">※ 全為觀察值：命中率取自各次呼叫 usage；冷啟門檻＝命中率 &lt; {CACHE_COLD_PCT}%；'
+                 '時間為本機時區。Claude 的 TTL 量測（cohort／成因／遵約率）在'
+                 ' <a href="cache-report.html">快取分析報告</a>。</div>' if d.get("claude_report") else
+                 f'<div class="lead">※ 全為觀察值：命中率取自各次呼叫 usage；冷啟門檻＝命中率 &lt; {CACHE_COLD_PCT}%；'
+                 '時間為本機時區。</div>')
+    parts.append("</div>")
+    return html_page("Codex 快取存活統計", "".join(parts), "report")
+
+
+def render_codex_survival_md(d) -> str:
+    out = ["# 📈 Codex 快取存活統計", "",
+           f"同一 session 內相鄰呼叫的「閒置間隔 → 命中率」觀察，依型態分層。命中門檻 {CACHE_COLD_PCT}%。",
+           "⚠ OpenAI 自動快取無 TTL 標記，且前綴部分命中、組織內跨 session 共享——本頁是觀察，非 TTL 量測。", "",
+           "涵蓋範圍：" + " · ".join(_codex_cover(d)), ""]
+    hit_frac = d["tok_read"] / d["tok_in"] if d["tok_in"] else 0.0
+    out.append(f"- 整體命中率（token 加權）：**{_pct(hit_frac)}**")
+    out.append(f"- 相鄰呼叫樣本：**{d['n_pairs']}**（脈絡 ≥ {REPORT_MIN_CTX} tokens）")
+    if d["short_n"]:
+        out.append(f"- 短間隔（<{fmt_dur(REPORT_INTRA_SEC)}）斷點冷啟：**{d['short_cold']}/{d['short_n']}**（{_ci_str(d['short_cold'], d['short_n'])}）")
+    if d["warm_max"]:
+        out.append(f"- 最長閒置仍命中：**{fmt_dur(d['warm_max'])}**（含共享前綴殘餘效應）")
+    cohorts = _codex_survival_cohorts(d)
+    if cohorts:
+        head = " | ".join(f"{c['label']}：樣本 | 命中率（CI）" for c in cohorts)
+        out += ["", f"| 閒置間隔 | 全部：樣本 | 命中率（CI） | 中位命中% | {head} |",
+                "|---" * (4 + 2 * len(cohorts)) + "|"]
+        for i, (_, lbl) in enumerate(REPORT_GAP_BUCKETS):
+            n_all, hit_all = d["bins_all"][i]
+            if not n_all:
+                continue
+            meds = d["med_all"][i]
+            med = f"{meds[len(meds) // 2]}%" if meds else "—"
+            cells = " | ".join(f"{n or '—'} | {_ci_str(hit, n) if n else '—'}"
+                               for n, hit in (c["bins"][i] for c in cohorts))
+            out.append(f"| {lbl} | {n_all} | {_ci_str(hit_all, n_all)} | {med} | {cells} |")
+    if d["top_warm"]:
+        out += ["", "長閒置仍命中（≥ 1 小時；OpenAI 離峰保留可達 1 小時＋共享前綴刷新，非異常）："]
+        for g, ts in d["top_warm"]:
+            out.append(f"- {fmt_dur(g)} 後仍 ≥ {CACHE_COLD_PCT}% · {datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')}")
+    out += ["", f"※ 全為觀察值；冷啟門檻＝命中率 < {CACHE_COLD_PCT}%；時間為本機時區。"
+                "Claude 的 TTL 量測另見 [快取分析報告](cache-report.md)。" if d.get("claude_report") else
+                f"※ 全為觀察值；冷啟門檻＝命中率 < {CACHE_COLD_PCT}%；時間為本機時區。"]
+    return "\n".join(out)
+
+
+# =========================================================================
 # HTML 外殼（CSS）
 # =========================================================================
 CSS = """
@@ -3475,6 +3725,7 @@ def session_to_row(s: "Session") -> dict:
         "cache_steps": getattr(s, "cache_steps", []),   # cache-report 原料：[[epoch, cache_read, 脈絡, 寫總量, 寫5分, 寫1h, 模型idx], …]
         "cache_models": getattr(s, "cache_models", []),
         "cache_events": getattr(s, "cache_events", []),  # [[epoch, "limit"|"auth"|"compact"], …]
+        "codex_steps": getattr(s, "codex_steps", []),    # Codex 存活頁原料：[[epoch, cache_read, 脈絡], …]
         "ctx_peak": s.ctx_peak,
         "tok_out": s.tok_out,
         "out_html": s.out_html,
@@ -4217,10 +4468,25 @@ def main():
             except OSError:
                 pass
 
+    # Codex 快取存活統計：獨立於 Claude 報告（兩家 TTL 機制不同，資料層即分離，不混統計）
+    codex_data = build_codex_survival(rows)
+    codex_data["claude_report"] = has_report
+    has_codex_report = codex_data["has_data"]
+    if has_codex_report and want_html:
+        (out / "cache-codex.html").write_text(render_codex_survival_html(codex_data), encoding="utf-8")
+    if has_codex_report and want_md:
+        (out / "cache-codex.md").write_text(render_codex_survival_md(codex_data), encoding="utf-8")
+    if not has_codex_report:
+        for stale in (out / "cache-codex.html", out / "cache-codex.md"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
     if want_html:
-        (out / "index.html").write_text(render_index_html(rows, show_account, has_report), encoding="utf-8")
+        (out / "index.html").write_text(render_index_html(rows, show_account, has_report, has_codex_report), encoding="utf-8")
     if want_md:
-        (out / "index.md").write_text(render_index_md(rows, show_account, has_report), encoding="utf-8")
+        (out / "index.md").write_text(render_index_md(rows, show_account, has_report, has_codex_report), encoding="utf-8")
 
     # 清掉已不存在 session 的孤兒輸出檔（縮小範圍模式下不清，以免誤刪未處理的帳號/專案）
     removed = 0
@@ -4251,6 +4517,8 @@ def main():
         if has_report:
             print(f"  快取分析報告： {(out / 'cache-report.html').resolve()}")
             print(f"  快取假說檢定： {(out / 'cache-hypotheses.html').resolve()}")
+        if has_codex_report:
+            print(f"  Codex 快取存活： {(out / 'cache-codex.html').resolve()}")
     if args.open and want_html:
         try:
             webbrowser.open(index_path.as_uri())

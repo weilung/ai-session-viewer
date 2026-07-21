@@ -47,19 +47,29 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 30  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 31  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
 # session 型態（自動分類）：review／exec／chat（一般互動）。快取統計上 review/exec 與互動
-# session 是不同母體（2026-07-18 以 175 個本機 rollout 實測：本語料 85% 為 exec），故標記＋可篩選。
-# - review：首句（去噪後）以 REVIEW_PREFIX 開頭——涵蓋 review runner 標頭「# Review: <label>」與
-#   review prompt 檔 H1「# Review Prompt：」；Claude/Codex 皆適用（反向流程 Claude 當審查者也會中）。
+# session 是不同母體（2026-07-18 以 175 個本機 rollout 實測：本語料 85% 為 exec），故標記＋可篩選、
+# 且 Claude 報告可依 review／一般 分層。
+# - review：首句（去噪後）符合 REVIEW_RE——辨識「reviewer 角色/格式」，涵蓋 review runner 標頭
+#   「# Review: <label>」、「… Review Prompt」H1、手寫「你是 Reviewer session…」/「You are (a) Reviewer」、
+#   「你是一位資深…審查者…」；Claude/Codex 皆適用（反向流程 Claude 當審查者也會中）。
+#   刻意只認 reviewer 角色措辭，不認裸 "review"／"審查"，以免誤傷一般 chat（例如 Worker 跑 /dflow:pr-review）。
 # - exec：Codex 無頭執行（session_meta.originator == "codex_exec"／source == "exec"）。
 # - 首句為 review 的 exec session 歸 review（review 是更有資訊量的標籤）。
-REVIEW_PREFIX = "# Review"
+REVIEW_RE = re.compile(
+    r"(?i)"
+    r"^#\s*review"                       # 「# Review」標頭（含 # Review:／# Review Prompt）
+    r"|review\s+prompt\b"                # 「… Review Prompt」標頭
+    r"|reviewer\s+session"               # 你是 Reviewer session／You are (a) Reviewer session
+    r"|你是一位.{0,15}審查者"             # 資深程式碼審查者（cross-model review runner）
+    r"|you\s+are\s+(?:an?\s+)?reviewer"  # 英文 reviewer 角色
+)
 KIND_LABELS = {"review": "review", "exec": "exec", "chat": "一般"}
-KIND_TITLES = {"review": "首句為 review prompt（# Review 開頭）——cross-model review session",
+KIND_TITLES = {"review": "首句為 reviewer 角色／review prompt——cross-model review session",
                "exec": "codex exec 無頭執行（session_meta.originator）"}
 SOURCE_LABELS = {
     SOURCE_CLAUDE: "Claude Code",
@@ -510,7 +520,7 @@ class Session:
         self.ai_title = ""
         self.rename = ""
         self.exec_origin = False    # Codex 無頭執行（session_meta.originator == "codex_exec"）
-        self.kind = "chat"          # 型態 review/exec/chat（analyze 時判定，見 REVIEW_PREFIX 註解）
+        self.kind = "chat"          # 型態 review/exec/chat（analyze 時判定，見 REVIEW_RE 註解）
         self.models = []
         self.tok_out = 0
         self.ctx_peak = 0
@@ -1171,7 +1181,7 @@ def analyze(s):
                 if b.get("type") == "_step":
                     b["cause"] = causes.get(b.get("t"), "")
     first_txt = first_user_text(s.events)
-    s.kind = ("review" if first_txt.startswith(REVIEW_PREFIX)
+    s.kind = ("review" if REVIEW_RE.search(first_txt)
               else "exec" if s.exec_origin else "chat")
     s.codex_steps = collect_codex_steps(s)
 
@@ -2496,7 +2506,7 @@ def _break_category(gap):
     return "> 6 時（隔夜／長假級）"
 
 
-def build_cache_report(rows):
+def build_cache_report(rows, stratify=True):
     """從各 session 的 cache_steps／cache_events 彙整快取分析（v2）。回傳 dict（has_data=False 代表沒資料）。
     四條主線：
       (A) 成因分解──每個冷啟依 REPORT_CAUSES 優先序恰好歸一因；結構性成因（第一句/切帳號/換模型/壓縮）
@@ -2692,6 +2702,15 @@ def build_cache_report(rows):
         span = lo_s if lo_s == hi_s else f"{lo_s} ～ {hi_s}"
         span_weeks = max((hi_t - lo_t) / 86400 / 7, 1 / 7)
 
+    # 型態分層（review vs 一般）：同一套判定分別跑在兩個子母體上，供報告做「分開統計」比較。
+    # exec 是 Codex 專屬，Claude 只會有 review/chat；stratify=False 的子呼叫不再往下分層（防遞迴）。
+    by_kind = None
+    if stratify:
+        present = [kk for kk in ("review", "chat") if any(r.get("kind") == kk for r in claude)]
+        if len(present) >= 2:
+            by_kind = {kk: build_cache_report([r for r in claude if r.get("kind") == kk], stratify=False)
+                       for kk in present}
+
     cmh = _cmh([tuple(sx) for sx in strata])
     peak_n = sum(sx[0] + sx[1] for sx in strata)
     peak_c = sum(sx[0] for sx in strata)
@@ -2777,6 +2796,7 @@ def build_cache_report(rows):
         "limits_n": len(limit_ts), "limit_hours": lim_hours,
         "limits_wd": lim_wd, "limits_we": lim_we,
         "neg_gaps": neg_gaps,
+        "by_kind": by_kind,       # {kind: 子報告 dict}；型態分層比較用（None＝母體只有單一型態，不比較）
     }
 
 
@@ -2963,6 +2983,35 @@ def _cover_items(d):
     return cover
 
 
+def _kind_compare_data(d):
+    """型態分層比較（review vs 一般）的表格資料：回傳 (欄標題 list, [(指標名, [各欄值 str]), …])。
+    無分層（母體只有單一型態）回 None。HTML 與 MD 共用，確保兩邊數字一致。"""
+    bk = d.get("by_kind")
+    if not bk:
+        return None
+    cols = [("全部", d)] + [(KIND_LABELS.get(kk, kk), sub) for kk, sub in bk.items()]
+
+    def _hit(x):
+        return _pct(x["kpi"]["hit"]) if x["kpi"]["tok_in"] else "—"
+
+    def _comply(x):
+        n, h = x["kpi"]["comply_n"], x["kpi"]["comply_hit"]
+        return f"{_pct(h / n)}（n={n}）" if n else "—"
+
+    metrics = [
+        ("session 數", lambda x: str(x["n_sessions"])),
+        ("可分析步樣本", lambda x: str(x["n_pairs"])),
+        ("整體命中率", _hit),
+        ("TTL 遵約率", _comply),
+        ("冷啟總數", lambda x: str(sum(x["causes_total"].values()))),
+        ("　├ 提早失效（evict）", lambda x: str(x["causes_total"]["evict"])),
+        ("　└ 閒置過期（expiry）", lambda x: str(x["causes_total"]["expiry"])),
+    ]
+    headers = [name for name, _ in cols]
+    rows = [(label, [fn(sub) for _, sub in cols]) for label, fn in metrics]
+    return headers, rows
+
+
 def render_cache_report_html(d) -> str:
     parts = []
     # 導言
@@ -2993,6 +3042,20 @@ def render_cache_report_html(d) -> str:
     parts.append('<div class="kpis">' + "".join(
         f'<div class="kpi"><div class="kv2">{esc(v)}</div><div class="kl">{esc(t)}</div>'
         f'<div class="ks">{esc(s)}</div></div>' for t, v, s in tiles) + "</div>")
+
+    # ── 型態分層：review vs 一般 ──
+    cmp_data = _kind_compare_data(d)
+    if cmp_data:
+        headers, crows = cmp_data
+        parts.append("<h2>型態分層：review vs 一般</h2>")
+        parts.append('<div class="lead">同一套判定分別跑在兩個子母體上，看快取行為是否因型態而異'
+                     '（review＝首句是 reviewer 角色/review prompt 的 cross-model review；一般＝其餘互動；'
+                     'exec 是 Codex 專屬、不在此頁）。「全部」為兩者合計。</div>')
+        th = "".join(f'<th class="num">{esc(h)}</th>' for h in headers)
+        tb = "".join("<tr><td>" + esc(lbl) + "</td>"
+                     + "".join(f'<td class="num">{esc(v)}</td>' for v in vals) + "</tr>"
+                     for lbl, vals in crows)
+        parts.append(f'<table class="rep"><thead><tr><th>指標</th>{th}</tr></thead><tbody>{tb}</tbody></table>')
 
     # ── ① TTL 存活曲線 ──
     parts.append("<h2>① 快取能撐多久（TTL 存活曲線）</h2>")
@@ -3135,6 +3198,16 @@ def render_cache_report_md(d) -> str:
                    f"（CI {_pct(lo)}–{_pct(hi)}，n={k['comply_n']}）；提早失效 {k['comply_n'] - k['comply_hit']} 次")
     out.append(f"- 可避免冷啟（閒置過期）：**{d['causes_total']['expiry']} 次**（約 {k['avoid_week']:.1f} 次/週）"
                f"；估算可避免浪費 **{fmt_money(k['avoid_usd'])}{'+?' if k['avoid_partial'] else ''}**")
+
+    cmp_data = _kind_compare_data(d)
+    if cmp_data:
+        headers, crows = cmp_data
+        out += ["", "## 型態分層：review vs 一般", "",
+                "同一套判定分別跑在兩個子母體上（review＝首句是 reviewer 角色/review prompt；一般＝其餘；exec 是 Codex 專屬、不在此）。",
+                "", "| 指標 | " + " | ".join(headers) + " |",
+                "|---|" + "---:|" * len(headers)]
+        for lbl, vals in crows:
+            out.append(f"| {lbl} | " + " | ".join(vals) + " |")
 
     out += ["", "## ① 快取能撐多久（TTL 存活）", ""]
     if d["warm_max"]:

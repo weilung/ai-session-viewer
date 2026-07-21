@@ -761,6 +761,69 @@ def test_codex_survival_report(tmp_path=None):
     print("OK: codex survival report test passed")
 
 
+def test_review_detection():
+    # review 型態偵測放寬：認 reviewer 角色/格式（含手寫 prompt），但不認裸 "review"/"審查"，
+    # 也不誤收 Worker 跑 pr-review。
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+    is_rev = lambda t: bool(v.REVIEW_RE.search(t))
+    for t in [
+        "# Review: demo-r1 — 2026 — P\n請唯讀審查",
+        "# PROPOSAL-080 Fable Implementation-Stage Review Prompt 你是 Reviewer session，scope",
+        "你是 Reviewer session，scope 是 review PROPOSAL-080 在兩次 fresh R7 gate 失敗後的最小 corrective",
+        "You are a Reviewer session with fresh context — you did not author any of this",
+        "You are Reviewer session, scope is reviewing PROPOSAL-026",
+        "你是一位資深 Python 程式碼審查者。請做 R1 review：只審查目前未提交的這次改動",
+    ]:
+        assert is_rev(t), f"應判 review：{t[:40]!r}"
+    for t in [
+        "你是 Worker session, return-only，scope 是使用本專案既有 Dflow `/dflow:pr-review` 審查目前 feature/x",
+        "幫我 review 一下這段程式碼",
+        "請審查目前的改動並回報",
+        "實作一個快取分析報告",
+    ]:
+        assert not is_rev(t), f"不應判 review：{t[:40]!r}"
+    print("OK: review detection test passed")
+
+
+def test_cache_report_by_kind():
+    # Claude 報告「review vs 一般 分開統計」：build_cache_report 產出 by_kind 子報告、防遞迴、
+    # 母體只有單一型態時不分層；HTML/MD 有比較表。
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    def steps():   # [epoch, cache_read, ctx, w_total, w5, w1h, midx]；step0 冷(first)、step1 命中(1h cohort、gap 300s)
+        return [[1000, 0, 2000, 2000, 0, 2000, 0],
+                [1300, 1900, 2000, 100, 0, 100, 0]]
+
+    def row(kind):
+        return {"source_kind": v.SOURCE_CLAUDE, "kind": kind, "account": "a",
+                "cache_steps": steps(), "cache_models": ["m0"], "cache_events": []}
+
+    d = v.build_cache_report([row("review"), row("chat")])
+    assert d["by_kind"] is not None and set(d["by_kind"]) == {"review", "chat"}, "應分層 review/chat"
+    assert d["by_kind"]["review"]["n_sessions"] == 1 and d["by_kind"]["chat"]["n_sessions"] == 1, "各型態 1 session"
+    assert d["by_kind"]["review"].get("by_kind") is None, "子報告不得再往下分層（防遞迴）"
+    assert d["n_sessions"] == 2, "全部＝兩型態合計"
+    # 全部 first 冷啟＝2（兩 session 各一）＝子母體加總，確認分層與合計一致
+    assert d["causes_total"]["first"] == 2
+    assert (d["by_kind"]["review"]["causes_total"]["first"]
+            + d["by_kind"]["chat"]["causes_total"]["first"]) == 2
+
+    html = v.render_cache_report_html(d)
+    assert "型態分層" in html and "review" in html and "一般" in html, "HTML 應有型態分層比較表"
+    md = v.render_cache_report_md(d)
+    assert "## 型態分層" in md, "MD 應有型態分層小節"
+
+    # 母體只有單一型態 → 不分層（沒有可比對象）
+    assert v.build_cache_report([row("chat")])["by_kind"] is None, "單一型態不分層"
+    assert "型態分層" not in v.render_cache_report_html(v.build_cache_report([row("chat")])), \
+        "單一型態的報告不應出現分層表"
+    print("OK: cache report by-kind test passed")
+
+
 def test_classify_cache_causes():
     # 逐步冷啟成因分類（供徽章著色）：first/switch/model/compact/expiry/evict/intra 各命中一次，
     # 並與 build_cache_report 的 causes_total 交叉比對，確保「報告」與「逐步徽章」用同一套判定、不漂移。
@@ -911,6 +974,8 @@ if __name__ == "__main__":
     test_session_kind_tags()
     test_codex_survival_report()
     test_cache_report()
+    test_review_detection()
+    test_cache_report_by_kind()
     test_classify_cache_causes()
     test_cold_cause_badges()
     test_codex_ai_label()

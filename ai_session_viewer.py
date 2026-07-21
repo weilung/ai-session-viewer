@@ -47,7 +47,7 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 29  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 30  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -69,6 +69,15 @@ SOURCE_LABELS = {
 
 def source_label(kind: str) -> str:
     return SOURCE_LABELS.get(kind, kind or "未知")
+
+
+# 對話裡 AI 那一方的顯示名（回合標頭用）：Claude Code → Claude、Codex → Codex。
+# 注意：MD 標頭的「🤖 <名>」被全文搜尋的 _TURN_HEAD_RE 比對，改這裡要同步放寬該正則。
+AI_NAMES = {SOURCE_CLAUDE: "Claude", SOURCE_CODEX: "Codex"}
+
+
+def ai_name(kind: str) -> str:
+    return AI_NAMES.get(kind, "AI")
 
 
 def esc(s) -> str:
@@ -174,6 +183,34 @@ REPORT_CAUSES = [
     ("evict",   "提早失效",       "異常：1h TTL 內（2–55 分）卻冷啟"),
     ("intra",   "回合內雜訊",     "快取斷點/20-block 回溯的一次性 miss，非 TTL"),
 ]
+
+# 逐步／回合徽章的冷啟著色：只有「真的把快取弄丟」（閒置過期、異常提早失效）才醒目紅標；
+# 其餘結構性、本來就不會命中的（首呼叫、切帳號、換模型、壓縮後、回合內斷點）改中性灰，
+# 避免被誤讀成「快取一直失效」。未歸因（如 ctx 太小的暖機、子代理另有前綴）比照結構性處理。
+_COLD_GENUINE = {"expiry", "evict"}
+_COLD_CAUSE_NOTE = {
+    "first":   "首呼叫：全新前綴，無快取可命中（結構性、不可避免）",
+    "switch":  "額度/帳號邊界後第一步：快取按組織隔離（結構性）",
+    "model":   "換模型：快取按模型隔離（結構性）",
+    "compact": "壓縮後：前綴被改寫（結構性）",
+    "intra":   "回合內快取斷點的一次性 miss，非 TTL 失效",
+    "expiry":  "閒置超過 TTL，快取已過期（可避免）",
+    "evict":   "1h TTL 內（2–55 分）卻未命中＝提早失效（異常，值得注意）",
+}
+
+
+def _cold_display(cause):
+    """冷啟步的顯示類別（cause 由 classify_cache_causes 掛在 b["cause"]）：
+      - 真失效 expiry/evict → 醒目紅標 'cold'；
+      - None（未分析來源：Codex／子代理，沒跑成因分析）→ 維持原紅標 'cold'，不擅自改語意；
+      - 其餘（結構性成因，或 "" ＝ Claude 已分析、非失效的暖機）→ 中性灰 'coldx'。"""
+    if cause in _COLD_GENUINE or cause is None:
+        return "cold"
+    return "coldx"
+
+
+# Markdown（無 CSS 著色）用的短成因標籤，與 REPORT_CAUSES 對齊。
+_COLD_CAUSE_LABEL = {k: lbl for k, lbl, _ in REPORT_CAUSES}
 
 
 def model_price(model):
@@ -966,6 +1003,12 @@ def block_is_renderable(b, role):
     return False
 
 
+def _epoch(e):
+    """事件的 epoch 秒（int）或 None——與 cache_steps 存的 int(dt.timestamp()) 同源，供成因 join。"""
+    dt = e.get("_dt")
+    return int(dt.timestamp()) if dt else None
+
+
 def _new_turn_usage():
     return {"ids": set(), "input": 0, "cache_create": 0, "cache_read": 0,
             "output": 0, "ctx_max": 0, "cost": 0.0, "unpriced": False}
@@ -998,7 +1041,8 @@ def _acc_turn_usage(acc, msg):
 def _step_usage(msg):
     """單一步驟（＝一次 API 呼叫；Claude 為一個 message.id，Codex 為帶 usage 的步驟起點事件）的
     usage，供回合內 per-step 徽章使用。
-    只取顯示需要的三項：cache_read（命中分子）、total_in（脈絡＝命中分母/ctx）、output（產出）。"""
+    取顯示需要的欄位：input（全新輸入）、cache_create（快取寫入）、cache_read（命中分子）、
+    total_in（脈絡＝命中分母/ctx）、output（產出）；後三者為可勾選的 token 細分徽章所用。"""
     if not isinstance(msg, dict):
         return None
     u = msg.get("usage") or {}
@@ -1011,7 +1055,7 @@ def _step_usage(msg):
     total_in = i + c1 + c2
     if total_in <= 0 and o <= 0:
         return None
-    return {"cache_read": c2, "total_in": total_in, "output": o}
+    return {"input": i, "cache_create": c1, "cache_read": c2, "total_in": total_in, "output": o}
 
 
 def group_turns(events, per_step=True, step_by_usage=False):
@@ -1065,12 +1109,12 @@ def group_turns(events, per_step=True, step_by_usage=False):
                     cur["_step_ids"].add(step_key)
                     cur["n_steps"] += 1
                     cur["blocks"].append({"type": "_step", "idx": cur["n_steps"],
-                                          "u": _step_usage(msg)})
+                                          "u": _step_usage(msg), "t": _epoch(e)})
             elif step_by_usage:
                 su = _step_usage(msg)
                 if su:
                     cur["n_steps"] += 1
-                    cur["blocks"].append({"type": "_step", "idx": cur["n_steps"], "u": su})
+                    cur["blocks"].append({"type": "_step", "idx": cur["n_steps"], "u": su, "t": _epoch(e)})
             cur["blocks"].extend(blocks)
             _acc_turn_usage(cur["u"], msg)
     if cur:
@@ -1116,6 +1160,16 @@ def analyze(s):
     s.n_turns = len(s.main_groups) + len(s.side_groups)
     _collect_usage(s)
     s.cache_steps, s.cache_models, s.cache_events = collect_cache_steps(s)
+    # 逐步冷啟成因：掛到「Claude 主對話」各步驟徽章（依 epoch join），供 _cold_display／turn_cold_class
+    # 決定紅標（真失效）或中性灰（結構性）。只有 Claude 主對話會被標：每個 _step 都設成成因字串或 ""
+    #（＝已分析、非失效成因），故其 cause 永不為 None；Codex 與子代理不跑分析、cause 維持 None＝原本紅標。
+    if s.source_kind != SOURCE_CODEX:
+        causes = (classify_cache_causes(s.cache_steps, s.cache_models, s.cache_events)
+                  if s.cache_steps else {})
+        for g in s.main_groups:
+            for b in g.get("blocks", []):
+                if b.get("type") == "_step":
+                    b["cause"] = causes.get(b.get("t"), "")
     first_txt = first_user_text(s.events)
     s.kind = ("review" if first_txt.startswith(REVIEW_PREFIX)
               else "exec" if s.exec_origin else "chat")
@@ -1274,6 +1328,54 @@ def _step_cold(st):
     """cache_steps 的一步是否冷啟：cache_read / 脈絡 < CACHE_COLD_PCT%。
     用整數交叉相乘精確比較（cr*100 < 門檻*脈絡），避免先四捨五入命中率而在門檻邊界誤判。"""
     return st[1] * 100 < CACHE_COLD_PCT * st[2]
+
+
+def classify_cache_causes(raw, models, events):
+    """給一個 Claude session 的 cache_steps（raw）、模型表與邊界事件，回傳 {epoch: 冷啟成因}（只收冷啟步）。
+    成因鍵與 REPORT_CAUSES 一致：first/switch/model/compact/expiry/evict/intra，供逐步／回合徽章著色
+    （_cold_display 據此決定紅標或中性）。這是 build_cache_report 逐步成因判定的獨立、無副作用複本：
+    報告端在同一迴圈裡另做分桶/統計，兩邊共用同一組門檻常數，且 test_smoke 有一致性測試釘住以防漂移。
+    與報告一致地只看 ctx ≥ REPORT_MIN_CTX 的步（暖機/瑣碎呼叫不歸因）；『first』僅限原始第 0 步且冷啟。"""
+    causes = {}
+    steps = [(i, st) for i, st in enumerate(raw) if st[2] >= REPORT_MIN_CTX]
+    if not steps:
+        return causes
+    if steps[0][0] == 0 and _step_cold(steps[0][1]):   # 原始第 0 步＝session 第一句
+        causes[steps[0][1][0]] = "first"
+    ei, n_ev = 0, len(events)
+    last_write = None      # 最近一次有寫入的可分析步之 TTL（"1h"/"5m"）——cur 讀的快取以此為準
+    for (_, prev), (_, cur) in zip(steps, steps[1:]):
+        if prev[5] > 0:
+            last_write = "1h"
+        elif prev[4] > 0:
+            last_write = "5m"
+        gap = cur[0] - prev[0]
+        if gap < 0:            # 時序異常（跨機同步等）——比照報告略過
+            continue
+        while ei < n_ev and events[ei][0] <= prev[0]:
+            ei += 1
+        kinds = set()
+        j = ei
+        while j < n_ev and events[j][0] <= cur[0]:
+            kinds.add(events[j][1])
+            j += 1
+        boundary = ("switch" if ("limit" in kinds or "auth" in kinds) else
+                    "model" if (prev[6] >= 0 and cur[6] >= 0 and prev[6] != cur[6]) else
+                    "compact" if "compact" in kinds else None)
+        if _step_cold(cur):
+            cohort = last_write or "unknown"
+            ttl_bound = REPORT_TTL_SAFE_SEC if cohort == "1h" else 5 * 60
+            if boundary:
+                causes[cur[0]] = boundary
+            elif gap >= ttl_bound:
+                causes[cur[0]] = "expiry"
+            elif gap >= REPORT_INTRA_SEC:
+                causes[cur[0]] = "evict"
+            else:
+                causes[cur[0]] = "intra"
+        if boundary:           # 結構性邊界：重置快取 lineage（比照報告），其後 TTL 由新的寫入重建
+            last_write = None
+    return causes
 
 
 def usage_int(usage, *keys):
@@ -1470,10 +1572,11 @@ def render_tool_html(block, tmap, used_ids):
 # 單則訊息 / 整個 session 呈現
 # =========================================================================
 def coldest_step(group):
-    """回合內命中率最低的步驟（從 _step 標記算）→ (pct, idx)；無逐步資料回 (None, None)。
+    """回合內命中率最低的步驟（從 _step 標記算）→ (pct, idx, cause)；無逐步資料回 (None, None, None)。
     冷啟動不一定在首步，也不一定要長間隔：可能是 resume／長閒置後 TTL 過期，也可能是回合內
-    快取斷點的一次性 miss（實測同一晚間隔 18s 的中途步驟也會 0%）。成因不一而足，故只取「最低的那一步」。"""
-    best_pct, best_idx = None, None
+    快取斷點的一次性 miss（實測同一晚間隔 18s 的中途步驟也會 0%）。成因由 classify_cache_causes 掛在
+    b["cause"]（未歸因為 None）；取「最低的那一步」並帶回其成因供徽章判定紅標／中性。"""
+    best_pct, best_idx, best_cause = None, None, None
     for b in group.get("blocks", []):
         if b.get("type") != "_step":
             continue
@@ -1482,13 +1585,47 @@ def coldest_step(group):
             continue
         p = round(100 * su["cache_read"] / su["total_in"])
         if best_pct is None or p < best_pct:
-            best_pct, best_idx = p, b.get("idx")
-    return best_pct, best_idx
+            best_pct, best_idx, best_cause = p, b.get("idx"), b.get("cause")
+    return best_pct, best_idx, best_cause
+
+
+def turn_cold_class(group):
+    """整段彙總 ⚡ 的冷啟顯示類別：''（非冷啟）／'cold'（醒目）／'coldx'（中性灰）。
+    紅：回合內含真失效步（expiry/evict），或含未分析來源的冷啟步（cause None＝Codex／子代理，維持原標示）；
+    灰：Claude 主對話僅結構性/暖機冷啟（首呼叫、回合內斷點等）——避免把「本來就不會命中」誤讀成失效。"""
+    u = group.get("u")
+    total_in = u["input"] + u["cache_create"] + u["cache_read"]
+    pct = round(100 * u["cache_read"] / total_in) if total_in else 0
+    if not total_in or pct >= CACHE_COLD_PCT:
+        return ""
+    genuine = unclassified = False
+    for b in group.get("blocks", []):
+        if b.get("type") != "_step":
+            continue
+        su = b.get("u")
+        if not su or su["total_in"] <= 0:
+            continue
+        if su["cache_read"] * 100 < CACHE_COLD_PCT * su["total_in"]:   # 該步冷啟
+            c = b.get("cause")
+            if c in _COLD_GENUINE:
+                genuine = True
+            elif c is None:
+                unclassified = True
+    return "cold" if (genuine or unclassified) else "coldx"
+
+
+def _breakdown_meters(inp, cw, cr):
+    """可勾選的 token 細分徽章（預設隱藏，見 meterbar）：新輸入 / 快取寫入 / 快取讀取。
+    整段彙總與逐步分隔列共用，讓「只有一個下載量」攤成四種 token 的來源。"""
+    return (f'<span class="meter m-in" title="全新輸入 tokens（未快取）">新輸入 {fmt_tokens(inp)}</span>'
+            f'<span class="meter m-cw" title="快取寫入 tokens（建立快取）">寫入 {fmt_tokens(cw)}</span>'
+            f'<span class="meter m-cr" title="快取讀取 tokens（命中量）">讀取 {fmt_tokens(cr)}</span>')
 
 
 def render_turn_meters(group):
-    """assistant 回合的小徽章：快取% / 估算花費 / 脈絡 / 產出（可由頁面勾選顯示）。
-    若整段彙總本身是冷啟動則 ⚡ 轉紅；多步回合另標「最低 N%·步驟K」紅徽，揭露被彙總藏住的冷啟動步驟。"""
+    """assistant 回合的小徽章：快取% / 花費 / (可勾) 新輸入·寫入·讀取 / 脈絡 / 產出。
+    冷啟著色分兩級：真失效（閒置過期/異常逐出）紅標、結構性或未歸因（首呼叫/回合內斷點/換模型…）中性灰，
+    避免把「本來就不會命中」誤讀成快取失效；多步回合另以 ❄ 揭露被彙總藏住的最冷步，同樣依成因決定紅或灰。"""
     u = group.get("u")
     if group.get("role") != "assistant" or not u:
         return ""
@@ -1496,32 +1633,46 @@ def render_turn_meters(group):
     if total_in <= 0 and u["output"] <= 0:
         return ""
     pct = round(100 * u["cache_read"] / total_in) if total_in else 0
-    cold = " cold" if pct < CACHE_COLD_PCT else ""
+    cold = ""
+    ctitle = "快取命中率（整段彙總）"
+    kind = turn_cold_class(group)
+    if kind:
+        cold = " " + kind
+        ctitle = ("整段命中率低，且含真正的快取失效（閒置過期或異常提早失效）" if kind == "cold"
+                  else "整段命中率低，但屬結構性/預期內（首呼叫、回合內斷點等）——非快取失效")
     cost = cost_label(u["cost"], u["unpriced"])
-    out = (f'<span class="meter m-cache{cold}" title="快取命中率（整段彙總）">⚡{pct}%</span>'
+    out = (f'<span class="meter m-cache{cold}" title="{esc_attr(ctitle)}">⚡{pct}%</span>'
            f'<span class="meter m-cost" title="估算花費">~{esc(cost)}</span>'
+           + _breakdown_meters(u["input"], u["cache_create"], u["cache_read"]) +
            f'<span class="meter m-ctx" title="脈絡 tokens（input+cache）">ctx {fmt_tokens(u["ctx_max"])}</span>'
            f'<span class="meter m-out" title="產出 tokens">↑{fmt_tokens(u["output"])}</span>')
     if group.get("n_steps", 0) >= 2:
-        mp, mi = coldest_step(group)
+        mp, mi, mc = coldest_step(group)
         if mp is not None and mp < CACHE_COLD_PCT:
-            out = (f'<span class="meter m-cache cold" '
-                   f'title="回合內命中率最低的步驟。冷啟動成因可能是長閒置／resume 後快取過期，'
-                   f'也可能是回合內快取斷點的一次性 miss（不一定要長間隔）">'
+            note = _COLD_CAUSE_NOTE.get(mc, "未歸因，多為暖機/瑣碎呼叫或未分析來源")
+            out = (f'<span class="meter m-cache {_cold_display(mc)}" '
+                   f'title="{esc_attr("回合內命中率最低的步驟——" + note)}">'
                    f'❄最低 {mp}%·步驟{mi}</span>') + out
     return out
 
 
-def render_step_meters(idx, u):
-    """回合內單一步驟（API 呼叫）的分隔列：步驟序號＋該步的快取% / ctx / 產出。
-    沿用 m-cache/m-ctx/m-out class，所以跟整段彙總共用同一組勾選開關（cost 不在步驟層顯示）。
-    該步為冷啟動（命中率 < CACHE_COLD_PCT）時 ⚡ 轉紅底白字。"""
+def render_step_meters(idx, u, cause=None):
+    """回合內單一步驟（API 呼叫）的分隔列：步驟序號＋該步的快取% / (可勾)細分 / ctx / 產出。
+    沿用 m-cache/m-in/m-cw/m-cr/m-ctx/m-out class，與整段彙總共用同一組勾選開關（cost 不在步驟層顯示）。
+    冷啟著色分兩級：真失效（閒置過期/異常逐出）紅底白字；結構性或未歸因（首呼叫/回合內斷點…）中性灰，
+    並在 title 說明成因。紅標＝有證據是真的快取失效；灰＝沒命中但非失效（或未分析，如 Codex）。"""
     if not u:
         return f'<div class="step-sep"><span class="step-n">步驟 {idx}</span></div>'
     pct = round(100 * u["cache_read"] / u["total_in"]) if u["total_in"] else 0
-    cold = " cold" if pct < CACHE_COLD_PCT else ""
+    cold = ""
+    title = "此步驟快取命中率"
+    if u["total_in"] and pct < CACHE_COLD_PCT:
+        cold = " " + _cold_display(cause)
+        note = _COLD_CAUSE_NOTE.get(cause)
+        title = ("此步驟未命中快取——" + note) if note else "此步驟未命中快取（未歸因，多為暖機/瑣碎呼叫或未分析來源）"
     return (f'<div class="step-sep"><span class="step-n">步驟 {idx}</span>'
-            f'<span class="meter m-cache{cold}" title="此步驟快取命中率">⚡{pct}%</span>'
+            f'<span class="meter m-cache{cold}" title="{esc_attr(title)}">⚡{pct}%</span>'
+            + _breakdown_meters(u.get("input", 0), u.get("cache_create", 0), u["cache_read"]) +
             f'<span class="meter m-ctx" title="此步驟脈絡 tokens（input+cache）">ctx {fmt_tokens(u["total_in"])}</span>'
             f'<span class="meter m-out" title="此步驟產出 tokens">↑{fmt_tokens(u["output"])}</span></div>')
 
@@ -1541,12 +1692,12 @@ def subagent_anchor(tid):
     return "sub-" + re.sub(r"[^A-Za-z0-9_-]", "-", tid)
 
 
-def render_subagent_block(tid, smap, smeta, tmap, used_ids, rendered):
+def render_subagent_block(tid, smap, smeta, tmap, used_ids, rendered, ai="Claude"):
     """把某個 Task 派出的子代理對話，算繪成就地的摺疊區（可遞迴處理巢狀子代理）。"""
     if not tid or tid in rendered or tid not in smap:
         return ""
     rendered.add(tid)
-    inner = [render_turn_html(g, tmap, used_ids, smap, smeta, rendered) for g in smap[tid]]
+    inner = [render_turn_html(g, tmap, used_ids, smap, smeta, rendered, ai) for g in smap[tid]]
     inner = [x for x in inner if x]
     if not inner:
         return ""
@@ -1555,7 +1706,7 @@ def render_subagent_block(tid, smap, smeta, tmap, used_ids, rendered):
             + f' · {len(inner)} 則</summary><div class="tbody">' + "".join(inner) + "</div></details>")
 
 
-def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=None, rendered_sub=None):
+def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=None, rendered_sub=None, ai="Claude"):
     role = group["role"]
     aid = f' id="{group["anchor"]}"' if group.get("anchor") else ""
     if group.get("compact"):
@@ -1581,7 +1732,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         t = b.get("type")
         if t == "_step":
             if multi_step:
-                parts.append(render_step_meters(b.get("idx", 0), b.get("u")))
+                parts.append(render_step_meters(b.get("idx", 0), b.get("u"), b.get("cause")))
             continue
         if t == "text":
             raw = b.get("text") or ""
@@ -1599,7 +1750,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
             parts.append(render_tool_html(b, tmap, used_ids))
             if subagent_map:
                 parts.append(render_subagent_block(b.get("id"), subagent_map, subagent_meta or {},
-                                                   tmap, used_ids, rendered_sub if rendered_sub is not None else set()))
+                                                   tmap, used_ids, rendered_sub if rendered_sub is not None else set(), ai))
         elif t == "image":
             parts.append(render_image_block(b))
 
@@ -1607,7 +1758,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         return ""
 
     icon = "👤" if role == "user" else "🤖"
-    who = "你" if role == "user" else "Claude"
+    who = "你" if role == "user" else ai
     side_cls = " side" if group.get("side") else ""
     side_badge = ' <span class="badge">↳ 子代理</span>' if group.get("side") else ""
     dt = group.get("dt")
@@ -1625,13 +1776,14 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
         analyze(s)
     smap = getattr(s, "subagent_map", {})
     smeta = getattr(s, "subagent_meta", {})
+    ai = ai_name(s.source_kind)          # 回合標頭 AI 那方的名（Claude/Codex）
     used = set()
     rendered_sub = set()
     # 主對話：換日時插入日期分隔線
     turns = []
     last_day = None
     for g in s.main_groups:
-        h = render_turn_html(g, s.tmap, used, smap, smeta, rendered_sub)
+        h = render_turn_html(g, s.tmap, used, smap, smeta, rendered_sub, ai)
         if not h:
             continue
         d = local_str(g.get("dt"), "%Y-%m-%d") if g.get("dt") else ""
@@ -1649,7 +1801,7 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
         blocks = []
         for tid in orphan_tids:
             rendered_sub.add(tid)
-            inner = [render_turn_html(g, s.tmap, used, smap, smeta, rendered_sub) for g in smap[tid]]
+            inner = [render_turn_html(g, s.tmap, used, smap, smeta, rendered_sub, ai) for g in smap[tid]]
             blocks += [x for x in inner if x]
         if blocks:
             side_html = ('<details id="sub-orphans" class="sidechain-wrap"><summary>↳ 子代理（subagent）對話 · '
@@ -1712,6 +1864,9 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
   <div class="meterbar">每則顯示：
     <label><input type="checkbox" id="cb_cache" onchange="tm('cache')">⚡快取%</label>
     <label><input type="checkbox" id="cb_cost" onchange="tm('cost')">💲花費</label>
+    <label><input type="checkbox" id="cb_in" onchange="tm('in')">新輸入</label>
+    <label><input type="checkbox" id="cb_cw" onchange="tm('cw')">快取寫入</label>
+    <label><input type="checkbox" id="cb_cr" onchange="tm('cr')">快取讀取</label>
     <label><input type="checkbox" id="cb_ctx" onchange="tm('ctx')">脈絡</label>
     <label><input type="checkbox" id="cb_out" onchange="tm('out')">產出</label>
   </div>
@@ -1738,7 +1893,7 @@ function openSub(id){{var el=document.getElementById(id);if(!el)return true;
  el.classList.add('hl');
  el.scrollIntoView({{behavior:'smooth',block:'start'}});history.replaceState(null,'',  '#'+id);return false;}}
 if(location.hash.length>1){{setTimeout(function(){{openSub(location.hash.slice(1));}},0);}}
-var MET=['cache','cost','ctx','out'],DEF={{cache:1,cost:1,ctx:0,out:0}};
+var MET=['cache','cost','in','cw','cr','ctx','out'],DEF={{cache:1,cost:1,in:0,cw:0,cr:0,ctx:0,out:0}};
 function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
 function lsSet(k,v){{try{{localStorage.setItem(k,v);}}catch(e){{}}}}
 function applyMet(){{MET.forEach(function(k){{var v=lsGet('m_'+k);v=(v===null)?DEF[k]:(v==='1'?1:0);document.body.classList.toggle('hide-'+k,!v);var cb=document.getElementById('cb_'+k);if(cb)cb.checked=!!v;}});}}
@@ -1746,7 +1901,7 @@ function tm(k){{var cb=document.getElementById('cb_'+k);lsSet('m_'+k,cb.checked?
 applyMet();
 </script>
 """
-    return html_page(s.title, body, body_class="hide-ctx hide-out")
+    return html_page(s.title, body, body_class="hide-in hide-cw hide-cr hide-ctx hide-out")
 
 
 # =========================================================================
@@ -1801,14 +1956,17 @@ def turn_meters_md(group):
     pct = round(100 * u["cache_read"] / total_in) if total_in else 0
     cold = ""
     if group.get("n_steps", 0) >= 2:
-        mp, mi = coldest_step(group)
+        mp, mi, mc = coldest_step(group)
         if mp is not None and mp < CACHE_COLD_PCT:
-            cold = f" · ❄最低 {mp}%（步驟{mi}）"
+            tag = _COLD_CAUSE_LABEL.get(mc)
+            # ⚠ 只掛在「真失效」（過期/異常逐出）；結構性/未歸因只標成因、不當警訊
+            warn = "⚠" if mc in _COLD_GENUINE else ""
+            cold = f" · ❄最低 {mp}%（步驟{mi}{('·' + tag) if tag else ''}）{warn}"
     cost = cost_label(u["cost"], u["unpriced"])
     return f"  ·  ⚡{pct}%{cold} · ~{cost} · ctx {fmt_tokens(u['ctx_max'])} · ↑{fmt_tokens(u['output'])}"
 
 
-def render_turn_md(group, tmap):
+def render_turn_md(group, tmap, ai="Claude"):
     role = group["role"]
     parts = []
     for b in group["blocks"]:
@@ -1828,7 +1986,7 @@ def render_turn_md(group, tmap):
             parts.append("_[圖片]_")
     if not parts:
         return ""
-    icon = "👤 You" if role == "user" else "🤖 Claude"
+    icon = "👤 You" if role == "user" else f"🤖 {ai}"
     side = "↳ " if group.get("side") else ""
     when = local_str(group.get("dt"), "%H:%M:%S")
     meters = turn_meters_md(group)
@@ -1859,11 +2017,12 @@ def render_session_md(s: Session) -> str:
         f"- Session：`{s.session_id}` · v{s.version}",
         "", "---",
     ]
-    parts = [render_turn_md(g, s.tmap) for g in s.main_groups]
+    ai = ai_name(s.source_kind)          # 回合標頭 AI 那方的名（Claude/Codex）
+    parts = [render_turn_md(g, s.tmap, ai) for g in s.main_groups]
     parts = [p for p in parts if p]
     out = "\n".join(x for x in head if x is not None) + "\n" + "\n".join(parts)
     if s.side_groups:
-        sparts = [render_turn_md(g, s.tmap) for g in s.side_groups]
+        sparts = [render_turn_md(g, s.tmap, ai) for g in s.side_groups]
         sparts = [p for p in sparts if p]
         if sparts:
             out += "\n\n---\n\n## ↳ 子代理（subagent）對話\n" + "\n".join(sparts)
@@ -3484,8 +3643,10 @@ font-size:13px;background:rgba(127,127,127,.06)}
 .badge{background:var(--border);border-radius:10px;padding:1px 8px;font-size:11px;color:var(--muted)}
 .meter{font-size:11px;color:var(--muted);background:rgba(127,127,127,.12);border-radius:8px;padding:1px 6px;margin-left:6px;white-space:nowrap}
 .meter.m-cache{color:var(--assistant)}.meter.m-cost{color:#d29922}
+.meter.m-cr{color:var(--assistant)}.meter.m-cw{color:#d29922}
 .meter.cold{background:var(--err);color:#fff;font-weight:600}
-body.hide-cache .m-cache,body.hide-cost .m-cost,body.hide-ctx .m-ctx,body.hide-out .m-out{display:none}
+.meter.coldx{background:rgba(127,127,127,.22);color:var(--muted);font-weight:600;text-decoration:underline dotted}
+body.hide-cache .m-cache,body.hide-cost .m-cost,body.hide-in .m-in,body.hide-cw .m-cw,body.hide-cr .m-cr,body.hide-ctx .m-ctx,body.hide-out .m-out{display:none}
 .step-sep{display:flex;align-items:center;flex-wrap:wrap;gap:0;margin:12px 0 4px;padding-top:7px;border-top:1px dashed var(--border)}
 .step-sep .meter{margin-left:6px}
 .step-n{font-size:11px;font-weight:600;color:var(--muted)}
@@ -3970,7 +4131,8 @@ MAX_HIT_CARDS = 800        # 整頁命中上限（防極熱門詞把頁面撐爆
 
 # 只認我們自己產生的回合標頭（render_turn_md），把 .md 切回一則一則；
 # 訊息內文若恰好偽裝出同款行會誤切——後果只是該筆跳錯位置，屬已知簡化。
-_TURN_HEAD_RE = re.compile(r"^### (?P<side>↳ )?(?P<who>👤 You|🤖 Claude) ·(?P<rest>.*)\{#(?P<a>[ts]\d+)\}\s*$")
+# 回合標頭：AI 那方是「🤖 <名>」（Claude／Codex…），故 who 放寬成 🤖 後接非空白名（見 ai_name/render_turn_md）。
+_TURN_HEAD_RE = re.compile(r"^### (?P<side>↳ )?(?P<who>👤 You|🤖 \S+) ·(?P<rest>.*)\{#(?P<a>[ts]\d+)\}\s*$")
 _TIME_RE = re.compile(r"\d\d:\d\d:\d\d")
 
 # 查詢語法：空白=AND；獨立大寫 OR=前後任一；"片語"/'片語' 逐字（引號要在詞邊界，

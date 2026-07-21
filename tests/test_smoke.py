@@ -761,6 +761,146 @@ def test_codex_survival_report(tmp_path=None):
     print("OK: codex survival report test passed")
 
 
+def test_classify_cache_causes():
+    # 逐步冷啟成因分類（供徽章著色）：first/switch/model/compact/expiry/evict/intra 各命中一次，
+    # 並與 build_cache_report 的 causes_total 交叉比對，確保「報告」與「逐步徽章」用同一套判定、不漂移。
+    import importlib
+    from collections import Counter
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+    # cache_steps 一筆＝[epoch, cache_read, ctx, w_total, w5, w1h, midx]；ctx=2000（≥ REPORT_MIN_CTX）
+    def cold(t, midx=0):   # 冷啟步（read=0）；帶 1h 寫入以延續 cohort
+        return [t, 0, 2000, 2000, 0, 2000, midx]
+    def warm(t, midx=0):   # 命中步（read=1900/2000=95%）
+        return [t, 1900, 2000, 2000, 0, 2000, midx]
+    raw = [
+        cold(0, 0),         # first：原始第 0 步冷啟
+        cold(60, 0),        # intra：gap 60 < 120s
+        cold(260, 0),       # evict：gap 200 ∈ [120,3300)，1h cohort
+        cold(4260, 0),      # expiry：gap 4000 ≥ 3300
+        cold(4360, 1),      # model：換 midx 0→1（優先於 gap）
+        cold(4460, 1),      # compact：其間有 compact 事件
+        cold(4560, 1),      # switch：其間有 limit 事件
+        warm(4660, 1),      # 命中 → 無成因
+    ]
+    models = ["m0", "m1"]
+    events = [[4400, "compact"], [4500, "limit"]]
+    got = v.classify_cache_causes(raw, models, events)
+    want = {0: "first", 60: "intra", 260: "evict", 4260: "expiry",
+            4360: "model", 4460: "compact", 4560: "switch"}
+    assert got == want, f"逐步成因不符：{got}"
+
+    rows = [{"source_kind": v.SOURCE_CLAUDE, "account": "", "cache_steps": raw,
+             "cache_models": models, "cache_events": events}]
+    rep = v.build_cache_report(rows)
+    agg = Counter(want.values())
+    for k, n in rep["causes_total"].items():
+        assert n == agg.get(k, 0), f"報告 causes_total[{k}]={n} 與分類器聚合 {agg.get(k,0)} 不一致（分類漂移）"
+    print("OK: classify cache causes test passed")
+
+
+def test_cold_cause_badges(tmp_path=None):
+    # Claude 逐步冷啟徽章依成因著色：結構性（首呼叫）→ 中性灰 coldx；真失效（提早逐出）→ 醒目紅 cold。
+    # 另驗 token 細分徽章（新輸入/快取寫入/快取讀取）與其勾選開關、預設隱藏 class。
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    csid = "00000000-0000-4000-8000-0000000000c1"
+    proj = tmp / "projects" / "cold-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+
+    def a(t, mid, inp, cw, cr, w1h):    # 一次 assistant 呼叫（＝一步）；w1h→1h 寫入細分
+        u = {"input_tokens": inp, "cache_creation_input_tokens": cw,
+             "cache_read_input_tokens": cr, "output_tokens": 40,
+             "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": w1h}}
+        return {"type": "assistant", "uuid": f"a{t}", "timestamp": t, "sessionId": csid,
+                "isSidechain": False,
+                "message": {"role": "assistant", "model": "claude-opus-4-8", "id": mid,
+                            "usage": u, "content": [{"type": "text", "text": f"答{mid}"}]}}
+    ev = [
+        {"type": "user", "uuid": "u1", "timestamp": "2026-06-10T01:00:00.000Z",
+         "cwd": "/x/Proj", "gitBranch": "main", "version": "2.1.150", "sessionId": csid,
+         "isSidechain": False, "message": {"role": "user", "content": "問題一COLDFIRST"}},
+        a("2026-06-10T01:00:05.000Z", "m_c1", 2000, 2000, 0, 2000),      # 首呼叫 0% → 結構性 coldx
+        {"type": "user", "uuid": "u2", "timestamp": "2026-06-10T01:10:00.000Z",
+         "sessionId": csid, "isSidechain": False,
+         "message": {"role": "user", "content": "問題二COLDEVICT"}},
+        a("2026-06-10T01:10:05.000Z", "m_c2", 3000, 0, 100, 0),          # gap 600s、1h cohort、3% → evict cold
+    ]
+    (proj / f"{csid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in ev), encoding="utf-8")
+
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={tmp / 'projects'}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    html = list((out / "sessions").rglob("*.html"))[0].read_text(encoding="utf-8")
+
+    assert 'class="meter m-cache coldx"' in html, "首呼叫冷啟應為中性灰 coldx（非快取失效）"
+    assert 'class="meter m-cache cold"' in html, "提早逐出冷啟應為醒目紅 cold（真失效）"
+    assert "結構性/預期內" in html, "結構性冷啟的 title 應說明非失效"
+    assert "含真正的快取失效" in html, "真失效冷啟的 title 應點名快取失效"
+    # token 細分：三個新徽章 + 勾選開關 + 預設隱藏 class + coldx 樣式
+    for needle, msg in {
+        'class="meter m-in"': "應有『新輸入』細分徽章",
+        'class="meter m-cw"': "應有『快取寫入』細分徽章",
+        'class="meter m-cr"': "應有『快取讀取』細分徽章",
+        'id="cb_in"': "應有新輸入勾選框", 'id="cb_cw"': "應有快取寫入勾選框",
+        'id="cb_cr"': "應有快取讀取勾選框",
+        "hide-in hide-cw hide-cr": "token 細分應預設隱藏",
+        ".meter.coldx": "應有中性冷啟樣式",
+    }.items():
+        assert needle in html, f"{msg}（找不到 {needle!r}）"
+    print("OK: cold cause badges test passed")
+
+
+def test_codex_ai_label(tmp_path=None):
+    # Codex session 的 AI 那方應標「Codex」而非寫死「Claude」；且 MD 標頭放寬後仍能被搜尋正則切出。
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+    m = v._TURN_HEAD_RE.match("### 🤖 Codex · 12:00:00  ·  ⚡50% {#t2}")
+    assert m and m.group("who") == "🤖 Codex", "搜尋正則應能切出 Codex 回合標頭"
+
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    sess_dir = tmp / "sessions" / "2026" / "06" / "07"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    csid = "019f0000-0000-7000-8000-0000000000a1"
+
+    def line(sec, typ, payload):
+        return json.dumps({"timestamp": f"2026-06-07T01:00:{sec:02d}.000Z",
+                           "type": typ, "payload": payload}, ensure_ascii=False)
+    rows = [
+        line(0, "session_meta", {"id": csid, "cwd": "/x/CodexProj",
+                                 "cli_version": "0.29.0", "git": {"branch": "main"}}),
+        line(1, "turn_context", {"cwd": "/x/CodexProj", "model": "gpt-5.5"}),
+        line(2, "event_msg", {"type": "user_message", "message": "幫我看一下LABELQ。"}),
+        line(3, "response_item", {"type": "message", "role": "assistant",
+                                  "content": [{"type": "output_text", "text": "好的LABELANS。"}]}),
+    ]
+    (sess_dir / f"rollout-2026-06-07T01-00-00-{csid}.jsonl").write_text(
+        "\n".join(rows), encoding="utf-8")
+
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--codex-source", f"demo={tmp / 'sessions'}",
+         "--no-claude", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    html = list((out / "sessions").rglob("*.html"))[0].read_text(encoding="utf-8")
+    md = list((out / "sessions").rglob("*.md"))[0].read_text(encoding="utf-8")
+    assert "🤖 Codex" in html and "🤖 Claude" not in html, "Codex session HTML 的 AI 應標 Codex 而非 Claude"
+    assert "### 🤖 Codex ·" in md, "Codex session MD 回合標頭應標 Codex"
+    assert "🤖 Claude" not in md, "Codex session MD 不應寫死 Claude"
+
+    # 搜尋 Codex 助手回合內容 → 應命中並錨到助手那一則（證明放寬後的 _TURN_HEAD_RE 有把 Codex 回合切出）
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(out), "--search", "LABELANS"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0 and "命中 0 則" not in r.stdout, f"應搜到 Codex 助手內容\n{r.stdout}{r.stderr}"
+    print("OK: codex ai label test passed")
+
+
 if __name__ == "__main__":
     test_smoke()
     test_search()
@@ -771,3 +911,6 @@ if __name__ == "__main__":
     test_session_kind_tags()
     test_codex_survival_report()
     test_cache_report()
+    test_classify_cache_causes()
+    test_cold_cause_badges()
+    test_codex_ai_label()

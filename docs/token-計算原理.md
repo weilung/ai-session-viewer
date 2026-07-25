@@ -44,6 +44,13 @@
 | `cache_read_input_tokens` | 這輪**從快取重用**的量（之前存過，直接讀） | 約 0.1× 輸入價 |
 | `output_tokens` | 模型**產出**的量（回答＋思考＋工具參數） | 輸出價 |
 
+同一則 assistant 訊息旁邊還有兩個欄位，本工具也會用（**2026-05 起的 Claude Code 版本才有**，舊資料沒有）：
+
+| 欄位 | 意思 |
+|---|---|
+| `message.diagnostics.cache_miss_reason` | **Claude 自己說這次為什麼沒命中**：平常是 `null`，沒命中才出現，型別有 `tools_changed`／`system_changed`／`messages_changed`／`model_changed`／`previous_message_not_found`／`unavailable`；部分型別附 `cache_missed_input_tokens`＝**失效前綴有多長**（從多久以前的內容開始對不上），**不等於這次重寫量**。見 §4.1 |
+| 事件層的 `effort` | 這次呼叫的推理強度（`low`…`max`）；中途改它會變動請求內容、影響快取 |
+
 > ⚠️ 關鍵：Claude 的 `input_tokens` **已經扣掉快取部分**。很多人以為 input 是「整個脈絡」，其實不是。
 > 整段脈絡要把三個輸入欄位**加起來**（見下一節）。
 
@@ -125,6 +132,35 @@ total_in = i + c1 + c2             # 這輪脈絡
 - **低或 0%**：通常是該 session 第一輪，或距上次超過 TTL 導致快取失效、要重新寫入。
 
 這是一個**比值**，分子分母會同步放大，所以即使 token 數字本身有誤差，命中率仍相對穩定。
+
+### 4.1 為什麼沒命中：不用猜，Claude 會自己說
+
+2026-05 起的 Claude Code 會在 `message.diagnostics.cache_miss_reason` 直接寫出**這次沒命中的原因**
+（平常是 `null`，沒命中才有）。這比任何「依間隔猜測」都準，所以本工具**有自報就以自報為準**：
+
+| `type` | 意思 | 它是不是「快取沒撐住」？ |
+|---|---|---|
+| `tools_changed` | 工具定義變了（載入/移除 MCP、skill、動態工具） | ❌ 是你改了前綴 |
+| `system_changed` | 系統提示變了（CLAUDE.md／系統前綴改動） | ❌ 同上 |
+| `messages_changed` | 前面訊息內容變了（倒帶重編） | ❌ 同上 |
+| `model_changed` | 換了模型（快取按模型隔離） | ❌ 同上 |
+| `previous_message_not_found` | 該在的前綴不在快取了（過期／被逐出／壓縮改寫） | ✅ 是 |
+| `unavailable` | 這次快取暫時不可用（伺服器側） | ✅ 是 |
+
+三個實務重點：
+
+1. **前四種不是「快取失效」**，是「這次請求的前綴跟上次不一樣了」——一定會重寫，跟你離開多久無關。
+   本工具把它們標成結構性（灰色），也**不列入 TTL 統計**（否則會把 TTL 講得比實際差）。
+2. **有一種失效在 `⚡%` 上完全看不出來**：呼叫回報了失效前綴長度、也確實重寫了一段，
+   但因為分母（脈絡）同步變大，命中率可能還是 95%。這叫**部分失效**——只有徽章與報告的
+   「②-b」那節看得到。實測「部分失效」以 `unavailable` 最多（中位命中 99%，只掉一小段）；
+   `tools_changed` 則相反，因為工具區在請求最前面，一變動幾乎整段重寫，多半落在**冷啟**那欄。
+
+3. **`cache_missed_input_tokens` 不是「這次重寫量」**，別拿它直接算錢。它是**失效前綴長度**：
+   實測有步驟回報 344k，但那一步只寫入 8k、同時讀了 426k（命中 98%）——那 344k 多半由別的
+   快取段供應、根本沒重算。本工具徽章因此寫「失效前綴 N」，**金額一律以該步實際
+   `cache_creation` 為上限**估算——極端單步不設上限會誇大數十倍，但彙總到整體金額後差距通常很小
+   （多數步驟的失效前綴其實 ≈ 實際寫入量）。
 
 ### 整段 vs 每一步：一個「回合」其實是多次 API 呼叫的合計
 
@@ -267,6 +303,10 @@ Codex（OpenAI）的 JSONL 在 `event_msg` 的 `token_count.info.last_token_usag
 | 回合（turn） | 你一次提問後、到下次換你說話之前的所有步驟合計 |
 | TTL | 快取存活時間（5 分 / 1 小時，每次使用會刷新），影響寫入倍率 |
 | message.id 去重 | 同一則被拆多筆事件，靠 id 只算一次 |
+| 自報成因 | `diagnostics.cache_miss_reason`：Claude 直接說這次為什麼沒命中（§4.1） |
+| 部分失效 | 命中率仍高、卻有一段被迫重寫；⚡% 看不出來 |
+| 失效前綴 | `cache_missed_input_tokens`：從多久以前的內容開始對不上；**不等於重寫量**（§4.1-3） |
+| effort | 這次呼叫的推理強度；中途改動會變動請求、影響快取 |
 
 ---
 
@@ -310,6 +350,7 @@ for line in path.read_text(encoding="utf-8").splitlines():
 ## 延伸：本工具相關程式碼位置
 
 - `PRICE_PER_M` / `CACHE_WRITE_MULT` / `CACHE_WRITE_MULT_1H` / `CACHE_READ_MULT`：單價與快取倍率。
+- `API_MISS_LABELS` / `_miss_reason()` / `rewrite_waste_usd()`：第 4.1 節的自報成因與重算成本估算。
 - `call_cost()` / `_ephemeral_split()`：第 6 節的成本公式與 TTL 細分讀取。
 - `_collect_usage()`：第 2、5 節的彙整與 message.id 去重。
 - `_step_usage()` / `group_turns()` 的 `_step` 標記 / `render_step_meters()`：第 4 節「整段 vs 每一步」的逐步命中率。

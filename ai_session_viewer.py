@@ -47,7 +47,7 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 31  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 32  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -187,7 +187,10 @@ REPORT_CTX_BINS = [(50_000, "< 50k"), (150_000, "50–150k"), (300_000, "150–3
 REPORT_CAUSES = [
     ("first",   "session 第一句", "不可避免：全新前綴"),
     ("switch",  "limit/切帳號",   "不可避免：429/401 邊界後第一步（快取按組織隔離）"),
-    ("model",   "換模型",         "結構性：快取按模型隔離"),
+    ("model",   "換模型",         "結構性：快取按模型隔離（API 自報 model_changed 亦歸此）"),
+    ("tools",   "工具定義變動",   "結構性〔API 自報〕：載入/移除 MCP、skill、動態工具 → 工具區後整段重寫"),
+    ("system",  "系統提示變動",   "結構性〔API 自報〕：CLAUDE.md／系統前綴改動 → 其後整段重寫"),
+    ("msgs",    "前文內容變動",   "結構性〔API 自報〕：倒帶重編/前文被改寫 → 變動點後重寫"),
     ("compact", "壓縮後",         "結構性：/compact 或自動壓縮改寫前綴"),
     ("expiry",  "閒置過期",       "可避免：間隔超過 TTL"),
     ("evict",   "提早失效",       "異常：1h TTL 內（2–55 分）卻冷啟"),
@@ -202,11 +205,26 @@ _COLD_CAUSE_NOTE = {
     "first":   "首呼叫：全新前綴，無快取可命中（結構性、不可避免）",
     "switch":  "額度/帳號邊界後第一步：快取按組織隔離（結構性）",
     "model":   "換模型：快取按模型隔離（結構性）",
+    "tools":   "Claude 自報：工具定義變動（載入/移除 MCP、skill、動態工具）→ 工具區之後整段重寫（結構性）",
+    "system":  "Claude 自報：系統提示變動（CLAUDE.md／系統前綴改動）→ 其後整段重寫（結構性）",
+    "msgs":    "Claude 自報：前文內容變動（倒帶重編/前文被改寫）→ 變動點之後重寫（結構性）",
     "compact": "壓縮後：前綴被改寫（結構性）",
     "intra":   "回合內快取斷點的一次性 miss，非 TTL 失效",
     "expiry":  "閒置超過 TTL，快取已過期（可避免）",
     "evict":   "1h TTL 內（2–55 分）卻未命中＝提早失效（異常，值得注意）",
 }
+
+
+def _pct_display(cr, total):
+    """命中率的顯示字串。冷熱判定一律用精確比值，但顯示若四捨五入到門檻上（24.5〜24.99% → 25%）
+    就會出現「畫面寫 ⚡25%、卻著上冷啟色」而與報告寫的「門檻＝命中率 < 25%」打架 → 這種剛好踩線的
+    情形多給一位小數。其餘照常取整。"""
+    if not total:
+        return "0"
+    ratio = 100 * cr / total
+    if round(ratio) == CACHE_COLD_PCT and ratio < CACHE_COLD_PCT:
+        return f"{(1000 * cr // total) / 10:.1f}"   # 向下取到 0.1：連 24.99% 也要印成 24.9 而非 25.0
+    return str(round(ratio))
 
 
 def _cold_display(cause):
@@ -217,6 +235,94 @@ def _cold_display(cause):
     if cause in _COLD_GENUINE or cause is None:
         return "cold"
     return "coldx"
+
+
+# ── Claude API 自報的快取未命中成因（message.diagnostics.cache_miss_reason）──
+# 2026-05 起的 Claude Code 版本才寫入這欄：平常是 null，只有這次呼叫真的沒命中（含只掉一段的
+# 「部分失效」）才帶成因，部分成因另附 cache_missed_input_tokens＝**失效前綴有多長**
+# （從多久以前的內容開始對不上），不等於這次重寫量——實測有 missed 遠大於本步寫入的案例。
+# 有這欄時它是**實據**，優先於本工具依「間隔/邊界」推論的成因（見 classify_cache_causes）。
+API_MISS_LABELS = {
+    "tools_changed":              "工具定義變動",
+    "system_changed":             "系統提示變動",
+    "messages_changed":           "前文內容變動",
+    "model_changed":              "換模型",
+    "previous_message_not_found": "前文不在快取",
+    "unavailable":                "快取暫時不可用",
+    "unknown":                    "未知的新成因",
+}
+API_MISS_NOTES = {
+    "tools_changed":              "工具定義變了（載入/移除 MCP、skill、動態工具）——工具區之後的前綴整段重寫",
+    "system_changed":             "系統提示變了（CLAUDE.md／output style／系統前綴改動）——其後整段重寫",
+    "messages_changed":           "前面訊息內容變了（倒帶重編、內容被改寫）——變動點之後重寫",
+    "model_changed":              "換了模型：快取按模型隔離",
+    "previous_message_not_found": "前一段前綴已不在快取（過期、被逐出，或壓縮/清空改寫了前綴）",
+    "unavailable":                "快取本次暫時不可用（伺服器側）",
+    "unknown":                    "Claude 回報了本工具還不認得的新成因型別（次數與失效前綴長度照計；型別名以通稱顯示）",
+}
+# 前綴被改掉＝client 造成、必然重寫，不是 TTL 失效 → 比照結構性邊界排除在 TTL 統計/假說樣本之外。
+# previous_message_not_found／unavailable 不在此列：那正是「快取真的不在了」的形態，仍當失效候選。
+# 前綴變動類對應到報告成因鍵（REPORT_CAUSES）；model_changed 併入既有的 "model"。
+# （這個 dict 的 key 集合就是「前綴變動類」的唯一定義，不另立常數以免兩處分岔。）
+API_MISS_CAUSE = {"tools_changed": "tools", "system_changed": "system",
+                  "messages_changed": "msgs", "model_changed": "model"}
+# cache_steps 內以整數碼存成因（0＝無），避免 manifest 塞一堆重複字串。
+API_MISS_CODES = ["", "tools_changed", "system_changed", "messages_changed",
+                  "model_changed", "previous_message_not_found", "unavailable"]
+# 未知新型別的哨兵碼刻意用固定高值、**不用 len(API_MISS_CODES)**：manifest 只要 RENDERER_VERSION 沒變
+# 就會沿用舊 row，若哪天在上面 append 一種新 type，len 會位移、把存過的哨兵值重新解讀成那個新 type
+# （未知的失效會變成「確信標好」的失效）。往 API_MISS_CODES 增類別時無須動這個常數。
+API_MISS_UNKNOWN_CODE = 99
+
+
+def _miss_reason(msg):
+    """從 assistant message 取 API 自報的未命中成因 → (成因字串 or "", 失效前綴 token 數)。
+    舊版資料沒有 diagnostics（或為 null）時回 ("", 0)。"""
+    if not isinstance(msg, dict):
+        return "", 0
+    d = msg.get("diagnostics")
+    if not isinstance(d, dict):
+        return "", 0
+    r = d.get("cache_miss_reason")
+    if not isinstance(r, dict):
+        return "", 0
+    t = str(r.get("type") or "")
+    try:                                     # 先取量再判型別：未知的新成因也要保住它附的長度，
+        tok = int(r.get("cache_missed_input_tokens") or 0)   # 否則新 type 一出現就靜默少算
+    except (TypeError, ValueError):
+        tok = 0
+    if not t:
+        return "", 0
+    return t, max(tok, 0)                    # 未知的新成因：照樣顯示原字串與長度，不吞掉
+
+
+def miss_label(reason):
+    return API_MISS_LABELS.get(reason, reason or "")
+
+
+def rewrite_waste_usd(model, missed, c5=0, c1h=0, wrote=None):
+    """前綴失效這件事「比直接命中多花多少」的估算；未知模型回 None。
+    寫入倍率：知道本步實際寫入量 `wrote` 時（missed 已被它設上限），用 wrote 的 5m/1h breakdown
+    逐段拆（與 call_cost／avoid_usd 同規則——missed==wrote 時恰化簡成 avoid_usd、missed<wrote 時按比例）；
+    拿不到 wrote 才退回「有 1h 就整段 1h、否則 5m」的單一倍率近似。
+
+    ⚠ `cache_missed_input_tokens` 量的是**失效前綴有多長**（從多久以前的內容開始對不上），
+    不是「這次寫了多少」——實測有步驟回報 missed=344k 卻只寫入 8k、同時讀了 426k（命中 98%），
+    那 344k 多半由別的快取段供應、根本沒重算。所以傳入本步實際寫入量 `wrote` 時以它為上限，
+    多花的錢不可能超過「這次真的寫進去的量」。"""
+    price = model_price(model)
+    if not price or missed <= 0:
+        return None
+    if wrote is not None:
+        missed = min(missed, max(wrote, 0))
+        if missed <= 0:
+            return None
+    if wrote:                       # 有實際寫入量 → 用它的 5m/1h breakdown 逐段拆（同 call_cost／avoid_usd），
+        legacy = max(wrote - c5 - c1h, 0)   # 混合 TTL 不再整段按 1h（那會對前綴變動步系統性高估）
+        mult = ((legacy + c5) * CACHE_WRITE_MULT + c1h * CACHE_WRITE_MULT_1H) / wrote
+    else:
+        mult = CACHE_WRITE_MULT_1H if c1h > 0 else CACHE_WRITE_MULT
+    return missed * (mult - CACHE_READ_MULT) * price[0] / 1_000_000
 
 
 # Markdown（無 CSS 著色）用的短成因標籤，與 REPORT_CAUSES 對齊。
@@ -236,10 +342,12 @@ def model_price(model):
 # 各模型 context 視窗（token）；用於把 resume 量換算成 %。會隨官方調整變動，需要時自己改。
 # 前綴 fallback；查不到（如 Codex/gpt）就只顯示絕對值、不顯示 %。
 CONTEXT_WINDOW = {
-    "claude-opus-4": 1_000_000,
-    "claude-sonnet-4": 1_000_000,
+    "claude-opus": 1_000_000,     # 裸前綴（同 PRICE_PER_M）：opus-4/opus-5… 皆 1M，新版自動 fail-open
+    "claude-sonnet": 1_000_000,   # sonnet-4/sonnet-5… 皆 1M；claude-3-5-sonnet 開頭是 claude-3、落 200k
+    "claude-fable": 1_000_000,
+    "claude-mythos": 1_000_000,
     "claude-haiku": 200_000,
-    "claude-3": 200_000,
+    "claude-3": 200_000,          # 3.x 世代（含 3-5-sonnet）一律 200k，放最後當 fallback
 }
 
 
@@ -1021,11 +1129,14 @@ def _epoch(e):
 
 def _new_turn_usage():
     return {"ids": set(), "input": 0, "cache_create": 0, "cache_read": 0,
-            "output": 0, "ctx_max": 0, "cost": 0.0, "unpriced": False}
+            "output": 0, "ctx_max": 0, "cost": 0.0, "unpriced": False,
+            "miss": [], "miss_tok": 0, "miss_usd": 0.0, "miss_cold": 0,
+            "miss_usd_partial": False}   # 有步驟是未知模型、金額估不出 → 顯示 +?（同 ②-b 的 usd_partial）
 
 
 def _acc_turn_usage(acc, msg):
-    """把單筆 assistant 訊息的 usage 累加到該回合（依 message.id 去重）。"""
+    """把單筆 assistant 訊息的 usage 累加到該回合（依 message.id 去重）。
+    另收集該回合各步的 API 自報失效成因（含「命中率仍高但有一段被重寫」的部分失效）。"""
     mid = msg.get("id")
     if mid:
         if mid in acc["ids"]:
@@ -1046,13 +1157,26 @@ def _acc_turn_usage(acc, msg):
         acc["unpriced"] = True
     else:
         acc["cost"] += c
+    reason, mtok = _miss_reason(msg)
+    if reason:
+        acc["miss"].append(reason)
+        acc["miss_tok"] += mtok
+        if c2 * 100 < CACHE_COLD_PCT * (i + c1 + c2):     # 這步整段沒命中（非只掉一段）
+            acc["miss_cold"] += 1
+        w = rewrite_waste_usd(msg.get("model"), mtok, c5, c1h, wrote=c1)
+        if w:
+            acc["miss_usd"] += w
+        elif mtok > 0 and c1 > 0:
+            acc["miss_usd_partial"] = True     # 未知模型：別靜默貢獻 0，會顯示成偏低的「多付」
 
 
-def _step_usage(msg):
+def _step_usage(msg, ev=None):
     """單一步驟（＝一次 API 呼叫；Claude 為一個 message.id，Codex 為帶 usage 的步驟起點事件）的
     usage，供回合內 per-step 徽章使用。
     取顯示需要的欄位：input（全新輸入）、cache_create（快取寫入）、cache_read（命中分子）、
-    total_in（脈絡＝命中分母/ctx）、output（產出）；後三者為可勾選的 token 細分徽章所用。"""
+    total_in（脈絡＝命中分母/ctx）、output（產出）；後三者為可勾選的 token 細分徽章所用。
+    另帶三個「多給一點資訊」的可勾選欄位：miss（API 自報的失效成因與重寫量/估算多花的錢）、
+    win（該步脈絡佔 context 視窗的比例）、effort（該次呼叫的推理強度，取自事件層 `effort`）。"""
     if not isinstance(msg, dict):
         return None
     u = msg.get("usage") or {}
@@ -1065,7 +1189,14 @@ def _step_usage(msg):
     total_in = i + c1 + c2
     if total_in <= 0 and o <= 0:
         return None
-    return {"input": i, "cache_create": c1, "cache_read": c2, "total_in": total_in, "output": o}
+    reason, mtok = _miss_reason(msg)
+    c5, c1h = _ephemeral_split(u)
+    model = msg.get("model") or ""
+    return {"input": i, "cache_create": c1, "cache_read": c2, "total_in": total_in, "output": o,
+            "miss": reason, "miss_tok": mtok,
+            "miss_usd": rewrite_waste_usd(model, mtok, c5, c1h, wrote=c1),
+            "win": context_window(model), "model": model,
+            "effort": str((ev or {}).get("effort") or "")}
 
 
 def group_turns(events, per_step=True, step_by_usage=False):
@@ -1102,6 +1233,10 @@ def group_turns(events, per_step=True, step_by_usage=False):
             # 否則（純 tool_result / 空白）略過，不打斷 assistant 回合
         elif role == "assistant":
             if not blocks:
+                # 無可呈現內容（如純 thinking 簽章）的收尾事件也可能掛著 turn_duration：回合已開著就
+                # 先把耗時收下，否則那段 wall-clock 會靜默消失、⏱ 偏低（實測有 1 筆 223 秒被丟掉）。
+                if e.get("_turn_ms") and cur is not None and cur["role"] == "assistant":
+                    cur["dur_ms"] = cur.get("dur_ms", 0) + e["_turn_ms"]
                 continue
             if cur is None or cur["role"] != "assistant":
                 if cur:
@@ -1118,15 +1253,20 @@ def group_turns(events, per_step=True, step_by_usage=False):
                 if step_key not in cur["_step_ids"]:
                     cur["_step_ids"].add(step_key)
                     cur["n_steps"] += 1
-                    cur["blocks"].append({"type": "_step", "idx": cur["n_steps"],
-                                          "u": _step_usage(msg), "t": _epoch(e)})
+                    cur["blocks"].append({"type": "_step", "idx": cur["n_steps"], "mid": mid,
+                                          "u": _step_usage(msg, e), "t": _epoch(e)})
             elif step_by_usage:
-                su = _step_usage(msg)
+                su = _step_usage(msg, e)
                 if su:
                     cur["n_steps"] += 1
                     cur["blocks"].append({"type": "_step", "idx": cur["n_steps"], "u": su, "t": _epoch(e)})
             cur["blocks"].extend(blocks)
             _acc_turn_usage(cur["u"], msg)
+            if e.get("_turn_ms"):
+                # system/turn_duration 掛在「真實回合」最後一筆 assistant 上，但一個顯示回合可能併了
+                # 好幾個真實回合（中間的 user 事件是純 tool_result／雜訊，不另起回合）→ 要累加，
+                # 覆寫會只留最後一段（實測最壞：顯示 3 秒、其實跑了 651 秒）。
+                cur["dur_ms"] = cur.get("dur_ms", 0) + e["_turn_ms"]
     if cur:
         turns.append(cur)
     return turns
@@ -1134,6 +1274,24 @@ def group_turns(events, per_step=True, step_by_usage=False):
 
 def analyze(s):
     """建立 main/side 回合、tool 結果對照表與統計（render 前先呼叫一次）。"""
+    # 回合耗時：system/subtype=turn_duration 事件的 parentUuid 指向該回合最後一筆 assistant，
+    # 據此把「送出→答完」的 wall-clock 掛回該事件（Claude 專屬；沒有此事件的舊版資料就不顯示）。
+    dur_by_uuid = {}
+    for e in s.events:
+        if e.get("type") == "system" and e.get("subtype") == "turn_duration":
+            ms = e.get("durationMs")
+            pu = e.get("parentUuid")
+            if pu and isinstance(ms, (int, float)) and ms > 0:
+                dur_by_uuid[pu] = int(ms)
+    if dur_by_uuid:
+        for e in s.events:
+            ms = dur_by_uuid.get(e.get("uuid"))
+            if ms and e.get("type") == "assistant":
+                e["_turn_ms"] = ms
+    # 注意：parentUuid 指到非 assistant（user／tool_result／system，實測約 14%）或找不到對象的
+    # turn_duration 一律不掛、該回合就不顯示 ⏱——刻意不做近似、也不改掛別的事件（G1 曾因 dur_ms
+    # 覆寫踩過「顯示 3 秒、實際 651 秒」，這裡寧缺勿錯）。
+    # 掛上之後還有一條會丟：目標事件若沒有可呈現內容，group_turns 會跳過它——那裡另有補收（見該處註解）。
     msg = [e for e in s.events if e.get("type") in ("user", "assistant")]
     main = dedup(sorted([e for e in msg if not e.get("isSidechain")], key=ts_key))
     side = dedup(sorted([e for e in msg if e.get("isSidechain")], key=ts_key))
@@ -1170,6 +1328,21 @@ def analyze(s):
     s.n_turns = len(s.main_groups) + len(s.side_groups)
     _collect_usage(s)
     s.cache_steps, s.cache_models, s.cache_events = collect_cache_steps(s)
+    # 步驟時間正規化成「該次呼叫的起點」＝該 message.id 第一筆事件的時間，與 cache_steps 同鍵。
+    # 必要原因：`_step` 標記是掛在第一筆**有可呈現內容**的事件上（group_turns 對 assistant 有
+    # `if not blocks: continue`），而實測近六成呼叫的首事件沒有可呈現內容（純 thinking 簽章等），
+    # 兩者差 1〜30+ 秒 → ①成因 join 對不上（真失效步被畫成中性灰「未歸因」）②「距上一步」量到的
+    # 是「上次吐出內容→這次吐出內容」而非呼叫間隔，甚至會跨過 2 分（回合內雜訊/TTL 樣本）的界線。
+    call_ep = {}
+    for e in sorted((e for e in s.events if e.get("type") == "assistant"), key=ts_key):
+        mid = (e.get("message") or {}).get("id")
+        ep = _epoch(e)
+        if mid and ep is not None and mid not in call_ep:
+            call_ep[mid] = ep
+    for g in s.main_groups + s.side_groups:
+        for b in g.get("blocks", []):
+            if b.get("type") == "_step" and b.get("mid") in call_ep:
+                b["t"] = call_ep[b["mid"]]
     # 逐步冷啟成因：掛到「Claude 主對話」各步驟徽章（依 epoch join），供 _cold_display／turn_cold_class
     # 決定紅標（真失效）或中性灰（結構性）。只有 Claude 主對話會被標：每個 _step 都設成成因字串或 ""
     #（＝已分析、非失效成因），故其 cause 永不為 None；Codex 與子代理不跑分析、cause 維持 None＝原本紅標。
@@ -1180,6 +1353,20 @@ def analyze(s):
             for b in g.get("blocks", []):
                 if b.get("type") == "_step":
                     b["cause"] = causes.get(b.get("t"), "")
+    # 每步「距上一步多久」：同一條對話軸（主對話／子代理各自算）上一次 API 呼叫到這次的間隔——
+    # 快取 TTL 是「距上次使用」在算的，這個數字才是判讀冷熱的直接依據（statusline 的 (Xs ago) 同義）。
+    for groups in [s.main_groups] + list(s.subagent_map.values()):   # 子代理各自一條軸，不與主對話相混
+        prev_t = None
+        for g in groups:
+            for b in g.get("blocks", []):
+                if b.get("type") != "_step":
+                    continue
+                t = b.get("t")
+                if t is None:
+                    continue
+                if prev_t is not None and t >= prev_t:
+                    b["gap"] = t - prev_t
+                prev_t = t
     first_txt = first_user_text(s.events)
     s.kind = ("review" if REVIEW_RE.search(first_txt)
               else "exec" if s.exec_origin else "chat")
@@ -1191,10 +1378,17 @@ def _collect_usage(s):
     models, seen = [], set()
     inp = cc = cr = out = 0
     ctx_peak = 0
+    peak_model = ""
     cost = 0.0
     unpriced = False
     resume_ctx = 0          # 最後一筆主對話 assistant 的脈絡 = resume 後大約載入的 context
     resume_model = ""
+    miss_kinds = {}         # API 自報失效成因 -> 次數（含部分失效）
+    miss_tok = 0
+    miss_usd = 0.0
+    miss_usd_partial = False     # 有前綴變動步是未知模型、金額估不出（表頭顯示 +?）
+    miss_cold = 0           # 其中「整段沒命中」的次數（其餘為只掉一段的部分失效）
+    efforts = []            # 出現過的 effort 等級（依序、去重）——中途改 effort 會影響快取
     for e in s.events:
         if e.get("type") != "assistant":
             continue
@@ -1215,7 +1409,11 @@ def _collect_usage(s):
         c2 = usage_int(u, "cache_read_input_tokens", "cacheReadInputTokens")
         o = usage_int(u, "output_tokens", "outputTokens")
         inp += i; cc += c1; cr += c2; out += o
-        ctx_peak = max(ctx_peak, i + c1 + c2)
+        if i + c1 + c2 > ctx_peak:
+            ctx_peak = i + c1 + c2
+            peak_model = mdl or ""     # 峰值屬於哪個模型：換算 % 要用「那一步的」視窗，
+                                       # 不能用主對話最後的模型（子代理可能是別的模型、視窗不同）
+
         if not e.get("isSidechain") and (i + c1 + c2) > 0:
             resume_ctx = i + c1 + c2          # 主對話按時間在後者覆蓋前者 → 最終為最後一筆
             resume_model = mdl or resume_model
@@ -1225,23 +1423,58 @@ def _collect_usage(s):
             unpriced = True
         else:
             cost += c
+        eff = str(e.get("effort") or "")
+        if eff and eff not in efforts:
+            efforts.append(eff)
+        reason, mtok = _miss_reason(msg)
+        if reason:
+            miss_kinds[reason] = miss_kinds.get(reason, 0) + 1
+            miss_tok += mtok
+            if c2 * 100 < CACHE_COLD_PCT * (i + c1 + c2):
+                miss_cold += 1
+            w = rewrite_waste_usd(mdl, mtok, c5, c1h, wrote=c1)
+            if w:
+                miss_usd += w
+            elif mtok > 0 and c1 > 0:
+                miss_usd_partial = True        # 同上：表頭金額要標 +?，不可靜默低估
     total_in = inp + cc + cr
     s.models = models
     s.tok_out = out
     s.ctx_peak = ctx_peak
+    s.ctx_peak_win = context_window(peak_model)     # 峰值那一步模型的 context 視窗（查不到＝None）
     s.resume_ctx = resume_ctx
     s.resume_model = resume_model
     s.cost = cost
     s.cost_partial = unpriced
+    s.miss_kinds = miss_kinds
+    s.miss_tok = miss_tok
+    s.miss_usd = miss_usd
+    s.miss_usd_partial = miss_usd_partial
+    s.miss_cold = miss_cold
+    s.efforts = efforts
     s.cache_pct = round(100 * cr / total_in) if total_in else 0
     s.usage = {"input": inp, "cache_create": cc, "cache_read": cr, "output": out, "total_in": total_in}
 
 
+def _step_miss(st):
+    """cache_steps 一步的 API 自報成因 → (成因字串 or "", 失效前綴 token 數)；舊格式（7 欄）回 ("", 0)。
+    code==API_MISS_UNKNOWN_CODE 是「未知的新成因」哨兵（collect_cache_steps 存的）：以通稱 "unknown"
+    回報，好讓次數與失效前綴長度照樣進報告、不被靜默吞掉（逐步徽章那邊仍顯示原始型別字串）。"""
+    if len(st) < 9:
+        return "", 0
+    code = st[7]
+    if code == API_MISS_UNKNOWN_CODE:
+        return "unknown", st[8]
+    return (API_MISS_CODES[code] if 0 < code < len(API_MISS_CODES) else ""), st[8]
+
+
 def collect_cache_steps(s):
     """主對話每次 assistant API 呼叫的時間序列與快取邊界事件，供 cache-report 分析。回傳 (steps, models, events)：
-      steps  = [[epoch, cache_read, 脈絡tokens, 寫入總量, 寫入5分, 寫入1h, 模型idx], …]（依時間排序、
-               message.id 去重；寫入5分/1h 來自 usage.cache_creation 細分，舊資料無細分為 0；
-               模型idx 指向 models，未知 -1）
+      steps  = [[epoch, cache_read, 脈絡tokens, 寫入總量, 寫入5分, 寫入1h, 模型idx, 自報成因碼, 重算tokens], …]
+               （依時間排序、message.id 去重；寫入5分/1h 來自 usage.cache_creation 細分，舊資料無細分為 0；
+               模型idx 指向 models，未知 -1；自報成因碼＝API_MISS_CODES 索引、0＝無此資料、
+               API_MISS_UNKNOWN_CODE 為未知新型別哨兵，
+               重算tokens＝diagnostics 附的 cache_missed_input_tokens、無則 0）
       models = steps 用到的模型字串表（去重存一次，免每步重複存字串）
       events = [[epoch, kind], …]，kind ∈ "limit"(429)／"auth"(401)／"compact"——快取邊界標記，
                報告據此把其後第一步歸因為切帳號/登入/壓縮，而非 TTL 失效。
@@ -1278,7 +1511,10 @@ def collect_cache_steps(s):
         if mdl and mdl not in midx:
             midx[mdl] = len(models)
             models.append(mdl)
-        steps.append([int(dt.timestamp()), c2, total_in, c1, c5, c1h, midx.get(mdl, -1)])
+        reason, mtok = _miss_reason(msg)
+        code = (API_MISS_CODES.index(reason) if reason in API_MISS_CODES
+                else API_MISS_UNKNOWN_CODE if reason else 0)   # 未知的新成因：存哨兵碼，次數/長度不吞
+        steps.append([int(dt.timestamp()), c2, total_in, c1, c5, c1h, midx.get(mdl, -1), code, mtok])
     events = []
     for e in s.events:
         if e.get("isSidechain"):
@@ -1342,10 +1578,13 @@ def _step_cold(st):
 
 def classify_cache_causes(raw, models, events):
     """給一個 Claude session 的 cache_steps（raw）、模型表與邊界事件，回傳 {epoch: 冷啟成因}（只收冷啟步）。
-    成因鍵與 REPORT_CAUSES 一致：first/switch/model/compact/expiry/evict/intra，供逐步／回合徽章著色
-    （_cold_display 據此決定紅標或中性）。這是 build_cache_report 逐步成因判定的獨立、無副作用複本：
-    報告端在同一迴圈裡另做分桶/統計，兩邊共用同一組門檻常數，且 test_smoke 有一致性測試釘住以防漂移。
-    與報告一致地只看 ctx ≥ REPORT_MIN_CTX 的步（暖機/瑣碎呼叫不歸因）；『first』僅限原始第 0 步且冷啟。"""
+    成因鍵與 REPORT_CAUSES 一致：first/switch/model/tools/system/msgs/compact/expiry/evict/intra，
+    供逐步／回合徽章著色（_cold_display 據此決定紅標或中性）。這是 build_cache_report 逐步成因判定的
+    獨立、無副作用複本：報告端在同一迴圈裡另做分桶/統計，兩邊共用同一組門檻常數，且 test_smoke 有
+    一致性測試釘住以防漂移。
+    與報告一致地只看 ctx ≥ REPORT_MIN_CTX 的步（暖機/瑣碎呼叫不歸因）；『first』僅限原始第 0 步且冷啟。
+    **API 自報成因（diagnostics.cache_miss_reason）優先於一切推論**——那是實據；只有沒有這欄的
+    資料（舊版 CLI）或 API 未給成因時，才退回「邊界/間隔」推論。"""
     causes = {}
     steps = [(i, st) for i, st in enumerate(raw) if st[2] >= REPORT_MIN_CTX]
     if not steps:
@@ -1372,10 +1611,17 @@ def classify_cache_causes(raw, models, events):
         boundary = ("switch" if ("limit" in kinds or "auth" in kinds) else
                     "model" if (prev[6] >= 0 and cur[6] >= 0 and prev[6] != cur[6]) else
                     "compact" if "compact" in kinds else None)
+        api_cause = API_MISS_CAUSE.get(_step_miss(cur)[0])     # 實據優先
+        if api_cause == "msgs" and boundary == "compact":
+            # 壓縮就是「前文被改寫」的具體成因：通稱 msgs 會蓋掉更準的邊界實據（compact 是我們自己
+            # 記錄到的事件），還會把它從「不可避免」挪進「習慣可避免」——自動壓縮不是改習慣能省的。
+            api_cause = "compact"
         if _step_cold(cur):
             cohort = last_write or "unknown"
             ttl_bound = REPORT_TTL_SAFE_SEC if cohort == "1h" else 5 * 60
-            if boundary:
+            if api_cause:
+                causes[cur[0]] = api_cause
+            elif boundary:
                 causes[cur[0]] = boundary
             elif gap >= ttl_bound:
                 causes[cur[0]] = "expiry"
@@ -1383,6 +1629,7 @@ def classify_cache_causes(raw, models, events):
                 causes[cur[0]] = "evict"
             else:
                 causes[cur[0]] = "intra"
+        # 與 build_cache_report 同序：api_cause 這對整對略過（但邊界仍重置 lineage），再輪到 boundary。
         if boundary:           # 結構性邊界：重置快取 lineage（比照報告），其後 TTL 由新的寫入重建
             last_write = None
     return causes
@@ -1582,21 +1829,29 @@ def render_tool_html(block, tmap, used_ids):
 # 單則訊息 / 整個 session 呈現
 # =========================================================================
 def coldest_step(group):
-    """回合內命中率最低的步驟（從 _step 標記算）→ (pct, idx, cause)；無逐步資料回 (None, None, None)。
-    冷啟動不一定在首步，也不一定要長間隔：可能是 resume／長閒置後 TTL 過期，也可能是回合內
-    快取斷點的一次性 miss（實測同一晚間隔 18s 的中途步驟也會 0%）。成因由 classify_cache_causes 掛在
-    b["cause"]（未歸因為 None）；取「最低的那一步」並帶回其成因供徽章判定紅標／中性。"""
-    best_pct, best_idx, best_cause = None, None, None
-    for b in group.get("blocks", []):
+    """回合內命中率最低的步驟（從 _step 標記算）→ (pct, idx, cause, cold)；無逐步資料回
+    (None, None, None, False)。冷啟動不一定在首步，也不一定要長間隔：可能是 resume／長閒置後 TTL
+    過期，也可能是回合內快取斷點的一次性 miss（實測同一晚間隔 18s 的中途步驟也會 0%）。成因由
+    classify_cache_causes 掛在 b["cause"]（未歸因為 None）；取「最低的那一步」並帶回其成因與
+    是否冷啟供徽章判定紅標／中性。"""
+    best_pct, best_idx, best_cause, best_cold = None, None, None, False
+    best_key = None            # 選「最冷那步」用精確比值，不用四捨五入後的 pct——否則 25.0% 與 24.6%
+    for b in group.get("blocks", []):   # 同 round 成 25 時會選錯步、把真正最冷（該顯示 ❄）的那步藏掉
         if b.get("type") != "_step":
             continue
         su = b.get("u")
         if not su or su["total_in"] <= 0:
             continue
-        p = round(100 * su["cache_read"] / su["total_in"])
-        if best_pct is None or p < best_pct:
-            best_pct, best_idx, best_cause = p, b.get("idx"), b.get("cause")
-    return best_pct, best_idx, best_cause
+        p = _pct_display(su["cache_read"], su["total_in"])
+        key = su["cache_read"] * 1_000_000 // su["total_in"]
+        if best_key is None or key < best_key:
+            # 顯示走 _pct_display（踩門檻時給一位小數），選步／冷熱判定用整數比值（同 _step_cold）。
+            best_key = key
+            best_pct, best_idx = p, b.get("idx")
+            bc = b.get("cause")                       # "" ＝已分析非失效（灰）、None ＝未分析軸（紅）——
+            best_cause = bc if bc else (API_MISS_CAUSE.get(su.get("miss") or "") or bc)  # 別讓 or 把 "" 洗成 None
+            best_cold = su["cache_read"] * 100 < CACHE_COLD_PCT * su["total_in"]
+    return best_pct, best_idx, best_cause, best_cold
 
 
 def turn_cold_class(group):
@@ -1605,8 +1860,9 @@ def turn_cold_class(group):
     灰：Claude 主對話僅結構性/暖機冷啟（首呼叫、回合內斷點等）——避免把「本來就不會命中」誤讀成失效。"""
     u = group.get("u")
     total_in = u["input"] + u["cache_create"] + u["cache_read"]
-    pct = round(100 * u["cache_read"] / total_in) if total_in else 0
-    if not total_in or pct >= CACHE_COLD_PCT:
+    # 冷熱判定用整數交叉相乘（與 _step_cold／render_step_meters／coldest_step 同一判準），不先四捨五入：
+    # 否則彙總落在 24.5〜24.99% 時整段 ⚡ 不著色，卻同時掛著已著色的 ❄ 與逐步 ⚡，自相矛盾。
+    if not total_in or u["cache_read"] * 100 >= CACHE_COLD_PCT * total_in:
         return ""
     genuine = unclassified = False
     for b in group.get("blocks", []):
@@ -1616,7 +1872,8 @@ def turn_cold_class(group):
         if not su or su["total_in"] <= 0:
             continue
         if su["cache_read"] * 100 < CACHE_COLD_PCT * su["total_in"]:   # 該步冷啟
-            c = b.get("cause")
+            c = b.get("cause")                        # 保留 ""（已分析非失效）與 None（未分析軸）的區別
+            c = c if c else (API_MISS_CAUSE.get(su.get("miss") or "") or c)
             if c in _COLD_GENUINE:
                 genuine = True
             elif c is None:
@@ -1632,6 +1889,88 @@ def _breakdown_meters(inp, cw, cr):
             f'<span class="meter m-cr" title="快取讀取 tokens（命中量）">讀取 {fmt_tokens(cr)}</span>')
 
 
+def _ctx_meter(total_in, win, prefix=""):
+    """脈絡徽章；知道該模型 context 視窗時附「佔視窗 %」——這是 statusline 的 ctx% 同義值，
+    看得出離自動壓縮還有多遠（壓縮會改寫前綴、整段快取重來）。"""
+    pct = f" ({round(100 * total_in / win)}%)" if (win and total_in) else ""
+    tip = "脈絡 tokens（input+cache）" + (f"；佔 {fmt_tokens(win)} context 視窗" if win else "")
+    return f'<span class="meter m-ctx" title="{esc_attr(tip)}">{prefix}ctx {fmt_tokens(total_in)}{pct}</span>'
+
+
+def _miss_meter(reason, mtok, usd, partial=False):
+    """API 自報的快取失效徽章（diagnostics.cache_miss_reason）——實據，不是推論。
+    整段沒命中與「命中率仍高、只掉一段」的部分失效都會出現；後者標成中性的「部分失效」，
+    因為它不是快取整個掉了（⚡% 上完全看不出來，只有這裡看得到）。"""
+    if not reason:
+        return ""
+    extra = ""
+    if mtok:
+        money = f"（多付 ~{esc(fmt_money(usd))}）" if usd else ""
+        extra = f" · 失效前綴 {fmt_tokens(mtok)}{money}"
+    note = API_MISS_NOTES.get(reason, "Claude 自報的未命中成因")
+    cls, tag = ("m-miss part", "部分失效·") if partial else ("m-miss", "")
+    tip = ("Claude API 自報：" + note
+           + ("（此步命中率仍在門檻之上，只掉一段）" if partial else "")
+           + "。「失效前綴」＝從多久以前的內容開始對不上（API 回報值），"
+             "不等於這次重寫量；金額以本步實際寫入量為上限估算")
+    return (f'<span class="meter {cls}" title="{esc_attr(tip)}">'
+            f'⚠{tag}{esc(miss_label(reason))}{extra}</span>')
+
+
+def _extra_meters(u, gap=None):
+    """可勾選的補充徽章：距上一次 API 呼叫多久（TTL 是按「距上次使用」在算）、該步 effort 等級
+    （切 effort 會改變請求前綴 → 影響快取）。無資料的欄位不輸出。"""
+    out = ""
+    if gap is not None:
+        out += (f'<span class="meter m-gap" title="距上一次 API 呼叫（快取 TTL 以距上次使用計）">'
+                f'距上一步 {fmt_dur(gap)}</span>')
+    if u and u.get("effort"):
+        out += (f'<span class="meter m-eff" title="這次呼叫的推理強度（effort）；中途改 effort 會變動請求、影響快取">'
+                f'effort {esc(u["effort"])}</span>')
+    return out
+
+
+def _miss_items(s):
+    """session 內 API 自報失效的 (成因標籤, 次數) 清單，多的在前。"""
+    kinds = getattr(s, "miss_kinds", None) or {}
+    return [(miss_label(r), n) for r, n in sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _miss_head(s):
+    """session 表頭「快取被打斷」摘要的文字（HTML/MD 共用）；沒有自報成因回 ""。"""
+    items = _miss_items(s)
+    if not items:
+        return "", ""
+    n = sum(c for _, c in items)
+    cold = getattr(s, "miss_cold", 0)
+    detail = "、".join(f"{lbl} {c}" for lbl, c in items)
+    tok = getattr(s, "miss_tok", 0)
+    usd = getattr(s, "miss_usd", 0.0)
+    upart = getattr(s, "miss_usd_partial", False)     # 混到未知模型時要標 ?／+?，不可靜默低估
+    cost = (f"，失效前綴合計 {fmt_tokens(tok)}"
+            + (f"（多付 ~{cost_label(usd, upart)}）" if (usd or upart) else "")) if tok else ""
+    head = (f"⚠ 快取被打斷 {n} 次" if cold else f"⚠ 部分失效 {n} 次")
+    if cold and cold < n:
+        head += f"（整段 {cold}、只掉一段 {n - cold}）"
+    return f"{head}（{detail}）{cost}", "Claude API 自報的成因；「只掉一段」在 ⚡% 上看不出來"
+
+
+def _miss_summary_html(s):
+    """session 表頭的「快取被打斷」摘要——Claude API 自報，含命中率仍高的部分失效。"""
+    text, tip = _miss_head(s)
+    if not text:
+        return ""
+    return f' · <span class="warn" title="{esc_attr(tip)}">{esc(text)}</span>'
+
+
+def _group_window(group):
+    """該回合模型的 context 視窗（取回合內第一個知道視窗的步驟）；查不到回 None（只顯示絕對值）。"""
+    for b in group.get("blocks", []):
+        if b.get("type") == "_step" and b.get("u") and b["u"].get("win"):
+            return b["u"]["win"]
+    return None
+
+
 def render_turn_meters(group):
     """assistant 回合的小徽章：快取% / 花費 / (可勾) 新輸入·寫入·讀取 / 脈絡 / 產出。
     冷啟著色分兩級：真失效（閒置過期/異常逐出）紅標、結構性或未歸因（首呼叫/回合內斷點/換模型…）中性灰，
@@ -1642,7 +1981,7 @@ def render_turn_meters(group):
     total_in = u["input"] + u["cache_create"] + u["cache_read"]
     if total_in <= 0 and u["output"] <= 0:
         return ""
-    pct = round(100 * u["cache_read"] / total_in) if total_in else 0
+    pct = _pct_display(u["cache_read"], total_in)
     cold = ""
     ctitle = "快取命中率（整段彙總）"
     kind = turn_cold_class(group)
@@ -1653,12 +1992,33 @@ def render_turn_meters(group):
     cost = cost_label(u["cost"], u["unpriced"])
     out = (f'<span class="meter m-cache{cold}" title="{esc_attr(ctitle)}">⚡{pct}%</span>'
            f'<span class="meter m-cost" title="估算花費">~{esc(cost)}</span>'
-           + _breakdown_meters(u["input"], u["cache_create"], u["cache_read"]) +
-           f'<span class="meter m-ctx" title="脈絡 tokens（input+cache）">ctx {fmt_tokens(u["ctx_max"])}</span>'
+           + _breakdown_meters(u["input"], u["cache_create"], u["cache_read"])
+           + _ctx_meter(u["ctx_max"], _group_window(group)) +
            f'<span class="meter m-out" title="產出 tokens">↑{fmt_tokens(u["output"])}</span>')
+    if group.get("dur_ms"):
+        out += (f'<span class="meter m-dur" title="這個回合的實際耗時（你送出 → 答完，含工具執行）">'
+                f'⏱{fmt_dur(group["dur_ms"] / 1000)}</span>')
+    if u.get("miss"):
+        # 回合彙總：把該回合各步的 API 自報失效收成一個徽章（多種成因就列出來，取最常見的在前）；
+        # 全部都只掉一段時標「部分失效」中性色，不誇大成整段快取沒了。
+        order = sorted(set(u["miss"]), key=lambda r: (-u["miss"].count(r), r))
+        label = "、".join(miss_label(r) for r in order[:2]) + ("…" if len(order) > 2 else "")
+        n = len(u["miss"])
+        money = (f"（~{esc(cost_label(u['miss_usd'], u.get('miss_usd_partial')))}）"
+                 if (u.get("miss_usd") or u.get("miss_usd_partial")) else "")
+        tok = f" · 失效前綴 {fmt_tokens(u['miss_tok'])}{money}" if u.get("miss_tok") else ""
+        tip = "；".join(API_MISS_NOTES.get(r, r) for r in order[:3])
+        # 整段／只掉一段要照實拆（比照 _miss_head）：回合內只要有一步整段冷啟就把整個 ×N 都講成
+        # 「整段快取沒了」是往嚴重方向誇大，與 session 表頭的「整段 a、只掉一段 b」自相矛盾。
+        nc = u.get("miss_cold") or 0
+        cls, tag = (("m-miss", "") if nc == n else
+                    ("m-miss part", "部分失效·") if nc == 0 else
+                    ("m-miss", f"整段{nc}·只掉一段{n - nc}·"))
+        out = (f'<span class="meter {cls}" title="{esc_attr("Claude API 自報：" + tip)}">'
+               f'⚠{tag}{esc(label)}×{n}{tok}</span>') + out
     if group.get("n_steps", 0) >= 2:
-        mp, mi, mc = coldest_step(group)
-        if mp is not None and mp < CACHE_COLD_PCT:
+        mp, mi, mc, mcold = coldest_step(group)
+        if mp is not None and mcold:
             note = _COLD_CAUSE_NOTE.get(mc, "未歸因，多為暖機/瑣碎呼叫或未分析來源")
             out = (f'<span class="meter m-cache {_cold_display(mc)}" '
                    f'title="{esc_attr("回合內命中率最低的步驟——" + note)}">'
@@ -1666,25 +2026,36 @@ def render_turn_meters(group):
     return out
 
 
-def render_step_meters(idx, u, cause=None):
-    """回合內單一步驟（API 呼叫）的分隔列：步驟序號＋該步的快取% / (可勾)細分 / ctx / 產出。
+def render_step_meters(idx, u, cause=None, gap=None):
+    """回合內單一步驟（API 呼叫）的分隔列：步驟序號＋該步的快取% / (可勾)細分 / ctx / 產出，
+    另加 API 自報的失效成因（有才出現）與可勾選的「距上一步 / effort」。
     沿用 m-cache/m-in/m-cw/m-cr/m-ctx/m-out class，與整段彙總共用同一組勾選開關（cost 不在步驟層顯示）。
     冷啟著色分兩級：真失效（閒置過期/異常逐出）紅底白字；結構性或未歸因（首呼叫/回合內斷點…）中性灰，
     並在 title 說明成因。紅標＝有證據是真的快取失效；灰＝沒命中但非失效（或未分析，如 Codex）。"""
     if not u:
         return f'<div class="step-sep"><span class="step-n">步驟 {idx}</span></div>'
-    pct = round(100 * u["cache_read"] / u["total_in"]) if u["total_in"] else 0
+    pct = _pct_display(u["cache_read"], u["total_in"])
+    # 冷/熱的界線一律用整數交叉相乘（與 _step_cold／_acc_turn_usage／報告同一判準），不用四捨五入後的
+    # pct——否則 24.6〜24.99% 這種邊界會顯示成「⚡25% 沒著色」卻同時掛著整段失效的 ⚠，自相矛盾。
+    cold_now = bool(u["total_in"]) and u["cache_read"] * 100 < CACHE_COLD_PCT * u["total_in"]
+    # 沒跑成因分析的軸（子代理／Codex）b["cause"] 為 None、_cold_display 預設塗紅；但 API 自報是實據——
+    # 有前綴變動就直接接手。務必用 `if cause` 而非 `cause or …`：主對話「已分析、非失效」的步 cause=""
+    # （falsy 但不是 None），不可被 or 洗成 None 而誤塗紅——那會動到無 diagnostics 的舊資料（違反不變量①）。
+    cause = cause if cause else (API_MISS_CAUSE.get(u.get("miss") or "") or cause)
     cold = ""
     title = "此步驟快取命中率"
-    if u["total_in"] and pct < CACHE_COLD_PCT:
+    if cold_now:
         cold = " " + _cold_display(cause)
         note = _COLD_CAUSE_NOTE.get(cause)
         title = ("此步驟未命中快取——" + note) if note else "此步驟未命中快取（未歸因，多為暖機/瑣碎呼叫或未分析來源）"
     return (f'<div class="step-sep"><span class="step-n">步驟 {idx}</span>'
             f'<span class="meter m-cache{cold}" title="{esc_attr(title)}">⚡{pct}%</span>'
-            + _breakdown_meters(u.get("input", 0), u.get("cache_create", 0), u["cache_read"]) +
-            f'<span class="meter m-ctx" title="此步驟脈絡 tokens（input+cache）">ctx {fmt_tokens(u["total_in"])}</span>'
-            f'<span class="meter m-out" title="此步驟產出 tokens">↑{fmt_tokens(u["output"])}</span></div>')
+            + _miss_meter(u.get("miss"), u.get("miss_tok", 0), u.get("miss_usd"),
+                          partial=(bool(u["total_in"]) and not cold_now))
+            + _breakdown_meters(u.get("input", 0), u.get("cache_create", 0), u["cache_read"])
+            + _ctx_meter(u["total_in"], u.get("win"))
+            + f'<span class="meter m-out" title="此步驟產出 tokens">↑{fmt_tokens(u["output"])}</span>'
+            + _extra_meters(u, gap) + "</div>")
 
 
 def subagent_summary_label(meta):
@@ -1742,7 +2113,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         t = b.get("type")
         if t == "_step":
             if multi_step:
-                parts.append(render_step_meters(b.get("idx", 0), b.get("u"), b.get("cause")))
+                parts.append(render_step_meters(b.get("idx", 0), b.get("u"), b.get("cause"), b.get("gap")))
             continue
         if t == "text":
             raw = b.get("text") or ""
@@ -1845,10 +2216,15 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
     usage = ""
     if s.models:
         usage += " · 🤖 " + esc(", ".join(short_model(m) for m in s.models))
+    if getattr(s, "efforts", None):
+        usage += " · effort " + esc("→".join(s.efforts))
     if s.usage.get("total_in") or s.tok_out:
         cost = cost_label(s.cost, s.cost_partial)
+        peak_win = getattr(s, "ctx_peak_win", None)     # 峰值那一步自己的模型視窗（見 _collect_usage）
+        peak_pct = f"（{round(100 * s.ctx_peak / peak_win)}% / {fmt_tokens(peak_win)}）" if peak_win and s.ctx_peak else ""
         usage += (f" · 💲~{cost} · ⚡快取 {s.cache_pct}%"
-                  f" · 脈絡峰值 {fmt_tokens(s.ctx_peak)} · 產出 {fmt_tokens(s.tok_out)}")
+                  f" · 脈絡峰值 {fmt_tokens(s.ctx_peak)}{peak_pct} · 產出 {fmt_tokens(s.tok_out)}")
+    usage += _miss_summary_html(s)
     rc = getattr(s, "resume_ctx", 0)
     if rc:
         w = context_window(getattr(s, "resume_model", "") or (s.models[-1] if s.models else ""))
@@ -1873,12 +2249,16 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
   </div>
   <div class="meterbar">每則顯示：
     <label><input type="checkbox" id="cb_cache" onchange="tm('cache')">⚡快取%</label>
+    <label><input type="checkbox" id="cb_miss" onchange="tm('miss')" title="Claude API 自報的快取失效成因（含命中率仍高、只掉一段的部分失效）">⚠失效原因</label>
     <label><input type="checkbox" id="cb_cost" onchange="tm('cost')">💲花費</label>
     <label><input type="checkbox" id="cb_in" onchange="tm('in')">新輸入</label>
     <label><input type="checkbox" id="cb_cw" onchange="tm('cw')">快取寫入</label>
     <label><input type="checkbox" id="cb_cr" onchange="tm('cr')">快取讀取</label>
-    <label><input type="checkbox" id="cb_ctx" onchange="tm('ctx')">脈絡</label>
+    <label><input type="checkbox" id="cb_ctx" onchange="tm('ctx')" title="脈絡 tokens；知道模型視窗時附佔比 %">脈絡</label>
     <label><input type="checkbox" id="cb_out" onchange="tm('out')">產出</label>
+    <label><input type="checkbox" id="cb_gap" onchange="tm('gap')" title="距上一次 API 呼叫多久（快取 TTL 以距上次使用計）">距上一步</label>
+    <label><input type="checkbox" id="cb_dur" onchange="tm('dur')" title="這個回合實際耗時（送出 → 答完）">⏱耗時</label>
+    <label><input type="checkbox" id="cb_eff" onchange="tm('eff')" title="該次呼叫的推理強度 effort">effort</label>
   </div>
   <h1>{h1}</h1>
   {sub}
@@ -1903,7 +2283,8 @@ function openSub(id){{var el=document.getElementById(id);if(!el)return true;
  el.classList.add('hl');
  el.scrollIntoView({{behavior:'smooth',block:'start'}});history.replaceState(null,'',  '#'+id);return false;}}
 if(location.hash.length>1){{setTimeout(function(){{openSub(location.hash.slice(1));}},0);}}
-var MET=['cache','cost','in','cw','cr','ctx','out'],DEF={{cache:1,cost:1,in:0,cw:0,cr:0,ctx:0,out:0}};
+var MET=['cache','miss','cost','in','cw','cr','ctx','out','gap','dur','eff'],
+    DEF={{cache:1,miss:1,cost:1,in:0,cw:0,cr:0,ctx:0,out:0,gap:0,dur:0,eff:0}};
 function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
 function lsSet(k,v){{try{{localStorage.setItem(k,v);}}catch(e){{}}}}
 function applyMet(){{MET.forEach(function(k){{var v=lsGet('m_'+k);v=(v===null)?DEF[k]:(v==='1'?1:0);document.body.classList.toggle('hide-'+k,!v);var cb=document.getElementById('cb_'+k);if(cb)cb.checked=!!v;}});}}
@@ -1911,7 +2292,8 @@ function tm(k){{var cb=document.getElementById('cb_'+k);lsSet('m_'+k,cb.checked?
 applyMet();
 </script>
 """
-    return html_page(s.title, body, body_class="hide-in hide-cw hide-cr hide-ctx hide-out")
+    return html_page(s.title, body,
+                     body_class="hide-in hide-cw hide-cr hide-ctx hide-out hide-gap hide-dur hide-eff")
 
 
 # =========================================================================
@@ -1963,17 +2345,28 @@ def turn_meters_md(group):
     total_in = u["input"] + u["cache_create"] + u["cache_read"]
     if total_in <= 0 and u["output"] <= 0:
         return ""
-    pct = round(100 * u["cache_read"] / total_in) if total_in else 0
+    pct = _pct_display(u["cache_read"], total_in)
     cold = ""
     if group.get("n_steps", 0) >= 2:
-        mp, mi, mc = coldest_step(group)
-        if mp is not None and mp < CACHE_COLD_PCT:
+        mp, mi, mc, mcold = coldest_step(group)
+        if mp is not None and mcold:
             tag = _COLD_CAUSE_LABEL.get(mc)
             # ⚠ 只掛在「真失效」（過期/異常逐出）；結構性/未歸因只標成因、不當警訊
             warn = "⚠" if mc in _COLD_GENUINE else ""
             cold = f" · ❄最低 {mp}%（步驟{mi}{('·' + tag) if tag else ''}）{warn}"
     cost = cost_label(u["cost"], u["unpriced"])
-    return f"  ·  ⚡{pct}%{cold} · ~{cost} · ctx {fmt_tokens(u['ctx_max'])} · ↑{fmt_tokens(u['output'])}"
+    miss = ""
+    if u.get("miss"):      # API 自報失效（含部分失效）：MD 也要看得到，否則 grep 不到
+        order = sorted(set(u["miss"]), key=lambda r: (-u["miss"].count(r), r))
+        tok = f"·失效前綴 {fmt_tokens(u['miss_tok'])}" if u.get("miss_tok") else ""
+        nall, nc = len(u["miss"]), (u.get("miss_cold") or 0)     # 同 HTML：整段／只掉一段照實拆
+        tag = "" if nc == nall else ("部分失效·" if nc == 0 else f"整段{nc}·只掉一段{nall - nc}·")
+        miss = f" · ⚠{tag}{'、'.join(miss_label(r) for r in order[:2])}×{len(u['miss'])}{tok}"
+    win = _group_window(group)
+    pctx = f"（{round(100 * u['ctx_max'] / win)}%）" if (win and u["ctx_max"]) else ""
+    dur = f" · ⏱{fmt_dur(group['dur_ms'] / 1000)}" if group.get("dur_ms") else ""
+    return (f"  ·  ⚡{pct}%{cold}{miss} · ~{cost} · ctx {fmt_tokens(u['ctx_max'])}{pctx}"
+            f" · ↑{fmt_tokens(u['output'])}{dur}")
 
 
 def render_turn_md(group, tmap, ai="Claude"):
@@ -2023,6 +2416,8 @@ def render_session_md(s: Session) -> str:
          if (s.usage.get("total_in") or s.tok_out) else None),
         (f"- 脈絡峰值：{fmt_tokens(s.ctx_peak)} · 產出 {fmt_tokens(s.tok_out)}"
          if (s.usage.get("total_in") or s.tok_out) else None),
+        (f"- effort：{'→'.join(s.efforts)}" if getattr(s, "efforts", None) else None),
+        (f"- {_miss_head(s)[0]}（API 自報）" if _miss_head(s)[0] else None),
         (f"- 型態：{KIND_LABELS.get(s.kind, s.kind)}" if s.kind != "chat" else None),
         f"- Session：`{s.session_id}` · v{s.version}",
         "", "---",
@@ -2486,7 +2881,9 @@ def _ca_trend(bins):
 
 _CAUSE_LABEL = {k: lbl for k, lbl, _ in REPORT_CAUSES}
 _CAUSE_DESC = {k: desc for k, _, desc in REPORT_CAUSES}
-_AVOIDABLE_CAUSES = ("expiry", "evict")   # 「可避免/異常」：非結構性、與閒置行為相關
+_AVOIDABLE_CAUSES = ("expiry", "evict")   # 「可避免/異常」：非結構性、與閒置行為相關（③ 實色）。
+# 註：API 自報的前綴變動（tools/system/msgs）刻意不列此——它們「改習慣可避免」但「早點回來不可避免」，
+# 與本 bar 實色語意（閒置行為）不同，故歸淡色；③ 的 tooltip／圖例必須把它們列進去，否則與 ② 打架。
 
 
 def _top_hours(counts, k=3):
@@ -2509,14 +2906,19 @@ def _break_category(gap):
 def build_cache_report(rows, stratify=True):
     """從各 session 的 cache_steps／cache_events 彙整快取分析（v2）。回傳 dict（has_data=False 代表沒資料）。
     四條主線：
-      (A) 成因分解──每個冷啟依 REPORT_CAUSES 優先序恰好歸一因；結構性成因（第一句/切帳號/換模型/壓縮）
-          的相鄰步 pair 不進 TTL 估計（競爭風險：它們死於別的原因，混入會污染 TTL 曲線）。
+      (A) 成因分解──每個冷啟恰好歸一因，優先序為 **API 自報 > 邊界事件(switch/model/compact) > 間隔推論**
+          （REPORT_CAUSES 只是顯示順序，不代表優先序）；
+          結構性成因（第一句/切帳號/換模型/壓縮）的相鄰步 pair 不進 TTL 估計（競爭風險：它們死於
+          別的原因，混入會污染 TTL 曲線）。**API 自報的前綴變動**（工具定義/系統提示/前文/換模型）
+          同樣整對移出 TTL 與帶內樣本，但理由不同：那些步的命中率分母含被迫重寫的量、已被污染，
+          冷熱都移（只挑冷的移會把存活率灌高）；其中「本來會落在應命中帶」的對數另計 band_excluded，
+          恆等於帶內樣本 n 的減少量（假說頁引用此值，全母體的 excluded 不可拿來對）。
       (B) TTL 存活──分桶命中率＋Wilson CI；cohort 依「最近一次有寫入的步」之 TTL 分
           「1h／5m／未知(舊資料無細分)」——cur 讀的快取是那次寫入存的。
           KPI「TTL 遵約率」＝1h cohort 在應命中帶 [REPORT_INTRA_SEC, REPORT_TTL_SAFE_SEC) 的命中率，
           其補數＝「提早失效率」（1h 快取理論上帶內必命中；TTL 每次使用會刷新，gap＝距上次使用）。
       (C) 重暖作息──各帳號時間軸閒置 ≥ REPORT_BREAK_SEC 後的冷啟，本地時段直方圖
-          （平日/假日 × 可避免/不可避免，正規化為 次/活躍日）。
+          （平日/假日 × 可避免/非閒置造成，正規化為 次/活躍日）。
       (D) 尖峰假設──應命中帶內（1h cohort）依 UTC 分時看提早失效率；依 gap 分層做 CMH 勝算比＋卡方，
           控制「午休/夜間本來就閒得久」的混雜。
       (E) 脈絡假設──同一批帶內樣本依「前一步脈絡」分箱看失效率（Cochran–Armitage 趨勢），
@@ -2535,6 +2937,15 @@ def build_cache_report(rows, stratify=True):
     band_pairs = []                                 # 應命中帶樣本：(前步脈絡, gap 層 idx, 冷啟)──假說 (E) 用
     evict_form = []                                 # 帶內冷啟形態：(殘餘 cache_read, 寫入量, 本步脈絡, 前步脈絡)
     causes_total = {k: 0 for k in cause_keys}
+    # API 自報成因（diagnostics.cache_miss_reason）：冷啟／部分失效分開記，並估算失效前綴長度與多付的錢。
+    api_cold = {}                                   # reason -> 次數（冷啟步）
+    api_partial = {}                                # reason -> 次數（命中率仍 ≥ 門檻、只掉一段）
+    api_tok = {"cold": 0, "partial": 0}
+    api_usd = {"cold": 0.0, "partial": 0.0}
+    api_usd_partial = False                         # 有前綴變動步是未知模型、金額估不出（比照 avoid_partial 標 +?）
+    api_excluded = 0                                # 因「前綴變動」被排除的相鄰步對（全母體）
+    band_excluded = 0                               # 其中「本來會落在應命中帶」的對數（假說頁引用此值）
+    band_api = {}                                   # 應命中帶內失效時 API 說了什麼（"-"＝沒說）
     cold_events = []                                # (epoch, cause)：供分期堆疊圖
     warm_max = 0
     top_warm = []                                   # (gap, epoch)：gap ≥ 1 小時仍命中的異常
@@ -2556,6 +2967,27 @@ def build_cache_report(rows, stratify=True):
             tok_in += st[2]
             mode_n["1h" if st[5] > 0 else ("5m" if st[4] > 0 else "unknown")] += 1
         steps = [(i, st) for i, st in enumerate(raw) if st[2] >= REPORT_MIN_CTX]
+        # API 自報成因盤點（獨立於成因判定：連「命中率看起來正常、但 API 說有一段被重寫」的
+        # 部分失效也算進來——那是逐步徽章之外唯一看得到它的地方）。
+        for _, st in steps:
+            reason, mtok = _step_miss(st)
+            if not reason:
+                continue
+            bucket = "cold" if _step_cold(st) else "partial"
+            (api_cold if bucket == "cold" else api_partial)[reason] = \
+                (api_cold if bucket == "cold" else api_partial).get(reason, 0) + 1
+            api_tok[bucket] += mtok
+            mi = st[6]
+            w = rewrite_waste_usd(models[mi] if 0 <= mi < len(models) else "", mtok,
+                                  st[4], st[5], wrote=st[3])
+            # 注意：這裡對**任何**帶 cache_missed_input_tokens 的成因累加。今天實資料只有四種前綴變動類
+            # 會附長度（previous_message_not_found／unavailable 恆為 0），但那是資料性質、非程式保證 →
+            # ②-b 文案只能說「被迫重算的代價」，不可斷言「是你改前綴的代價」。（若哪天 CLI 也替
+            # unavailable 附長度，那是伺服器側失效，且 pmnf 的金額會開始與 KPI avoid_usd 重疊。）
+            if w:
+                api_usd[bucket] += w
+            elif mtok > 0 and st[3] > 0:
+                api_usd_partial = True              # 未知模型：有重算量卻算不出錢 → 標記，渲染時附 +?
         last_lim = None
         for t, kind in events:
             if kind == "limit" and (last_lim is None or t - last_lim > 600):
@@ -2590,10 +3022,17 @@ def build_cache_report(rows, stratify=True):
             boundary = ("switch" if ("limit" in kinds or "auth" in kinds) else
                         "model" if (prev[6] >= 0 and cur[6] >= 0 and prev[6] != cur[6]) else
                         "compact" if "compact" in kinds else None)
+            # 前綴變動（工具/系統提示/前文/換模型）是 client 造成、必然重寫，不是快取沒撐住 →
+            # 與結構性邊界同樣視為競爭風險：定成因用它，且該相鄰步對不進 TTL 存活／應命中帶統計。
+            api_cause = API_MISS_CAUSE.get(_step_miss(cur)[0])
+            if api_cause == "msgs" and boundary == "compact":
+                api_cause = "compact"      # 同 classify_cache_causes：壓縮邊界比通稱 msgs 更準
             cohort = last_write or "unknown"
             ttl_bound = REPORT_TTL_SAFE_SEC if cohort == "1h" else 5 * 60
             if cold:
-                if boundary:
+                if api_cause:
+                    cause = api_cause
+                elif boundary:
                     cause = boundary
                 elif gap >= ttl_bound:
                     cause = "expiry"
@@ -2613,6 +3052,20 @@ def build_cache_report(rows, stratify=True):
                         avoid_usd += (write - cur[3] * CACHE_READ_MULT) * price[0] / 1_000_000
                     else:
                         avoid_partial = True
+            if api_cause:
+                # API 說前綴被改掉：這步的命中/未命中被「客戶端改了前綴」污染（分母含被迫重寫的量），
+                # 不反映快取有沒有撐住 → 整對移出風險集（competing risk）。**冷、熱都移**：
+                # 只挑冷的移除等於只刪失敗樣本，會把存活率灌高，比不處理更糟。
+                # 只在「API 自報是唯一排除理由」時計數：同時有邊界（切帳號/換模型/壓縮）的對，
+                # 在這條規則出現以前就已被 boundary 擋掉，算成「因自報而排除」是錯誤歸因。
+                # （model_changed 幾乎必然伴隨 model 邊界，不擋就會系統性灌水。）
+                if not boundary:
+                    api_excluded += 1
+                    if cohort == "1h" and REPORT_INTRA_SEC <= gap < REPORT_TTL_SAFE_SEC:
+                        band_excluded += 1    # 這對本來會進應命中帶（假說頁引用的就是這個數）
+                else:
+                    last_write = None         # 邊界仍要重置 lineage（與 classify_cache_causes 一致）
+                continue
             if boundary:
                 # 結構性成因：不進 TTL 存活／帶內統計（競爭風險）。並重置快取 lineage——
                 # 切帳號/換模型/壓縮後是全新前綴，邊界前的寫入 TTL 不再適用；
@@ -2645,6 +3098,8 @@ def build_cache_report(rows, stratify=True):
                 band_pairs.append((prev[2], si, cold))
                 if cold:
                     evict_form.append((cur[1], cur[3], cur[2], prev[2]))
+                    r_api = _step_miss(cur)[0]       # 帶內失效時 API 怎麼說（前綴變動類已在上面排除）
+                    band_api[r_api or "-"] = band_api.get(r_api or "-", 0) + 1
         acct = r.get("account", "")
         tl = timelines.setdefault(acct, [])
         for _, st in steps:
@@ -2780,6 +3235,13 @@ def build_cache_report(rows, stratify=True):
         # (A) 成因
         "causes_total": causes_total,
         "cause_periods": periods,
+        # (A2) API 自報成因（實據）：冷啟／部分失效各自的次數、失效前綴長度與估算多付的錢
+        "api": {"cold": api_cold, "partial": api_partial,
+                "cold_tok": api_tok["cold"], "partial_tok": api_tok["partial"],
+                "cold_usd": api_usd["cold"], "partial_usd": api_usd["partial"],
+                "usd_partial": api_usd_partial,
+                "excluded": api_excluded, "band_excluded": band_excluded, "band": band_api,
+                "n": sum(api_cold.values()) + sum(api_partial.values())},
         # (C) 作息
         "clock_wd": wd, "clock_we": we,
         "wd_days": len(act_wd), "we_days": len(act_we),
@@ -2815,7 +3277,7 @@ def _pct(x, digits=0):
 
 
 def _hour_chart2(cells, days, mx, lo, hi):
-    """時段圖（每列一小時）：bar 分兩段＝可避免（實色）＋不可避免（同色調淡），
+    """時段圖（每列一小時）：bar 分兩段＝可避免（實色）＋非閒置造成（同色調淡；含 API 自報的前綴變動），
     寬度＝次/活躍日、依傳入 mx 正規化讓平日/假日共用刻度；只畫 lo..hi 小時。"""
     mx = mx or 1
     days = days or 1
@@ -2828,7 +3290,7 @@ def _hour_chart2(cells, days, mx, lo, hi):
             f'<div class="hrow"><span class="hh">{h:02d} 時</span>'
             f'<span class="hbarwrap">'
             f'<span class="hseg a" style="width:{wa}px" title="可避免（閒置過期/提早失效）：{a} 次"></span>'
-            f'<span class="hseg u" style="width:{wu}px" title="不可避免（第一句/切帳號/換模型/壓縮）：{u} 次"></span>'
+            f'<span class="hseg u" style="width:{wu}px" title="非閒置造成（第一句/切帳號/換模型/壓縮，或 API 自報的前綴變動）：{u} 次"></span>'
             f'</span><span class="hn">{(a + u) or ""}</span></div>')
     return "".join(rows)
 
@@ -2961,6 +3423,113 @@ def _svg_dotplot(rows, aria):
     return "".join(parts)
 
 
+def _api_miss_rows(d):
+    """API 自報成因的彙總列：[(成因鍵, 冷啟次數, 部分失效次數)]，總次數多的在前。"""
+    api = d.get("api") or {}
+    cold, partial = api.get("cold") or {}, api.get("partial") or {}
+    keys = sorted(set(cold) | set(partial),
+                  key=lambda r: (-(cold.get(r, 0) + partial.get(r, 0)), r))
+    return [(r, cold.get(r, 0), partial.get(r, 0)) for r in keys]
+
+
+def _api_miss_html(d):
+    """②-b：Claude 自報的失效成因全貌，含「命中率看起來正常、卻有一段被重寫」的部分失效。
+    部分失效在 ⚡% 上完全看不出來（分母同步變大），只有這裡與逐步徽章看得到。"""
+    api = d.get("api") or {}
+    rows = _api_miss_rows(d)
+    parts = ["<h3>②-b Claude 自報的失效成因（含部分失效）</h3>"]
+    if not rows:
+        parts.append('<div class="lead">這批資料沒有 API 自報成因——2026-05 之前的 Claude Code 版本'
+                     "還沒有 <code>diagnostics.cache_miss_reason</code> 這個欄位，"
+                     "或期間內每次呼叫都完整命中。上面的成因全部來自本工具推論。</div>")
+        return "".join(parts)
+    n_cold = sum(c for _, c, _ in rows)
+    n_part = sum(p for _, _, p in rows)
+    tok = api.get("partial_tok", 0) + api.get("cold_tok", 0)
+    usd = api.get("partial_usd", 0.0) + api.get("cold_usd", 0.0)
+    # 用 cost_label 而非 fmt_money：全部步驟都是未知模型時 usd＝0，仍要顯示 ?／+? 提示金額算不出來，
+    # 不能整句消失（那會讓讀者以為「沒有多付」）。
+    money = (f"、比直接命中多付 <b>~{esc(cost_label(usd, api.get('usd_partial')))}</b>"
+             if (usd or api.get("usd_partial")) else "")
+    parts.append(f'<div class="insight">Claude 明講失效成因的呼叫共 <b>{n_cold + n_part}</b> 次：'
+                 f'冷啟 {n_cold} 次、<b>部分失效 {n_part}</b> 次'
+                 f'（命中率仍在門檻之上、但有一段被迫重算——在 ⚡% 上看不出來）。'
+                 f'API 有附「失效前綴長度」的合計 <b>{fmt_tokens(tok)}</b> tokens{money}'
+                 "（失效前綴＝從多久以前開始對不上，不等於重寫量；金額以各步實際寫入量為上限估算，"
+                 "算的是「這些被迫重算的 token 比直接命中多付多少」，不等於「本來全都省得下來」）。"
+                 "本節母體＝所有有自報成因的呼叫（含 ② 歸為「session 第一句」的首步、及 ② 逐對統計略過的步），"
+                 "故各成因的「冷啟」數不必等於 ② 對應列。</div>")
+    body = "".join(f"<tr><td>{esc(miss_label(r))}</td><td class='num'>{c}</td><td class='num'>{p}</td>"
+                   f"<td class='hn'>{esc(API_MISS_NOTES.get(r, ''))}</td></tr>"
+                   for r, c, p in rows)
+    parts.append('<table class="rep"><thead><tr><th>API 自報成因</th><th class="num">冷啟</th>'
+                 '<th class="num">部分失效</th><th>意思</th></tr></thead>'
+                 f"<tbody>{body}</tbody></table>")
+    if api.get("excluded"):
+        parts.append(f'<div class="lead">另有 <b>{api["excluded"]}</b> 對相鄰步因「前綴被改掉」'
+                     "（工具定義／系統提示／前文／換模型）排除在 TTL 存活與應命中帶統計之外："
+                     "這些步的命中率分母含被迫重寫的量，已被污染，不反映快取有沒有撐住——"
+                     "所以整對移出風險集（冷、熱都移；只挑冷的移會把存活率灌高）。</div>")
+    return "".join(parts)
+
+
+def _api_miss_md(d):
+    """②-b 的 Markdown 版（與 _api_miss_html 同一批數字）。"""
+    api = d.get("api") or {}
+    rows = _api_miss_rows(d)
+    out = ["", "### ②-b Claude 自報的失效成因（含部分失效）", ""]
+    if not rows:
+        out.append("這批資料沒有 API 自報成因（2026-05 前的 Claude Code 版本沒有 "
+                   "`diagnostics.cache_miss_reason`，或期間內每次呼叫都完整命中）；上面的成因全為本工具推論。")
+        return out
+    n_cold = sum(c for _, c, _ in rows)
+    n_part = sum(p for _, _, p in rows)
+    tok = api.get("partial_tok", 0) + api.get("cold_tok", 0)
+    usd = api.get("partial_usd", 0.0) + api.get("cold_usd", 0.0)
+    out.append(f"Claude 明講成因的呼叫共 {n_cold + n_part} 次：冷啟 {n_cold}、"
+               f"**部分失效 {n_part}**（命中率仍在門檻之上、但有一段被迫重算，⚡% 看不出來）；"
+               f"有附「失效前綴長度」的合計 {fmt_tokens(tok)} tokens"
+               + (f"、比直接命中多付 ~{cost_label(usd, api.get('usd_partial'))}"
+                  if (usd or api.get("usd_partial")) else "")
+               + "（失效前綴不等於重寫量；金額以各步實際寫入量為上限估算，算的是「這些被迫重算的 token "
+                 "比直接命中多付多少」，不等於「本來全都省得下來」）。"
+                 "本節母體＝所有有自報成因的呼叫（含 ② 的「session 第一句」首步、及逐對統計略過的步），"
+                 "故各成因「冷啟」數不必等於 ② 對應列。")
+    out += ["", "| API 自報成因 | 冷啟 | 部分失效 | 意思 |", "|---|---:|---:|---|"]
+    for r, c, p in rows:
+        out.append(f"| {miss_label(r)} | {c} | {p} | {API_MISS_NOTES.get(r, '')} |")
+    if api.get("excluded"):
+        out += ["", f"另有 {api['excluded']} 對相鄰步因「前綴被改掉」排除在 TTL 存活與應命中帶統計外："
+                    "這些步的命中率分母含被迫重寫的量、已被污染，整對移出風險集"
+                    "（冷、熱都移；只挑冷的移會把存活率灌高）。"]
+    return out
+
+
+def _band_api_note(d):
+    """假說頁共用句：帶內「提早失效」樣本裡，API 各說了什麼（前綴變動類已在取樣時排除）。"""
+    api = d.get("api") or {}
+    band = api.get("band") or {}
+    note = ""
+    if api.get("band_excluded"):     # 只算「本來會落在這條帶內」的，別拿全母體數字唬人
+        note = (f"（另有 {api['band_excluded']} 對本來會落在帶內的相鄰步，因 API 自報「前綴被改掉」"
+                "──工具定義／系統提示／前文／換模型──整對移出樣本：命中與未命中都移，"
+                "只挑未命中移會把存活率灌高）")
+    if not band:                     # 帶內一個失效樣本都沒留下時，排除揭露更要講——遵約率看起來完美，
+        if not note:                 # 正是因為失效樣本全被排除掉了
+            return ""
+        return (f"帶內沒有失效樣本{note}。" if (d.get("kpi") or {}).get("comply_n")
+                else f"帶內樣本全數被移出{note}。")   # 連樣本都不剩＝「沒有失效」會誤導
+    named = [(r, n) for r, n in sorted(band.items(), key=lambda kv: -kv[1]) if r != "-"]
+    silent = band.get("-", 0)
+    bits = "、".join(f"{miss_label(r)} {n} 次" for r, n in named)
+    if not named:
+        return f"這批帶內失效 API 都沒給成因{note}。"
+    tail = ("「前文不在快取」正是「該在的前綴不見了」的形態，仍當失效候選；"
+            if any(r == "previous_message_not_found" for r, _ in named) else "")
+    return (f"帶內失效裡 API 有給成因的：{bits}；其餘 {silent} 次 API 沒說。"
+            f"{tail}能明確歸給客戶端改動的都已排除{note}。")
+
+
 def _hours_label(hours):
     return "、".join(f"{h:02d}" for h in hours) + " 時" if hours else "—"
 
@@ -3031,8 +3600,11 @@ def render_cache_report_html(d) -> str:
     tiles = [("整體命中率", _pct(k["hit"]) if k["tok_in"] else "—", "token 加權：讀取 ÷ 全部脈絡")]
     if k["comply_n"]:
         p, lo, hi = _wilson(k["comply_hit"], k["comply_n"])
+        bx = (d.get("api") or {}).get("band_excluded") or 0
         tiles.append(("TTL 遵約率", _pct(p),
-                      f"1h 快取、閒置 2–55 分內回來仍命中；CI {_pct(lo)}–{_pct(hi)}，n={k['comply_n']}"))
+                      f"1h 快取、閒置 2–55 分內回來仍命中；CI {_pct(lo)}–{_pct(hi)}，n={k['comply_n']}"
+                      # headline 數字自己也要帶這個限定——它因排除而整整跳了 1.75pp
+                      + (f"（另有 {bx} 對因前綴變動移出）" if bx else "")))
         tiles.append(("提早失效", f"{k['comply_n'] - k['comply_hit']} 次",
                       f"應命中帶內卻冷啟＝{_pct(1 - p)}（1h TTL 下理論上應為 0）"))
     tiles.append(("可避免冷啟", f"{d['causes_total']['expiry']} 次",
@@ -3077,7 +3649,8 @@ def render_cache_report_html(d) -> str:
         if len(cohorts) > 1:
             parts.append('<div class="legend">' + "".join(
                 f'<span><span class="sw {c["css"]}"></span>{esc(c["label"])}</span>' for c in cohorts) + "</div>")
-        parts.append('<div class="lead">結構性冷啟（session 第一句／切帳號／換模型／壓縮後）已從曲線樣本排除'
+        parts.append('<div class="lead">結構性冷啟（session 第一句／切帳號／換模型／壓縮後，以及 API 自報的'
+                     '前綴變動——工具定義／系統提示／前文）已從曲線樣本排除'
                      '（它們不是 TTL 造成的）；「&lt; 1 分」桶的 miss 多為回合內快取斷點雜訊。'
                      'TTL 每次使用會刷新，故 x 軸＝距上一次使用的閒置時間。</div>')
         head = "".join(f'<th colspan="2">{esc(c["label"])}</th>' for c in cohorts)
@@ -3105,14 +3678,25 @@ def render_cache_report_html(d) -> str:
 
     # ── ② 冷啟成因分解 ──
     parts.append("<h2>② 冷啟成因分解</h2>")
+    parts.append('<div class="lead">成因有兩種來源：<b>API 自報</b>（Claude 在 '
+                 "<code>diagnostics.cache_miss_reason</code> 直接寫明為什麼沒命中——實據）與"
+                 "<b>本工具推論</b>（沒有自報時，依邊界事件與間隔判定）。有自報就以自報為準。</div>")
     total_cold = sum(d["causes_total"].values())
     if total_cold:
         ct = d["causes_total"]
         avoid = ct["expiry"] + ct["evict"]
-        struct = ct["first"] + ct["switch"] + ct["model"] + ct["compact"]
-        ins2 = (f"共 <b>{total_cold}</b> 次冷啟：結構性（避不掉）<b>{struct}</b>、"
-                f"可避免/異常 <b>{avoid}</b>（閒置過期 {ct['expiry']}＋提早失效 {ct['evict']}）、"
+        api_keys = ("tools", "system", "msgs")
+        api_n = sum(ct[k] for k in api_keys)
+        unavoid = ct["first"] + ct["switch"] + ct["model"] + ct["compact"]
+        ins2 = (f"共 <b>{total_cold}</b> 次冷啟：不可避免 <b>{unavoid}</b>"
+                "（第一句/切帳號/換模型/壓縮）、"
+                + (f"前綴變動（習慣可避免）<b>{api_n}</b>、" if api_n else "")
+                + f"可避免/異常 <b>{avoid}</b>（閒置過期 {ct['expiry']}＋提早失效 {ct['evict']}）、"
                 f"回合內雜訊 {ct['intra']}。")
+        if api_n:
+            ins2 += (f"「前綴變動」是 API 自報的（工具定義 {ct['tools']}／系統提示 {ct['system']}／"
+                     f"前文 {ct['msgs']}）——不是快取沒撐住，是這次請求的前綴跟上次不一樣了、"
+                     "多為中途載工具或改 CLAUDE.md 造成（改掉習慣就能省），已排除在 TTL 統計外。")
         if ct["switch"]:
             ins2 += f"「limit/切帳號」{ct['switch']} 次已自動偵測（429/401 邊界），不會污染 TTL 統計。"
         parts.append(f'<div class="insight">{ins2}</div>')
@@ -3126,6 +3710,7 @@ def render_cache_report_html(d) -> str:
                      f"<th>說明</th></tr></thead><tbody>{rows}</tbody></table>")
     else:
         parts.append('<div class="insight">期間內沒有冷啟。</div>')
+    parts.append(_api_miss_html(d))
 
     # ── ③ 重暖作息 ──
     parts.append("<h2>③ 你都什麼時段重新暖機（冷啟作息）</h2>")
@@ -3133,7 +3718,8 @@ def render_cache_report_html(d) -> str:
     parts.append(f'<div class="lead">各帳號活動軸上「閒置 ≥ {fmt_dur(REPORT_BREAK_SEC)} 後、確實冷啟的第一步」'
                  f"＝一次重新開工，共 <b>{n_res}</b> 次（閒置夠久卻仍命中 1h 快取者不算）。"
                  "bar 分兩段：<b>實色＝可避免</b>（閒置過期/提早失效——早點回來或先 ping 就能省）、"
-                 "淡色＝不可避免（session 第一句/切帳號/換模型/壓縮）。已正規化為「次/活躍日」，平日假日可直接比。</div>")
+                 "淡色＝不是閒置造成的（session 第一句/切帳號/換模型/壓縮，以及 API 自報的前綴變動——"
+                 "那類要改習慣才省得到，不是「早點回來」能解決的）。已正規化為「次/活躍日」，平日假日可直接比。</div>")
     wd_tot = [c["a"] + c["u"] for c in d["clock_wd"]]
     we_tot = [c["a"] + c["u"] for c in d["clock_we"]]
     ins3 = []
@@ -3194,8 +3780,11 @@ def render_cache_report_md(d) -> str:
     out.append(f"- 整體命中率（token 加權）：**{_pct(k['hit'])}**")
     if k["comply_n"]:
         p, lo, hi = _wilson(k["comply_hit"], k["comply_n"])
+        bx = (d.get("api") or {}).get("band_excluded") or 0
         out.append(f"- TTL 遵約率（1h 快取、閒置 2–55 分仍命中）：**{_pct(p)}**"
-                   f"（CI {_pct(lo)}–{_pct(hi)}，n={k['comply_n']}）；提早失效 {k['comply_n'] - k['comply_hit']} 次")
+                   f"（CI {_pct(lo)}–{_pct(hi)}，n={k['comply_n']}"
+                   + (f"；另有 {bx} 對因前綴變動移出" if bx else "")
+                   + f"）；提早失效 {k['comply_n'] - k['comply_hit']} 次")
     out.append(f"- 可避免冷啟（閒置過期）：**{d['causes_total']['expiry']} 次**（約 {k['avoid_week']:.1f} 次/週）"
                f"；估算可避免浪費 **{fmt_money(k['avoid_usd'])}{'+?' if k['avoid_partial'] else ''}**")
 
@@ -3228,19 +3817,30 @@ def render_cache_report_md(d) -> str:
             if row_n:
                 out.append(f"| {lbl} | " + " | ".join(cells) + " |")
         out.append("")
-        out.append("> 結構性冷啟（第一句/切帳號/換模型/壓縮）已排除；「< 1 分」桶多為回合內快取斷點雜訊。"
+        out.append("> 結構性冷啟（第一句/切帳號/換模型/壓縮，以及 API 自報的前綴變動：工具定義/系統提示/前文）"
+                   "已排除；「< 1 分」桶多為回合內快取斷點雜訊。"
                    "TTL 每次使用會刷新，間隔＝距上一次使用。")
     if d["top_warm"]:
         out += ["", "異常存活（>1 小時仍命中；理論上不該發生，供對照）："]
         for g, ts in d["top_warm"]:
             out.append(f"- {fmt_dur(g)} 後仍命中 · {datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')}")
 
-    out += ["", "## ② 冷啟成因分解", ""]
+    out += ["", "## ② 冷啟成因分解", "",
+            "成因兩種來源：**API 自報**（Claude 在 `diagnostics.cache_miss_reason` 直接寫明——實據）與"
+            "**本工具推論**（沒有自報時依邊界事件與間隔判定）；有自報就以自報為準。"]
     total_cold = sum(d["causes_total"].values())
     if total_cold:
         ct = d["causes_total"]
-        out.append(f"共 {total_cold} 次冷啟；結構性 {ct['first'] + ct['switch'] + ct['model'] + ct['compact']}、"
-                   f"可避免/異常 {ct['expiry'] + ct['evict']}、回合內雜訊 {ct['intra']}。")
+        api_n = ct["tools"] + ct["system"] + ct["msgs"]
+        unavoid = ct["first"] + ct["switch"] + ct["model"] + ct["compact"]
+        out.append("")
+        out.append(f"共 {total_cold} 次冷啟；不可避免 {unavoid}（第一句/切帳號/換模型/壓縮）、"
+                   + (f"前綴變動（習慣可避免）{api_n}、" if api_n else "")
+                   + f"可避免/異常 {ct['expiry'] + ct['evict']}、回合內雜訊 {ct['intra']}。")
+        if api_n:
+            out.append(f"「前綴變動」是 API 自報的（工具定義 {ct['tools']}／系統提示 {ct['system']}／"
+                       f"前文 {ct['msgs']}）——不是快取沒撐住，多為中途載工具或改 CLAUDE.md 造成"
+                       "（改掉習慣就能省），已排除在 TTL 統計外。")
         out += ["", "| 成因 | 次數 | 說明 |", "|---|---:|---|"]
         for key, lbl, desc in REPORT_CAUSES:
             out.append(f"| {lbl} | {d['causes_total'][key]} | {desc} |")
@@ -3253,17 +3853,19 @@ def render_cache_report_md(d) -> str:
                 out.append(f"| {p['label']} | {cells} | {sum(p['counts'].values())} |")
     else:
         out.append("期間內沒有冷啟。")
+    out += _api_miss_md(d)
 
     out += ["", "## ③ 重暖作息（冷啟時段）", "",
             f"閒置 ≥ {fmt_dur(REPORT_BREAK_SEC)} 後、確實冷啟的第一步＝重新開工，共 {d['n_resumes']} 次"
-            "（可避免＝閒置過期/提早失效；不可避免＝第一句/切帳號/換模型/壓縮）。"]
+            "（可避免＝閒置過期/提早失效；非閒置造成＝第一句/切帳號/換模型/壓縮，以及 API 自報的"
+            "前綴變動——工具定義/系統提示/前文，那類要改習慣才省得到，不是「早點回來」能解決的）。"]
     wd_tot = [c["a"] + c["u"] for c in d["clock_wd"]]
     we_tot = [c["a"] + c["u"] for c in d["clock_we"]]
     if sum(wd_tot):
         out.append(f"- 平日 {sum(wd_tot)} 次／{d['wd_days']} 個活躍日，集中 {_hours_label(_top_hours(wd_tot))}")
     if sum(we_tot):
         out.append(f"- 假日 {sum(we_tot)} 次／{d['we_days']} 個活躍日，集中 {_hours_label(_top_hours(we_tot))}")
-    out += ["", "| 時 | 平日可避免 | 平日不可避免 | 假日可避免 | 假日不可避免 |", "|---|---:|---:|---:|---:|"]
+    out += ["", "| 時 | 平日可避免 | 平日非閒置 | 假日可避免 | 假日非閒置 |", "|---|---:|---:|---:|---:|"]
     for h in range(24):
         if wd_tot[h] or we_tot[h]:
             out.append(f"| {h:02d} | {d['clock_wd'][h]['a'] or ''} | {d['clock_wd'][h]['u'] or ''} "
@@ -3310,15 +3912,28 @@ def render_cache_hypotheses_html(d) -> str:
         '<div class="lead">健檢報告量到「<b>提早失效</b>」——1 小時快取在應命中帶'
         f'（閒置 {fmt_dur(REPORT_INTRA_SEC)}–{fmt_dur(REPORT_TTL_SAFE_SEC)}，TTL 每次使用會刷新）'
         '內卻冷啟的異常。這頁把它的候選成因一個假說一節逐一檢定；樣本、門檻與健檢頁同一套'
-        '（結構性冷啟已排除、比率附 Wilson 95% CI），拿自己的 JSONL 跑 viewer 就會得到同一組檢定，可直接對照。</div>')
+        '（結構性冷啟已排除、比率附 Wilson 95% CI），拿自己的 JSONL 跑 viewer 就會得到同一組檢定，可直接對照。'
+        '2026-05 起的紀錄 Claude 會<b>自報</b>未命中成因，能歸給「前綴被改掉」（工具定義／系統提示／前文／'
+        '換模型）的已從樣本剔除——這頁追的是<b>剩下不能歸給客戶端改動</b>的那些'
+        '（其中不少 API 仍給了成因，如「前文不在快取」——那正是快取真的不在了的形態，故仍當失效候選）。</div>')
     parts.append(f'<div class="lead">涵蓋範圍：{esc(" · ".join(_cover_items(d)))}</div>')
     if k["comply_n"]:
         ev = k["comply_n"] - k["comply_hit"]
         parts.append(f'<div class="insight">共用樣本：應命中帶相鄰步 <b>n={k["comply_n"]}</b>，'
                      f'其中提早失效 <b>{ev}</b> 次（{_ci_str(ev, k["comply_n"])}）。</div>')
+    elif (d.get("api") or {}).get("band_excluded"):
+        # 樣本不是不存在，是被排除掉了——不可講成「資料不足、再累積就有」。但排除理由不只自報：
+        # 邊界（切帳號/換模型/壓縮）排掉的帶內對**不**計進 band_excluded，不可一併算在 API 頭上。
+        parts.append('<div class="insight">應命中帶目前沒有可檢定樣本——<b>不是</b>資料不足，'
+                     '而是原本會落在帶內的相鄰步都已排除（其中 '
+                     f'<b>{d["api"]["band_excluded"]}</b> 對因 API 自報「前綴被改掉」，'
+                     '其餘為切帳號／換模型／壓縮邊界）。</div>')
     else:
         parts.append('<div class="insight">尚無應命中帶樣本（需要 1h 快取寫入、閒置 2–55 分的相鄰步）；'
                      '累積資料後這頁才有東西可檢定。</div>')
+    note = _band_api_note(d)         # 移出 guard：帶內樣本被排除到 0 時，這句揭露才最需要講
+    if note:
+        parts.append(f'<div class="lead">{esc(note)}</div>')
 
     # ── ① 尖峰時段假說 ──
     parts.append("<h2>① 伺服器時段：全球尖峰時較易被擠掉？</h2>")
@@ -3407,14 +4022,24 @@ def render_cache_hypotheses_md(d) -> str:
            f"健檢報告量到「提早失效」——1 小時快取在應命中帶（閒置 {fmt_dur(REPORT_INTRA_SEC)}–"
            f"{fmt_dur(REPORT_TTL_SAFE_SEC)}）內卻冷啟的異常。"
            "這頁逐一檢定它的候選成因；樣本、門檻與健檢頁（[快取分析報告](cache-report.md)）同一套，"
-           "拿自己的 JSONL 跑 viewer 就會得到同一組檢定，可直接對照。", ""]
+           "拿自己的 JSONL 跑 viewer 就會得到同一組檢定，可直接對照。"
+           "2026-05 起的紀錄 Claude 會自報未命中成因，能歸給「前綴被改掉」（工具定義／系統提示／前文／換模型）"
+           "的已從樣本剔除——這頁追的是剩下不能歸給客戶端改動的那些"
+           "（其中不少 API 仍給了成因，如「前文不在快取」——那正是快取真的不在了的形態，仍當失效候選）。", ""]
     out.append("涵蓋範圍：" + " · ".join(_cover_items(d)))
     if k["comply_n"]:
         ev = k["comply_n"] - k["comply_hit"]
         out += ["", f"共用樣本：應命中帶相鄰步 n={k['comply_n']}，其中提早失效 {ev} 次"
                     f"（{_ci_str(ev, k['comply_n'])}）。"]
+    elif (d.get("api") or {}).get("band_excluded"):
+        out += ["", "應命中帶目前沒有可檢定樣本——**不是**資料不足，而是原本會落在帶內的相鄰步都已排除"
+                    f"（其中 {d['api']['band_excluded']} 對因 API 自報「前綴被改掉」，"
+                    "其餘為切帳號／換模型／壓縮邊界）。"]
     else:
         out += ["", "尚無應命中帶樣本（需要 1h 快取寫入、閒置 2–55 分的相鄰步）。"]
+    note = _band_api_note(d)         # 移出 guard（同 HTML）：樣本被排除到 0 時最需要這句
+    if note:
+        out += ["", note]
 
     out += ["", "## ① 伺服器時段：全球尖峰時較易被擠掉？", "",
             "依 UTC（伺服器時間）分時；依間隔分層（2–15/15–30/30–55 分）做 CMH，控制「閒多久」的混雜。"]
@@ -3698,6 +4323,7 @@ font:15px/1.65 -apple-system,"Segoe UI",system-ui,"Microsoft JhengHei","PingFang
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 h1{font-size:22px;margin:.4em 0 .2em}
 .smeta{color:var(--muted);font-size:13px;margin:2px 0;word-break:break-all}
+.smeta .warn{color:#d29922}
 .mono,.nowrap{white-space:nowrap}.mono{font-family:ui-monospace,Consolas,monospace}
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
 .ctrl button,.back{background:var(--panel);border:1px solid var(--border);color:var(--text);
@@ -3719,7 +4345,10 @@ font-size:13px;background:rgba(127,127,127,.06)}
 .meter.m-cr{color:var(--assistant)}.meter.m-cw{color:#d29922}
 .meter.cold{background:var(--err);color:#fff;font-weight:600}
 .meter.coldx{background:rgba(127,127,127,.22);color:var(--muted);font-weight:600;text-decoration:underline dotted}
-body.hide-cache .m-cache,body.hide-cost .m-cost,body.hide-in .m-in,body.hide-cw .m-cw,body.hide-cr .m-cr,body.hide-ctx .m-ctx,body.hide-out .m-out{display:none}
+.meter.m-miss{background:rgba(210,153,34,.18);color:#d29922;font-weight:600}
+.meter.m-miss.part{background:rgba(127,127,127,.14);color:var(--muted);font-weight:500}
+.meter.m-gap,.meter.m-dur,.meter.m-eff{color:var(--muted)}
+body.hide-cache .m-cache,body.hide-miss .m-miss,body.hide-cost .m-cost,body.hide-in .m-in,body.hide-cw .m-cw,body.hide-cr .m-cr,body.hide-ctx .m-ctx,body.hide-out .m-out,body.hide-gap .m-gap,body.hide-dur .m-dur,body.hide-eff .m-eff{display:none}
 .step-sep{display:flex;align-items:center;flex-wrap:wrap;gap:0;margin:12px 0 4px;padding-top:7px;border-top:1px dashed var(--border)}
 .step-sep .meter{margin-left:6px}
 .step-n{font-size:11px;font-weight:600;color:var(--muted)}
@@ -3844,6 +4473,9 @@ font-family:ui-monospace,Consolas,monospace}
 .report .cz-first{background:rgba(139,148,158,.6)}
 .report .cz-switch{background:#9d7bd8}
 .report .cz-model{background:#39c5cf}
+.report .cz-tools{background:#6ea8fe}
+.report .cz-system{background:#7fb77f}
+.report .cz-msgs{background:#c9b458}
 .report .cz-compact{background:#d2963c}
 .report .cz-expiry{background:var(--accent)}
 .report .cz-evict{background:var(--err)}
@@ -3956,7 +4588,8 @@ def session_to_row(s: "Session") -> dict:
         "cost": s.cost,
         "cost_partial": s.cost_partial,
         "cache_pct": s.cache_pct,
-        "cache_steps": getattr(s, "cache_steps", []),   # cache-report 原料：[[epoch, cache_read, 脈絡, 寫總量, 寫5分, 寫1h, 模型idx], …]
+        # cache-report 原料：[[epoch, cache_read, 脈絡, 寫總量, 寫5分, 寫1h, 模型idx, 自報成因碼, 重算tokens], …]
+        "cache_steps": getattr(s, "cache_steps", []),
         "cache_models": getattr(s, "cache_models", []),
         "cache_events": getattr(s, "cache_events", []),  # [[epoch, "limit"|"auth"|"compact"], …]
         "codex_steps": getattr(s, "codex_steps", []),    # Codex 存活頁原料：[[epoch, cache_read, 脈絡], …]

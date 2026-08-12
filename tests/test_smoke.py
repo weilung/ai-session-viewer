@@ -1219,6 +1219,33 @@ def test_api_miss_reason(tmp_path=None):
         miss_tok, miss_usd, miss_usd_partial, miss_cold = 9000, 0.0, True, 1
     assert "多付 ~?" in v._miss_head(_S())[0], "session 表頭金額也要標 ?"
 
+    # (X1 F2) 逐步徽章同理——回合／表頭／②-b 三層都標 ? 了，只有步驟層靜默省略金額＝同一事實兩處
+    #         說法不一，且「失效前綴 9.0k」不附金額會被讀成「沒多付」。三種情形都要釘：
+    def _mk(model, c1, c2):
+        return {"id": "su", "model": model,
+                "diagnostics": {"cache_miss_reason": {"type": "tools_changed",
+                                                      "cache_missed_input_tokens": 9000}},
+                "usage": {"input_tokens": 2, "cache_creation_input_tokens": c1,
+                          "cache_read_input_tokens": c2, "output_tokens": 5}}
+    su_unk = v._step_usage(_mk("claude-zzznew-9", 9000, 0))          # 未知模型 → 標 ?
+    assert su_unk["miss_usd"] is None and su_unk["miss_usd_partial"] is True, \
+        f"未知模型的步驟應標 miss_usd_partial：{su_unk}"
+    assert "多付 ~?" in v.render_step_meters(1, su_unk), \
+        f"逐步徽章金額算不出時要標 ?：{v.render_step_meters(1, su_unk)}"
+    su_known = v._step_usage(_mk("claude-opus-4-20250514", 9000, 0))  # 已知模型 → 照常顯示金額
+    assert su_known["miss_usd_partial"] is False and "多付 ~$" in v.render_step_meters(1, su_known), \
+        "已知模型不得回歸成 ?"
+    su_zero = v._step_usage(_mk("claude-opus-4-20250514", 0, 90000))  # 寫入 0＝真的沒多付，不可誤標 ?
+    assert su_zero["miss_usd"] is None and su_zero["miss_usd_partial"] is False, \
+        "被 wrote 上限壓成 0 是『真的沒多付』，與『算不出來』不同，不得標 ?"
+    assert "多付" not in v.render_step_meters(1, su_zero), "沒多付的步驟不該出現金額字樣"
+    # 不變量①：沒有 diagnostics 的舊資料完全不受影響（不得冒出徽章或旗標）
+    su_old = v._step_usage({"id": "so", "model": "claude-opus-4-20250514",
+                            "usage": {"input_tokens": 2, "cache_creation_input_tokens": 100,
+                                      "cache_read_input_tokens": 900, "output_tokens": 5}})
+    assert su_old["miss"] == "" and su_old["miss_usd_partial"] is False, "舊資料不得被本修正動到"
+    assert "失效前綴" not in v.render_step_meters(1, su_old), "舊資料不該出現失效徽章"
+
     # (G8 #1) ③ 的 MD 版不得還寫「不可避免＝第一句/切帳號/換模型/壓縮」（HTML 已改，MD 漏改＝兩處說法不一）
     md_rep = v.render_cache_report_md(d1)
     assert "不可避免＝第一句" not in md_rep, "③ MD 仍用舊標籤（前綴變動也落在該桶，說法會與 ② 打架）"
@@ -1245,6 +1272,90 @@ def test_api_miss_reason(tmp_path=None):
     got_n = v.classify_cache_causes(raw_c, ["claude-opus-4-8"], [])
     assert got_n[600] == "msgs", f"無壓縮邊界時仍應為 msgs：{got_n}"
 
+    # (X2 F1) 首步也要「有自報就以自報為準」。快取跨 session 共用 → 新 session 第一句仍可能命中上一場
+    #         的前綴，此時 tools/system/msgs 才是真成因；標 first 會把「習慣可避免」記進「不可避免」桶，
+    #         也讓 ② 與 ②-b／逐步徽章對同一步說法不一。
+    raw_f1 = [st2(0, 0, tools_code)]
+    assert v.classify_cache_causes(raw_f1, ["claude-opus-4-8"], []) == {0: "tools"}, \
+        "首步自報 tools_changed 不得被 first 蓋掉"
+    d_f1 = rep(raw_f1)
+    assert d_f1["causes_total"]["tools"] == 1 and d_f1["causes_total"]["first"] == 0, \
+        f"報告端同理：{ {k: n for k, n in d_f1['causes_total'].items() if n} }"
+    assert v.classify_cache_causes([st2(0, 0)], ["claude-opus-4-8"], []) == {0: "first"}, \
+        "沒有自報時仍須是 first（不得反向誤判）"
+
+    # (X2 F2) 前綴變動步若沒有新寫入，舊 TTL lineage 必須失效——否則下一個冷啟沿用舊 1h cohort、
+    #         被判成假的「1h 內卻冷啟」(evict)，正是本工具要消滅的東西。
+    def stw(t, cr, wrote, w1h, code=0):
+        return [t, cr, 2000, wrote, 0, w1h, 0, code, 0]
+    raw_f2 = [stw(0, 0, 2000, 2000), stw(60, 2000, 0, 0),
+              stw(200, 1800, 0, 0, tools_code), stw(600, 0, 2000, 2000)]
+    got_f2 = v.classify_cache_causes(raw_f2, ["claude-opus-4-8"], [])
+    assert got_f2.get(600) == "expiry", f"前綴變動後應落到 unknown lineage，不得是假 evict：{got_f2}"
+    assert rep(raw_f2)["causes_total"]["evict"] == 0, "報告端同樣不得產生假 evict"
+    # 反面：前綴變動步自己有寫入時 lineage 應由它重建（修正不得矯枉過正、把真 evict 也吃掉）
+    raw_f2b = [stw(0, 0, 2000, 2000), stw(60, 2000, 0, 0),
+               stw(200, 1800, 2000, 2000, tools_code), stw(600, 0, 2000, 2000)]
+    assert v.classify_cache_causes(raw_f2b, ["claude-opus-4-8"], []).get(600) == "evict", \
+        "前綴變動步有寫入時，lineage 應重建成 1h"
+
+    # (X2 F2b) band_excluded ＝「帶內樣本的**完整**減少量」（反事實差額），不是只數被直接排除的那一對：
+    #          lineage 失效會讓下游的對也從 1h 掉進 unknown、一併離開帶內。此 fixture 減少 2 對、
+    #          只數直接排除會report 1，故有鑑別力。
+    raw_f2c = [[600, 1900, 2000, 2000, 0, 2000, 0, 0, 0],
+               [1200, 0, 2000, 2000, 0, 0, 0, tools_code, 0],
+               [2700, 0, 2000, 0, 0, 2000, 0, 0, 0]]
+    on_c, off_c = rep(raw_f2c), rep([r[:7] + [0, 0] for r in raw_f2c])
+    drop_c = off_c["kpi"]["comply_n"] - on_c["kpi"]["comply_n"]
+    assert drop_c == 2, f"前提：這組反事實應減少 2 對（否則斷言沒鑑別力），實得 {drop_c}"
+    assert on_c["api"]["band_excluded"] == drop_c, \
+        f"band_excluded 須恆等於帶內樣本減少量：報 {on_c['api']['band_excluded']}、實減 {drop_c}"
+
+    # (X2 F3) ②-b 母體＝所有有自報成因的呼叫。ctx < REPORT_MIN_CTX 的過濾只服務「由命中率推論成因」，
+    #         對 API 明講的事實不適用；過濾掉會少算次數／長度／金額，還可能吞掉未知的新型別。
+    d_f3 = rep([[0, 0, 400, 400, 0, 400, 0, tools_code, 321]])
+    assert d_f3["api"]["cold"].get("tools_changed") == 1 and d_f3["api"]["cold_tok"] == 321, \
+        f"ctx < {v.REPORT_MIN_CTX} 的自報呼叫不得被靜默吞掉：{d_f3['api']}"
+
+    # (X4 H2) 被 REPORT_MIN_CTX 濾掉的前綴變動步，照樣污染它所夾的那一對相鄰步。
+    #         不看的話結構性實據被分析門檻吃掉，下游冷啟被誤判成假 evict——實測 ctx 差 1 個
+    #         token（400 vs 500）結論就整個翻轉，那是分析門檻不該有的權力。
+    def stc(t, cr, ctx, wrote, w1h, code=0, missed=0):
+        return [t, cr, ctx, wrote, 0, w1h, 0, code, missed]
+    for ctx_lo in (400, v.REPORT_MIN_CTX):        # 門檻上下都要得到同一個結論
+        raw_h2 = [stc(0, 0, 2000, 2000, 2000),
+                  stc(600, 0, ctx_lo, 0, 0, tools_code, 900),   # 低 ctx 的前綴變動
+                  stc(1200, 0, 2000, 2000, 2000)]
+        d_h2 = rep(raw_h2)
+        assert d_h2["causes_total"]["evict"] == 0, \
+            f"ctx={ctx_lo}：夾在中間的前綴變動不得讓下游冷啟變成假 evict：" \
+            f"{ {k: n for k, n in d_h2['causes_total'].items() if n} }"
+        assert d_h2["api"]["excluded"] >= 1 and d_h2["kpi"]["comply_n"] == 0, \
+            f"ctx={ctx_lo}：被污染的對必須移出應命中帶：{d_h2['api']} / {d_h2['kpi']['comply_n']}"
+        assert v.classify_cache_causes(raw_h2, ["claude-opus-4-8"], []).get(1200) != "evict", \
+            f"ctx={ctx_lo}：徽章端同樣不得有假 evict"
+
+    # (X4 H1) 同一秒的兩次呼叫不得共用 join 鍵。撞號時後者會蓋掉前者，而自從首步也採用 API
+    #         自報成因之後，後果從「推論成因貼錯」升級成「沒有 diagnostics 的那一步被標成
+    #         API 自報」＝把推論講成實據，違反最高不變量①。
+    def stk(t, code=0):
+        return [t, 0, 2000, 2000, 0, 2000, 0, code, 900 if code else 0]
+    raw_h1 = [stk(1000), stk(1000, tools_code)]      # 同秒：第 0 步無自報、第 1 步自報 tools
+    c_h1 = v.classify_cache_causes(raw_h1, ["claude-opus-4-8"], [])
+    assert len(c_h1) == 2, f"同秒兩步必須各有自己的鍵，不得互相覆蓋：{c_h1}"
+    seen_h1, got_h1 = {}, []
+    for st in raw_h1:                                 # 比照 analyze()：依序數、共用 _cause_key
+        t = st[0]
+        n = seen_h1.get(t, 0)
+        seen_h1[t] = n + 1
+        got_h1.append(c_h1.get(v._cause_key(t, n), ""))
+    assert got_h1 == ["first", "tools"], \
+        f"無 diagnostics 的首步不得被標成 API 自報成因（撞號前是 ['tools','tools']）：{got_h1}"
+    assert Counter(got_h1) == Counter({k: n for k, n in rep(raw_h1)["causes_total"].items() if n}), \
+        "撞秒時徽章與報告仍須一致"
+    # 沒撞秒時鍵必須維持裸 epoch（保證舊資料行為完全不變）
+    assert v._cause_key(1000, 0) == 1000 and v._cause_key(1000, 1) == (1000, 1)
+
     print("OK: api miss reason test passed")
 
 
@@ -1259,6 +1370,17 @@ def test_ctx_window_and_coldest(tmp_path=None):
     assert v.context_window("claude-sonnet-5-20260101") == 1_000_000
     assert v.context_window("claude-3-5-sonnet-20241022") == 200_000, "3.x 世代仍落 200k fallback"
     assert v.context_window("gpt-5.5") is None, "非 Claude 查不到就回 None（只顯示絕對值）"
+    # (X4 M6) 1M 是**分版本**的，不能用裸前綴一律當 1M：opus/sonnet 要 4.6 以上才是 1M。
+    #         先前 sonnet-4-5 的 100k 脈絡會被算成 10%（實際 50%），差 5 倍。
+    for m in ("claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+              "claude-sonnet-4-6", "claude-sonnet-5", "claude-fable-5", "claude-opus-6"):
+        assert v.context_window(m) == 1_000_000, f"{m} 應為 1M，實得 {v.context_window(m)}"
+    for m in ("claude-opus-4-5", "claude-opus-4-5-20251101", "claude-opus-4-1",
+              "claude-opus-4-20250514", "claude-sonnet-4-5-20250929",
+              "claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"):
+        assert v.context_window(m) == 200_000, f"{m} 應為 200k，實得 {v.context_window(m)}"
+    # 日期尾段不可被當成次版號（否則 opus-4-20250514 會被讀成「很新」而誤判 1M）
+    assert v._model_version("4-20250514") == (4, 0) and v._model_version("4-8") == (4, 8)
     # (2) coldest_step 冷熱判定用整數交叉相乘：24.6% 的最低步要算冷、不得因 round→25% 漏掉 ❄。
     g = {"n_steps": 2, "blocks": [
         {"type": "_step", "idx": 1, "u": {"cache_read": 9000, "total_in": 10000, "output": 0}},
@@ -1269,6 +1391,66 @@ def test_ctx_window_and_coldest(tmp_path=None):
         {"type": "_step", "idx": 1, "u": {"cache_read": 9000, "total_in": 10000, "output": 0}},
         {"type": "_step", "idx": 2, "u": {"cache_read": 2600, "total_in": 10000, "output": 0}}]}
     assert v.coldest_step(g2)[3] is False, "26% 不應判冷（確保沒有反向誤判）"
+
+    # (X2 F4) 同一顯示回合可能併了不同模型的呼叫（opus 1M 視窗 → haiku 200k 視窗）。回合的
+    #         「佔視窗 %」必須用 **ctx_max 那一步** 的視窗，不是第一步的——否則回合徽章與逐步徽章
+    #         對同一事實給出兩個百分比（實測 19% vs 95%）。HTML 與 MD 都要對。
+    def _m(mid, model, cr):
+        return {"id": mid, "model": model,
+                "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                          "cache_read_input_tokens": cr, "output_tokens": 5}}
+    acc = v._new_turn_usage()
+    v._acc_turn_usage(acc, _m("m1", "claude-opus-4-8", 100_000))             # 1M 視窗、非 ctx_max
+    v._acc_turn_usage(acc, _m("m2", "claude-haiku-4-5-20251001", 190_000))   # 200k 視窗、ctx_max 來自這步
+    assert acc["ctx_max"] == 190_000 and acc["ctx_win"] == 200_000, \
+        f"ctx_win 應跟著 ctx_max 那一步走：{acc['ctx_max']}/{acc['ctx_win']}"
+    gw = {"role": "assistant", "n_steps": 2, "blocks": [], "u": acc}
+    assert "(95%)" in v.render_turn_meters(gw), f"回合佔比應為 95%：{v.render_turn_meters(gw)[:200]}"
+    assert "（95%）" in v.turn_meters_md(gw), f"MD 版同樣要 95%：{v.turn_meters_md(gw)}"
+    # 反向：ctx_max 來自大視窗那步時，不得被後來的小視窗汙染
+    acc2 = v._new_turn_usage()
+    v._acc_turn_usage(acc2, _m("n1", "claude-opus-4-8", 400_000))
+    v._acc_turn_usage(acc2, _m("n2", "claude-haiku-4-5-20251001", 50_000))
+    assert acc2["ctx_win"] == 1_000_000 and "(40%)" in v.render_turn_meters(
+        {"role": "assistant", "n_steps": 2, "blocks": [], "u": acc2}), "反向情境不得誤用小視窗"
+
+    # (X3 M1) 「距上一步／effort」原本只掛在逐步分隔列上，而單步回合刻意不畫那一列
+    #         → 單次呼叫的回合（多數）這兩欄完全看不到；MD 更是完全不畫逐步列、單步多步都沒有。
+    su_x3 = {"win": 1_000_000, "cache_read": 900, "total_in": 1000, "input": 0, "cache_create": 100,
+             "output": 5, "miss": "", "miss_tok": 0, "miss_usd": None, "miss_usd_partial": False,
+             "model": "claude-opus-4-8", "effort": "max"}
+    tu_x3 = {"input": 0, "cache_create": 100, "cache_read": 900, "output": 5, "ctx_max": 1000,
+             "ctx_win": 1_000_000, "cost": 0.0, "unpriced": False, "miss": [], "miss_tok": 0,
+             "miss_usd": 0.0, "miss_cold": 0, "miss_usd_partial": False}
+    g_solo = {"role": "assistant", "n_steps": 1, "anchor": "", "u": tu_x3,
+              "blocks": [{"type": "_step", "idx": 1, "u": su_x3, "gap": 600},
+                         {"type": "text", "text": "hi"}]}
+    h_solo = v.render_turn_html(g_solo, {}, set())
+    assert "距上一步" in h_solo and "effort" in h_solo, f"單步回合也要看得到 gap/effort：{h_solo[:300]}"
+    assert "距上一步" in v.turn_meters_md(g_solo) and "effort" in v.turn_meters_md(g_solo), \
+        f"MD 版同樣要有：{v.turn_meters_md(g_solo)}"
+    # 多步回合走逐步列，回合列不得再補一份（否則同一資訊出現兩次）
+    h_multi = v.render_turn_html(dict(g_solo, n_steps=2), {}, set())
+    assert h_multi.count("距上一步") == 1, f"多步回合不得重複顯示：出現 {h_multi.count('距上一步')} 次"
+
+    # (X3 M2) turn_duration 若在「還沒有開著的 assistant 回合」時抵達（緊接可見 user、同一次呼叫的
+    #         內容後到），原本直接丟掉 → 那則的 ⏱ 永遠消失。改成按 message.id 暫存再掛回。
+    from datetime import datetime, timezone
+
+    def _ev(role, mid, blocks, ms=None):
+        e = {"type": role, "_dt": datetime(2026, 7, 26, tzinfo=timezone.utc),
+             "message": {"id": mid, "model": "claude-opus-4-8", "content": blocks,
+                         "usage": {"input_tokens": 1, "cache_creation_input_tokens": 0,
+                                   "cache_read_input_tokens": 0, "output_tokens": 1}}}
+        if ms:
+            e["_turn_ms"] = ms
+        return e
+    turns_x3 = v.group_turns([_ev("user", "u1", [{"type": "text", "text": "q"}]),
+                              _ev("assistant", "a1", [], ms=223000),      # 無內容＋耗時，cur 還是 user
+                              _ev("assistant", "a1", [{"type": "text", "text": "ans"}])])
+    a_x3 = [t for t in turns_x3 if t["role"] == "assistant"]
+    assert a_x3 and a_x3[0].get("dur_ms") == 223000, \
+        f"同一次呼叫的耗時必須掛回來，不得靜默丟失：{[t.get('dur_ms') for t in a_x3]}"
     # (G7) 選「最冷步」也要用精確比值：25.0% 與 24.6% 同 round 成 25 時，要選真正最冷（步2）並標冷。
     g3 = {"n_steps": 2, "blocks": [
         {"type": "_step", "idx": 1, "u": {"cache_read": 2500, "total_in": 10000, "output": 0}},
@@ -1340,6 +1522,290 @@ def test_codex_ai_label(tmp_path=None):
     print("OK: codex ai label test passed")
 
 
+def test_codex_item_completed_user(tmp_path=None):
+    # Codex 0.147 互動模式（codex-tui）不再發 event_msg:user_message，改發
+    # item_completed(item.type == "UserMessage")；exec 路徑仍發舊格式。兩種都要收得到
+    # 使用者 prompt 與標題，且某版兩種都發時只能收一次（不得重複呈現）。
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    sess_dir = tmp / "sessions" / "2026" / "06" / "08"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+
+    def line(sec, typ, payload):
+        # sec 會超過 59（各 fixture 各用一段），要進位到分，否則會產生 03:00:60 這種無效時間
+        return json.dumps({"timestamp": f"2026-06-08T03:{sec // 60:02d}:{sec % 60:02d}.000Z",
+                           "type": typ, "payload": payload}, ensure_ascii=False)
+
+    def usermsg_new(sec, text, iid):
+        return line(sec, "event_msg", {"type": "item_completed", "item": {
+            "type": "UserMessage", "id": iid,
+            "content": [{"type": "text", "text": text, "text_elements": []}]}})
+
+    def started(sec):
+        return line(sec, "event_msg", {"type": "task_started", "turn_id": f"turn-{sec}"})
+
+    def tc(sec, inp, cached, out_tok):
+        return line(sec, "event_msg", {"type": "token_count", "info": {
+            "last_token_usage": {"input_tokens": inp, "cached_input_tokens": cached,
+                                 "output_tokens": out_tok, "reasoning_output_tokens": 0,
+                                 "total_tokens": inp + out_tok},
+            "model_context_window": 272000}})
+
+    # A：只有新格式 → prompt 與標題都要出得來
+    sid_a = "019f0004-0000-7000-8000-00000000000a"
+    (sess_dir / f"rollout-2026-06-08T03-00-00-{sid_a}.jsonl").write_text("\n".join([
+        line(0, "session_meta", {"id": sid_a, "cwd": "/x/NewFmt", "cli_version": "0.147.0",
+                                 "originator": "codex-tui"}),
+        line(1, "turn_context", {"cwd": "/x/NewFmt", "model": "gpt-5.6"}),
+        started(2),
+        usermsg_new(3, "新格式問句NEWFMTQ。", "item-1"),
+        # 這種 response_item role=user 是注入的脈絡，不可當成使用者 turn
+        line(4, "response_item", {"type": "message", "role": "user",
+                                  "content": [{"type": "input_text", "text": "注入脈絡INJECTED。"}]}),
+        line(5, "response_item", {"type": "message", "role": "assistant",
+                                  "content": [{"type": "output_text", "text": "新格式回答NEWFMTA。"}]}),
+        # item_completed 的其他 item 型別不得被當成使用者回合，也不得炸掉
+        line(6, "event_msg", {"type": "item_completed",
+                              "item": {"type": "Reasoning", "id": "r-1", "content": []}}),
+        tc(7, 2000, 1800, 10),
+    ]), encoding="utf-8")
+
+    # B：**同一檔前半舊格式、後半新格式**（resume 跨版本升級的真實形狀：rollout 是追加的，
+    #    格式跟著當下執行模式走）。三則 prompt 落在三個不同回合窗 → 三則都必須收到。
+    #    這是「整檔擇一」會靜默吃掉兩則的那個情境。
+    sid_b = "019f0005-0000-7000-8000-00000000000b"
+    (sess_dir / f"rollout-2026-06-08T03-10-00-{sid_b}.jsonl").write_text("\n".join([
+        line(10, "session_meta", {"id": sid_b, "cwd": "/x/Mixed", "cli_version": "0.146.0"}),
+        line(11, "turn_context", {"cwd": "/x/Mixed", "model": "gpt-5.6"}),
+        started(12),
+        line(13, "event_msg", {"type": "user_message", "message": "舊格式問句MIXOLD。"}),
+        line(14, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答一MIXA1。"}]}),
+        started(15),
+        usermsg_new(16, "新格式問句MIXNEW1。", "item-b1"),
+        line(17, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答二MIXA2。"}]}),
+        started(18),
+        usermsg_new(19, "新格式問句MIXNEW2。", "item-b2"),
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答三MIXA3。"}]}),
+    ]), encoding="utf-8")
+
+    # C：同一個回合窗內新舊都發同一段文字（假想版本的真重複）→ 只收一次；
+    #    但同樣一句話在**別的**回合窗重打 → 是真的兩則，不得被判重刪掉。
+    sid_c = "019f0006-0000-7000-8000-00000000000c"
+    (sess_dir / f"rollout-2026-06-08T03-20-00-{sid_c}.jsonl").write_text("\n".join([
+        line(30, "session_meta", {"id": sid_c, "cwd": "/x/Dupe", "cli_version": "0.148.0"}),
+        line(31, "turn_context", {"cwd": "/x/Dupe", "model": "gpt-5.6"}),
+        started(32),
+        line(33, "event_msg", {"type": "user_message", "message": "重複問句DUPEQ。"}),
+        usermsg_new(34, "重複問句DUPEQ。", "item-c1"),
+        line(35, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "好的DUPEA。"}]}),
+        started(36),
+        line(37, "event_msg", {"type": "user_message", "message": "重複問句DUPEQ。"}),
+        line(38, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "再一次DUPEA2。"}]}),
+    ]), encoding="utf-8")
+
+    # D：item.type 改名 ＋ content element type 改名 → 收不到回合，但**必須出聲**（不得靜默）
+    sid_d = "019f0007-0000-7000-8000-00000000000d"
+    (sess_dir / f"rollout-2026-06-08T03-30-00-{sid_d}.jsonl").write_text("\n".join([
+        line(40, "session_meta", {"id": sid_d, "cwd": "/x/Drift", "cli_version": "0.999.0"}),
+        line(41, "turn_context", {"cwd": "/x/Drift", "model": "gpt-5.6"}),
+        started(42),
+        line(43, "event_msg", {"type": "item_completed", "item": {
+            "type": "UserMessageItem", "id": "item-d1",       # 型別改名 → 認不得
+            "content": [{"type": "text", "text": "漂移問句DRIFTQ。"}]}}),
+        line(44, "response_item", {"type": "message", "role": "user",
+                                   "content": [{"type": "input_text", "text": "注入脈絡DRIFTCTX。"}]}),
+        line(45, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "漂移回答DRIFTA。"}]}),
+    ]), encoding="utf-8")
+
+    # E：UserMessage 取不出文字（純圖片 prompt／element type 改名）→ 不得收成空回合，且必須出聲
+    sid_e = "019f0008-0000-7000-8000-00000000000e"
+    (sess_dir / f"rollout-2026-06-08T03-40-00-{sid_e}.jsonl").write_text("\n".join([
+        line(50, "session_meta", {"id": sid_e, "cwd": "/x/Empty", "cli_version": "0.999.0"}),
+        line(51, "turn_context", {"cwd": "/x/Empty", "model": "gpt-5.6"}),
+        started(52),
+        line(53, "event_msg", {"type": "item_completed", "item": {
+            "type": "UserMessage", "id": "item-e1",
+            "content": [{"type": "image", "image_url": "data:image/png;base64,AA"}]}}),
+        started(54),
+        usermsg_new(55, "文字問句EMPTYOK。", "item-e2"),
+        line(56, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答EMPTYA。"}]}),
+    ]), encoding="utf-8")
+
+    # F：同一回合窗內真的重打同一句話（實測本機有 window 含多達 7 則 user 記錄）。
+    #    中間隔著助手回答 → 是兩則真回合，判重不得把它刪成一則。
+    sid_f = "019f0009-0000-7000-8000-00000000000f"
+    (sess_dir / f"rollout-2026-06-08T03-50-00-{sid_f}.jsonl").write_text("\n".join([
+        line(60, "session_meta", {"id": sid_f, "cwd": "/x/Repeat", "cli_version": "0.148.0"}),
+        line(61, "turn_context", {"cwd": "/x/Repeat", "model": "gpt-5.6"}),
+        started(62),
+        line(63, "event_msg", {"type": "user_message", "message": "重打同一句REPEATQ。"}),
+        line(64, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答一REPEATA1。"}]}),
+        usermsg_new(65, "重打同一句REPEATQ。", "item-f1"),   # 同一 window、同文字，但中間有回答
+        line(66, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答二REPEATA2。"}]}),
+    ]), encoding="utf-8")
+
+    # G：item.type 改成通用名 ＋ role="user"（只比對型別名會整個穿過去而無聲）
+    sid_g = "019f000a-0000-7000-8000-00000000000a"
+    (sess_dir / f"rollout-2026-06-08T04-00-00-{sid_g}.jsonl").write_text("\n".join([
+        line(70, "session_meta", {"id": sid_g, "cwd": "/x/Role", "cli_version": "0.999.0"}),
+        line(71, "turn_context", {"cwd": "/x/Role", "model": "gpt-5.6"}),
+        started(72),
+        line(73, "event_msg", {"type": "item_completed", "item": {
+            "type": "Message", "role": "user", "id": "item-g1",
+            "content": [{"type": "text", "text": "通用型別問句ROLEQ。"}]}}),
+        line(74, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答ROLEA。"}]}),
+    ]), encoding="utf-8")
+
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--codex-source", f"demo={tmp / 'sessions'}",
+         "--no-claude", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+
+    pages = {p.name: p.read_text(encoding="utf-8") for p in (out / "sessions").rglob("*.html")}
+    mds = {p.name: p.read_text(encoding="utf-8") for p in (out / "sessions").rglob("*.md")}
+
+    def md_of(sid):
+        return next(v for k, v in mds.items() if sid[:8] in k)
+
+    a = next(v for k, v in pages.items() if sid_a[:8] in k)
+    assert "NEWFMTQ" in a, "新格式的使用者 prompt 應呈現在 session 頁"
+    assert "NEWFMTA" in a, "助手回答應照常呈現"
+    assert "INJECTED" not in a, "response_item role=user 的注入脈絡不可被當成使用者 turn"
+    assert md_of(sid_a).count("### 👤 You") == 1, "新格式應恰好收出一則使用者回合"
+
+    # B：混合檔三則全在（整檔擇一的話會只剩一則）
+    b_md = md_of(sid_b)
+    assert b_md.count("### 👤 You") == 3, \
+        f"混合格式檔應收出 3 則使用者回合，實得 {b_md.count('### 👤 You')}"
+    for mark in ("MIXOLD", "MIXNEW1", "MIXNEW2"):
+        assert mark in b_md, f"混合格式檔遺失 prompt：{mark}"
+
+    # C：同窗重複收一次；跨窗同文是兩則真回合 → 共 2 則
+    c_md = md_of(sid_c)
+    assert c_md.count("### 👤 You") == 2, \
+        f"同窗判重＋跨窗保留應得 2 則使用者回合，實得 {c_md.count('### 👤 You')}"
+
+    # D/E：漂移必須出聲（stderr），不得靜默產出空頁
+    assert "型別像使用者訊息卻不認得" in r.stderr, \
+        f"item.type 漂移應對 stderr 出聲，實得 stderr：{r.stderr}"
+    assert "取不出文字" in r.stderr, f"UserMessage 取不出文字應對 stderr 出聲，實得 stderr：{r.stderr}"
+    e_md = md_of(sid_e)
+    assert e_md.count("### 👤 You") == 1, "取不出文字的那則不得收成空回合（只剩文字那則）"
+
+    # F：同窗重打同一句（中間隔著回答）→ 是兩則真回合，判重不得誤刪
+    f_md = md_of(sid_f)
+    assert f_md.count("### 👤 You") == 2, \
+        f"同一回合窗內隔著回答重打同一句應收出 2 則，實得 {f_md.count('### 👤 You')}"
+
+    # G：通用型別 ＋ role=user → 收不到回合，但必須出聲（只比對型別名會靜默穿過）
+    g_md = md_of(sid_g)
+    assert g_md.count("### 👤 You") == 0, "認不得的型別不應硬收成回合"
+    assert r.stderr.count("型別像使用者訊息卻不認得") >= 2, \
+        f"item.type 改名與 role=user 兩種漂移都要出聲，實得 stderr：{r.stderr}"
+
+    idx = (out / "index.html").read_text(encoding="utf-8")
+    assert "新格式問句NEWFMTQ" in idx, "索引標題應取到新格式的首句，而非 fallback 成 (無對話)"
+    assert f"(無對話) {sid_a[:8]}" not in idx, "有 prompt 的 session 不應被標成 (無對話)"
+    print("OK: codex item_completed user message test passed")
+
+
+def test_account_switch_cause(tmp_path=None):
+    # 自願切帳號（沒撞 limit）：transcript 裡沒有 429/401，只能靠各帳號自己的 history.jsonl 認出。
+    # 這種步在修正前會被歸成 evict（伺服器側異常），實為人因可避免 → 應歸 acct 並進索引的人因浪費。
+    import ai_session_viewer as v
+
+    sid = "019f0100-0000-7000-8000-000000000abc"
+    cfg_a = Path(tmp_path or tempfile.mkdtemp()) / "cfgA"
+    cfg_b = cfg_a.parent / "cfgB"
+    for c in (cfg_a, cfg_b):
+        c.mkdir(parents=True, exist_ok=True)
+    base = 1780000000
+    (cfg_a / "history.jsonl").write_text(json.dumps(
+        {"display": "先問一句", "timestamp": base * 1000, "sessionId": sid}) + "\n", encoding="utf-8")
+    (cfg_b / "history.jsonl").write_text(json.dumps(
+        {"display": "換帳號後再問", "timestamp": (base + 600) * 1000, "sessionId": sid}) + "\n",
+        encoding="utf-8")
+
+    sw = v.load_account_switches([cfg_a, cfg_b])
+    assert sid in sw, f"同一 sessionId 出現在兩個帳號的 history 應判定為切帳號，實得 {sw}"
+    # config 目錄必須獨立列舉：各帳號的 projects/ 常是指向同一實體的 junction，會被來源清單的
+    # realpath 去重收斂成一個，但 history.jsonl 各帳號各一份 —— 跟著收斂就永遠偵測不到切帳號。
+    (cfg_a / "projects").mkdir(exist_ok=True)
+    (cfg_b / "projects").mkdir(exist_ok=True)
+    found = v.claude_config_dirs([cfg_a / "projects", cfg_b / "projects"])
+    assert cfg_a in found and cfg_b in found, \
+        f"兩個帳號的 config 目錄都要列出（不得被 projects/ 的去重收斂掉），實得 {found}"
+
+    # 同一列被複製到另一個 config（手動跨機同步/備份還原）不是換帳號：同 timestamp 出現在
+    # 多個帳號 → 無法歸屬 → 整組排除，不得憑空生出一次 acct 而誣賴使用者。
+    cfg_c = cfg_a.parent / "cfgC"
+    cfg_d = cfg_a.parent / "cfgD"
+    dup = json.dumps({"display": "同一列", "timestamp": base * 1000, "sessionId": "dup-sid"})
+    for c in (cfg_c, cfg_d):
+        c.mkdir(parents=True, exist_ok=True)
+        (c / "history.jsonl").write_text(dup + "\n", encoding="utf-8")
+    assert v.load_account_switches([cfg_c, cfg_d]) == {}, \
+        "完全相同的 history 列出現在兩個帳號＝檔案被複製，不得判成切帳號"
+    # 單帳號時必須什麼都不報（安全退化，公開使用者多半只有一個帳號）
+    assert v.load_account_switches([cfg_a]) == {}, "單一帳號不應偵測出任何切換"
+
+    # 兩步：第二步間隔 10 分（<55 分 TTL）且冷啟 → 無 acct 資料時是 evict、有的話是 acct
+    steps = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
+             [base + 600, 0, 100000, 100000, 0, 100000, 0, 0, 0]]
+    models = ["claude-opus-4-5"]
+    c_no = v.classify_cache_causes(steps, models, [])
+    c_yes = v.classify_cache_causes(steps, models, [[base + 600, "acct"]])
+    assert "evict" in c_no.values(), f"沒有切帳號資料時應判 evict，實得 {c_no}"
+    assert "acct" in c_yes.values(), f"有切帳號資料時應判 acct，實得 {c_yes}"
+    assert "evict" not in c_yes.values(), "acct 應取代該步的 evict，不得兩者並存"
+
+    # acct 只搶 evict 那一格：間隔超過 TTL 時快取本來就會死 → 仍是 expiry
+    far = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
+           [base + 4000, 0, 100000, 100000, 0, 100000, 0, 0, 0]]
+    c_far = v.classify_cache_causes(far, models, [[base + 4000, "acct"]])
+    assert "expiry" in c_far.values(), f"間隔超過 TTL 應維持 expiry，實得 {c_far}"
+
+    # 索引的人因浪費：只認 expiry/acct，不含 evict（evict 是伺服器側異常，不該算在人頭上）
+    class _S:
+        pass
+    s = _S()
+    s.cache_steps, s.cache_models, s.cache_events = steps, models, [[base + 600, "acct"]]
+    n, usd, _p = v.session_waste(s)
+    assert n == 1 and usd > 0, f"切帳號那步應計入人因浪費，實得 n={n} usd={usd}"
+    s.cache_events = []
+    n_ev, _u, _p = v.session_waste(s)
+    assert n_ev == 0, f"evict 不得算進人因浪費，實得 {n_ev}"
+
+    # 索引呈現：紅徽章、浪費欄、篩選勾選框、data-waste 標記
+    row = {"session_id": sid, "source_kind": "claude-code", "account": "a", "proj": "P",
+           "proj_munged": "P", "cwd": "/x/P", "title": "切帳號那場", "rename": "", "ai_title": "",
+           "kind": "chat", "models": ["opus"], "cost": 1.0, "cost_partial": False,
+           "out_html": "x.html", "date_str": "2026-08-01 10:00", "month": "2026-08",
+           "dur": "10分", "branch": "main", "n_user": 2, "n_assistant": 2, "n_tools": 0,
+           "waste_n": n, "waste_usd": usd, "waste_partial": False}
+    html = v.render_index_html([row])
+    assert 'class="chip waste"' in html, "有人因浪費的 session 應有紅徽章"
+    assert f"🔥 ×{n}" in html, "徽章應標出次數"
+    assert 'data-waste="1"' in html, "row 應帶 data-waste 供篩選"
+    assert 'id="fw"' in html, "應有『只看有人因浪費的』勾選框"
+    assert "浪費</th>" in html, "應有浪費欄位表頭"
+    # 沒有任何浪費時不該擺一個永遠篩不出東西的勾選框
+    row0 = dict(row, waste_n=0, waste_usd=0.0)
+    assert 'id="fw"' not in v.render_index_html([row0]), "全無浪費時不應出現篩選勾選框"
+    print("OK: account switch cause test passed")
+
+
 if __name__ == "__main__":
     test_smoke()
     test_search()
@@ -1357,3 +1823,5 @@ if __name__ == "__main__":
     test_api_miss_reason()
     test_ctx_window_and_coldest()
     test_codex_ai_label()
+    test_codex_item_completed_user()
+    test_account_switch_cause()

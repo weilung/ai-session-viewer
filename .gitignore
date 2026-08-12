@@ -14,3 +14,6 @@ Thumbs.db
 
 # AI 工具本機狀態
 .claude/
+
+# 跨模型 review 的暫存工作區（reviewer 唯一可寫的地方；fresh gate 前一律清空）
+.review-tmp/

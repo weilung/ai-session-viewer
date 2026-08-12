@@ -1665,6 +1665,18 @@ def test_codex_item_completed_user(tmp_path=None):
                                    "content": [{"type": "output_text", "text": "答ROLEA。"}]}),
     ]), encoding="utf-8")
 
+    # H：**反序**的雙表示（新格式先、舊格式後）。判重必須對稱，否則上游換個順序發就會收兩次。
+    sid_h = "019f000b-0000-7000-8000-00000000000b"
+    (sess_dir / f"rollout-2026-06-08T04-10-00-{sid_h}.jsonl").write_text("\n".join([
+        line(80, "session_meta", {"id": sid_h, "cwd": "/x/Rev", "cli_version": "0.148.0"}),
+        line(81, "turn_context", {"cwd": "/x/Rev", "model": "gpt-5.6"}),
+        started(82),
+        usermsg_new(83, "反序雙表示REVQ。", "item-h1"),
+        line(84, "event_msg", {"type": "user_message", "message": "反序雙表示REVQ。"}),
+        line(85, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答REVA。"}]}),
+    ]), encoding="utf-8")
+
     out = tmp / "out"
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "--codex-source", f"demo={tmp / 'sessions'}",
@@ -1707,6 +1719,12 @@ def test_codex_item_completed_user(tmp_path=None):
     f_md = md_of(sid_f)
     assert f_md.count("### 👤 You") == 2, \
         f"同一回合窗內隔著回答重打同一句應收出 2 則，實得 {f_md.count('### 👤 You')}"
+
+    # H：反序雙表示只能收一次（判重要對稱）
+    h_md = md_of(sid_h)
+    assert h_md.count("### 👤 You") == 1, \
+        f"新格式先、舊格式後的同一則應只收一次，實得 {h_md.count('### 👤 You')}"
+    assert "REVQ" in h_md, "反序判重後 prompt 內容仍應呈現"
 
     # G：通用型別 ＋ role=user → 收不到回合，但必須出聲（只比對型別名會靜默穿過）
     g_md = md_of(sid_g)
@@ -1786,6 +1804,28 @@ def test_account_switch_cause(tmp_path=None):
     s.cache_events = []
     n_ev, _u, _p = v.session_waste(s)
     assert n_ev == 0, f"evict 不得算進人因浪費，實得 {n_ev}"
+
+    # acct 在**統計**上必須與 limit/auth 同等對待：快取按組織隔離、被整段丟掉，不是「沒撐過
+    # TTL」。留在 TTL 風險集裡會被算成一次「提早失效」——正是本功能要消滅的污染換個地方發生。
+    def _row(ev):
+        return {"cache_steps": steps, "cache_models": models, "cache_events": ev,
+                "source_kind": "claude-code", "kind": "chat", "account": "a",
+                "start_ts": float(base)}
+    d_acct = v.build_cache_report([_row([[base + 600, "acct"]])])
+    d_limit = v.build_cache_report([_row([[base + 600, "limit"]])])
+    d_none = v.build_cache_report([_row([])])
+    assert d_acct["kpi"]["comply_n"] == 0, \
+        f"acct 應排除在 TTL 帶內樣本外（同 limit），實得 comply_n={d_acct['kpi']['comply_n']}"
+    assert d_limit["kpi"]["comply_n"] == 0, "limit 本來就該排除（對照組）"
+    assert d_none["kpi"]["comply_n"] == 1, \
+        "沒有帳號邊界的 evict 仍要留在風險集裡，否則是排除過頭"
+    assert d_acct["causes_total"]["acct"] == 1, "排除統計不得影響成因計數"
+
+    # 切帳號資料來自 repo 外的 history.jsonl：transcript 沒變也可能改變歸因 → 必須進指紋，
+    # 否則增量建置會沿用舊 row，把 acct 歸因與「浪費」欄靜默停在舊值。
+    probe = Path(v.__file__)
+    assert v.session_signature(probe) != v.session_signature(probe, [base + 600]), \
+        "切帳號時刻必須影響 session 指紋（否則增量建置不會重算歸因）"
 
     # 索引呈現：紅徽章、浪費欄、篩選勾選框、data-waste 標記
     row = {"session_id": sid, "source_kind": "claude-code", "account": "a", "proj": "P",

@@ -47,7 +47,7 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 37  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 38  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -931,7 +931,14 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             user_text = None
             if ptype == "user_message":
                 user_text = str(payload.get("message") or "")
-                pending_legacy = (user_text, i)
+                if pending_legacy is not None and pending_legacy[0] == user_text:
+                    # 反序的同一則（新格式先、舊格式後）。判重必須對稱：只認 legacy→new 的話，
+                    # 上游若換個順序發就會同一則收兩次，而且一樣沒有任何跡象。
+                    user_text = None
+                    n_dedup_suppressed += 1
+                    pending_legacy = None
+                else:
+                    pending_legacy = (user_text, i)
             elif ptype == "item_completed":
                 item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
                 itype = str(item.get("type") or "")
@@ -947,6 +954,8 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                         # 等於把漏收藏得更深。記成異常、由收尾哨兵出聲。
                         user_text = None
                         n_empty_user_items += 1
+                    else:
+                        pending_legacy = (user_text, i)   # 供反序判重（新格式先、舊格式後）
                 elif "user" in itype.lower() or str(item.get("role") or "").lower() == "user":
                     # 看得出是使用者訊息、卻不是我們認得的那個型別 → 上游可能又改名了
                     # （0.147 就是這樣整段消失的）。**型別名與 role 都要看**：若上游改成通用的
@@ -1891,7 +1900,9 @@ def classify_cache_causes(raw, models, events):
         # 兩者都要重置快取 lineage：前綴被改掉（或跨過結構性邊界）之後，邊界前那次寫入的 TTL 對後續步
         # 已不適用——不重置的話，下一個冷啟會被算進舊 cohort、標成「1h 內卻冷啟」的假 evict。
         # 重建交給迴圈頂端：下一輪 prev 就是本步，它若真有寫入自然會把 lineage 立回來。
-        if api_cause or boundary:
+        # acct 也要重置：自願切帳號同樣是全新前綴，邊界前那次寫入的 TTL 對後續步不再適用
+        # （與 build_cache_report 的排除條件同一組，兩邊必須同進同出）。
+        if api_cause or boundary or "acct" in kinds:
             last_write = None
     return causes
 
@@ -3411,10 +3422,14 @@ def build_cache_report(rows, stratify=True):
                 # 不重置會讓下一個冷啟沿用舊 cohort、被判成假的「1h 提早失效」——正是本工具要消滅的東西。
                 last_write = None             # 與 classify_cache_causes 一致
                 continue
-            if boundary:
+            if boundary or "acct" in kinds:
                 # 結構性成因：不進 TTL 存活／帶內統計（競爭風險）。並重置快取 lineage——
                 # 切帳號/換模型/壓縮後是全新前綴，邊界前的寫入 TTL 不再適用；
                 # 新 lineage 的 TTL 由邊界後第一個有寫入的步重新建立（其前皆視為 unknown）。
+                # ⚠ `acct`（自願切帳號）在**成因**上刻意只搶 evict 那一格（見上方判定），但在
+                # **統計**上它與 limit/auth 切帳號是同一件事：快取按組織隔離、被整段丟掉，不是
+                # 「沒撐過 TTL」。不在這裡一起排除的話，它會留在 comply_n／evict_form／UTC 尖峰
+                # 樣本裡被當成一次「提早失效」——正是本工具要消滅的那種污染，只是換個地方發生。
                 last_write = None
                 continue
             cb = cohort_bins[cohort][_gap_bucket_index(gap)]
@@ -4914,9 +4929,14 @@ def iter_codex_session_files(source: Path):
         yield sf
 
 
-def session_signature(main_path: Path) -> str:
+def session_signature(main_path: Path, acct_marks=()) -> str:
     """主檔 + 外部子代理檔 + 同專案 memory/ 的 (檔名, mtime, size) 組合，作為變動指紋。
-    把 memory 納入：memory 新增/變動/移除時，session 會重建（頁頂 🧠 連結與 row 的 mem_href 才會更新）。"""
+    把 memory 納入：memory 新增/變動/移除時，session 會重建（頁頂 🧠 連結與 row 的 mem_href 才會更新）。
+
+    `acct_marks` 是這場 session 的切帳號時刻（load_account_switches 的結果）。**必須進指紋**：
+    那份資料來自 repo 外的 history.jsonl，transcript 完全沒變也可能改變歸因結果（新增一個帳號、
+    還原備份都會）。不納入的話，增量建置會沿用舊 row，把 acct 歸因與「浪費」欄靜默停在舊值——
+    使用者看到的是過期的結論而且沒有任何跡象。空值與非空值會產生不同字串，所以增減兩個方向都會觸發重建。"""
     paths = [main_path]
     side = main_path.with_suffix("")
     if side.is_dir():
@@ -4932,6 +4952,8 @@ def session_signature(main_path: Path) -> str:
             parts.append(f"{tag}{p.name}:{st.st_mtime_ns}:{st.st_size}")
         except OSError:
             pass
+    if acct_marks:
+        parts.append("acct:" + ",".join(str(int(t)) for t in acct_marks))
     return "|".join(parts)
 
 
@@ -5587,7 +5609,8 @@ def main():
     n_build = n_reuse = n_empty = 0
     for source_kind, acc_name, proj_name, sf in files:
         key = manifest_key(source_kind, sf)
-        sig = session_signature(sf)
+        # Claude 的 transcript 檔名就是 sessionId，切帳號資料據此對應（Codex 無此資料）
+        sig = session_signature(sf, acct_switches.get(sf.stem, ()))
         cached = manifest.get(key) or {}
         row = cached.get("row")
         if source_kind == SOURCE_CODEX and args.project and row and not row_matches_project(row, args.project):

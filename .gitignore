@@ -17,3 +17,6 @@ Thumbs.db
 
 # 跨模型 review 的暫存工作區（reviewer 唯一可寫的地方；fresh gate 前一律清空）
 .review-tmp/
+
+# 待人工確認後才套用的草稿，不提交
+*.pending

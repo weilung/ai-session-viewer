@@ -914,6 +914,35 @@ def test_cold_cause_badges(tmp_path=None):
         ".meter.coldx": "應有中性冷啟樣式",
     }.items():
         assert needle in html, f"{msg}（找不到 {needle!r}）"
+
+    # 成因 join 必須以 message.id 對應，不可用「同秒第幾次」的序號：兩端母體不同——
+    # 生產端（classify_cache_causes）只數得出 usage 的呼叫，消費端走的是**所有** `_step`，
+    # 而沒有 usage 的呼叫照樣會產生 `_step`。同一秒裡夾一個沒有 usage 的步，序號就整批錯位，
+    # 成因掛到錯的步驟上，而徽章看起來一切正常。
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+    osid = "00000000-0000-4000-8000-0000000000c2"
+    oproj = tmp / "projects" / "ord-proj"
+    oproj.mkdir(parents=True, exist_ok=True)
+    same_sec = "2026-06-10T01:10:05.000Z"
+    nousage = {"type": "assistant", "uuid": "ax", "timestamp": same_sec, "sessionId": osid,
+               "isSidechain": False,
+               "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "m_x",
+                           "content": [{"type": "text", "text": "無 usage 但看得見的一步"}]}}
+    oev = [ev[0] | {"sessionId": osid}, a("2026-06-10T01:00:05.000Z", "m_o1", 2000, 2000, 0, 2000),
+           ev[2] | {"sessionId": osid}, nousage,
+           a(same_sec, "m_o2", 3000, 0, 100, 0)]      # 與 nousage 同秒的真冷啟
+    opath = oproj / f"{osid}.jsonl"
+    opath.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in oev), encoding="utf-8")
+    os_ = v.load_session(opath, "ord-proj")
+    v.analyze(os_)
+    by_mid = {b.get("mid"): b.get("cause")
+              for g in os_.main_groups for b in g.get("blocks", []) if b.get("type") == "_step"}
+    assert by_mid.get("m_o2") == "evict", \
+        f"真冷啟那步應拿到自己的成因，實得 {by_mid}"
+    assert not by_mid.get("m_x"), \
+        f"沒有 usage、不在 cache_steps 裡的步不得被掛上別人的成因，實得 {by_mid}"
     print("OK: cold cause badges test passed")
 
 
@@ -1590,8 +1619,9 @@ def test_codex_item_completed_user(tmp_path=None):
                                    "content": [{"type": "output_text", "text": "答三MIXA3。"}]}),
     ]), encoding="utf-8")
 
-    # C：同一個回合窗內新舊都發同一段文字（假想版本的真重複）→ 只收一次；
-    #    但同樣一句話在**別的**回合窗重打 → 是真的兩則，不得被判重刪掉。
+    # C：同一個回合窗內新舊格式發出同一段文字。**兩則都要留**——這個形狀有兩種可能來源
+    #    （同一則的雙表示／使用者連送兩次剛好被記成不同格式），兩種格式都沒有可互相關聯的
+    #    身分欄位，分不出來；歧義下刪資料就是靜默丟掉一則真實發問。只出聲，不刪。
     sid_c = "019f0006-0000-7000-8000-00000000000c"
     (sess_dir / f"rollout-2026-06-08T03-20-00-{sid_c}.jsonl").write_text("\n".join([
         line(30, "session_meta", {"id": sid_c, "cwd": "/x/Dupe", "cli_version": "0.148.0"}),
@@ -1665,7 +1695,8 @@ def test_codex_item_completed_user(tmp_path=None):
                                    "content": [{"type": "output_text", "text": "答ROLEA。"}]}),
     ]), encoding="utf-8")
 
-    # H：**反序**的雙表示（新格式先、舊格式後）。判重必須對稱，否則上游換個順序發就會收兩次。
+    # H：**反序**（新格式先、舊格式後）。與 C 同一條規則、順序相反：形狀對稱，處置也必須對稱
+    #    ——兩則都留、一樣出聲。少了這格，同一種歧義會因為順序不同而得到兩種處置。
     sid_h = "019f000b-0000-7000-8000-00000000000b"
     (sess_dir / f"rollout-2026-06-08T04-10-00-{sid_h}.jsonl").write_text("\n".join([
         line(80, "session_meta", {"id": sid_h, "cwd": "/x/Rev", "cli_version": "0.148.0"}),
@@ -1675,6 +1706,82 @@ def test_codex_item_completed_user(tmp_path=None):
         line(84, "event_msg", {"type": "user_message", "message": "反序雙表示REVQ。"}),
         line(85, "response_item", {"type": "message", "role": "assistant",
                                    "content": [{"type": "output_text", "text": "答REVA。"}]}),
+    ]), encoding="utf-8")
+
+    # I：**同格式**連續同文、中間沒有任何內容事件（佇列一次送出兩句一樣的話，實測 window 內
+    #    最多有 7 則 user 記錄）。判重只准認「跨格式」的雙表示——同格式連續同文是真的重打兩次，
+    #    誤刪就是靜默丟掉一則真實發問。新格式 ×2 與舊格式 ×2 兩邊都要守住。
+    sid_i = "019f000c-0000-7000-8000-00000000000c"
+    (sess_dir / f"rollout-2026-06-08T04-20-00-{sid_i}.jsonl").write_text("\n".join([
+        line(90, "session_meta", {"id": sid_i, "cwd": "/x/Queue", "cli_version": "0.148.0"}),
+        line(91, "turn_context", {"cwd": "/x/Queue", "model": "gpt-5.6"}),
+        started(92),
+        usermsg_new(93, "排隊重送QUEUEQ。", "item-i1"),
+        usermsg_new(94, "排隊重送QUEUEQ。", "item-i2"),      # 同格式、緊鄰、同文 → 兩則都要留
+        line(95, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答QUEUEA。"}]}),
+        started(96),
+        line(97, "event_msg", {"type": "user_message", "message": "排隊重送OLDQ。"}),
+        line(98, "event_msg", {"type": "user_message", "message": "排隊重送OLDQ。"}),   # 舊格式同理
+        line(99, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "答OLDA。"}]}),
+    ]), encoding="utf-8")
+
+    # J：漂移到 **event_msg 這一層**（payload.type 本身換名，不再是 user_message／item_completed）。
+    #    item 層的哨兵接不到這種，漏掉就又是「整場 prompt 一則不剩卻毫無聲音」。
+    sid_j = "019f000d-0000-7000-8000-00000000000d"
+    (sess_dir / f"rollout-2026-06-08T04-30-00-{sid_j}.jsonl").write_text("\n".join([
+        line(100, "session_meta", {"id": sid_j, "cwd": "/x/EvtDrift", "cli_version": "0.999.0"}),
+        line(101, "turn_context", {"cwd": "/x/EvtDrift", "model": "gpt-5.6"}),
+        started(102),
+        line(103, "event_msg", {"type": "user_prompt", "message": "事件層漂移LOSTQ。"}),
+        line(104, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答EVTDRIFTA。"}]}),
+        started(105),
+        # role=user 的未知型別（型別名不帶 user）同樣要被接住
+        line(106, "event_msg", {"type": "turn_input", "role": "user", "message": "角色欄漂移ROLELOST。"}),
+        line(107, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答EVTDRIFTB。"}]}),
+    ]), encoding="utf-8")
+
+    # K：`user_message` 的**型別還在**，但承載文字的欄位換了位置（message → content）。
+    #    型別白名單擋不住這種：它進得了已知分支、卻取不出文字。沒有哨兵就整則靜默消失，
+    #    而頁面看起來完整——與 0.147 那次同一種失效樣態，只是漂移點更深一層。
+    sid_k = "019f000e-0000-7000-8000-00000000000e"
+    (sess_dir / f"rollout-2026-06-08T04-40-00-{sid_k}.jsonl").write_text("\n".join([
+        line(110, "session_meta", {"id": sid_k, "cwd": "/x/FieldMove", "cli_version": "0.999.0"}),
+        line(111, "turn_context", {"cwd": "/x/FieldMove", "model": "gpt-5.6"}),
+        started(112),
+        line(113, "event_msg", {"type": "user_message", "content": "欄位搬家FIELDMOVEQ。"}),
+        line(114, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答FIELDMOVEA。"}]}),
+    ]), encoding="utf-8")
+
+    # L：`item_completed` 的型別還在，但 role/content 從 `item` 那一層**整組搬到 payload 這一層**。
+    #    item 層取不到型別也取不到 role → item 層哨兵接不到；payload.type 又是已知的
+    #    item_completed → event 層哨兵也進不去。哨兵必須**逐層**都有，否則中間這一層是個洞。
+    sid_l = "019f000f-0000-7000-8000-00000000000f"
+    (sess_dir / f"rollout-2026-06-08T04-50-00-{sid_l}.jsonl").write_text("\n".join([
+        line(120, "session_meta", {"id": sid_l, "cwd": "/x/LayerMove", "cli_version": "0.999.0"}),
+        line(121, "turn_context", {"cwd": "/x/LayerMove", "model": "gpt-5.6"}),
+        started(122),
+        line(123, "event_msg", {"type": "item_completed", "role": "user",
+                                "content": [{"type": "text", "text": "層級搬家LAYERMOVEQ。"}]}),
+        line(124, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答LAYERMOVEA。"}]}),
+    ]), encoding="utf-8")
+
+    # M：**最外層**的型別漂移——事件外殼從 `event_msg` 換成別的名字，payload 仍明確是使用者發言。
+    #    內兩層的哨兵都掛在 `event_msg` 那一支底下，根本進不來。哨兵要蓋滿每一層，
+    #    少一層就是一個洞，而每個洞的症狀都一樣：頁面看起來完整、prompt 一則不剩。
+    sid_m = "019f0010-0000-7000-8000-000000000010"
+    (sess_dir / f"rollout-2026-06-08T05-00-00-{sid_m}.jsonl").write_text("\n".join([
+        line(130, "session_meta", {"id": sid_m, "cwd": "/x/OuterDrift", "cli_version": "0.999.0"}),
+        line(131, "turn_context", {"cwd": "/x/OuterDrift", "model": "gpt-5.6"}),
+        started(132),
+        line(133, "user_event", {"type": "user_message", "message": "外殼漂移OUTERQ。"}),
+        line(134, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答OUTERA。"}]}),
     ]), encoding="utf-8")
 
     out = tmp / "out"
@@ -1703,10 +1810,12 @@ def test_codex_item_completed_user(tmp_path=None):
     for mark in ("MIXOLD", "MIXNEW1", "MIXNEW2"):
         assert mark in b_md, f"混合格式檔遺失 prompt：{mark}"
 
-    # C：同窗重複收一次；跨窗同文是兩則真回合 → 共 2 則
+    # C：跨格式緊鄰同文兩則都留（歧義不刪）＋跨窗同文兩則真回合 → 共 3 則
     c_md = md_of(sid_c)
-    assert c_md.count("### 👤 You") == 2, \
-        f"同窗判重＋跨窗保留應得 2 則使用者回合，實得 {c_md.count('### 👤 You')}"
+    assert c_md.count("### 👤 You") == 3, \
+        f"跨格式緊鄰同文應全部保留，共 3 則使用者回合，實得 {c_md.count('### 👤 You')}"
+    assert "緊鄰的跨格式同文" in r.stderr, \
+        f"跨格式緊鄰同文應對 stderr 出聲（保留但要讓人看得見），實得 stderr：{r.stderr}"
 
     # D/E：漂移必須出聲（stderr），不得靜默產出空頁
     assert "型別像使用者訊息卻不認得" in r.stderr, \
@@ -1720,17 +1829,52 @@ def test_codex_item_completed_user(tmp_path=None):
     assert f_md.count("### 👤 You") == 2, \
         f"同一回合窗內隔著回答重打同一句應收出 2 則，實得 {f_md.count('### 👤 You')}"
 
-    # H：反序雙表示只能收一次（判重要對稱）
+    # H：反序也一樣兩則都留（處置必須與 C 對稱）
     h_md = md_of(sid_h)
-    assert h_md.count("### 👤 You") == 1, \
-        f"新格式先、舊格式後的同一則應只收一次，實得 {h_md.count('### 👤 You')}"
-    assert "REVQ" in h_md, "反序判重後 prompt 內容仍應呈現"
+    assert h_md.count("### 👤 You") == 2, \
+        f"新格式先、舊格式後的緊鄰同文應兩則都留，實得 {h_md.count('### 👤 You')}"
+    assert "REVQ" in h_md, "prompt 內容仍應呈現"
 
     # G：通用型別 ＋ role=user → 收不到回合，但必須出聲（只比對型別名會靜默穿過）
     g_md = md_of(sid_g)
     assert g_md.count("### 👤 You") == 0, "認不得的型別不應硬收成回合"
     assert r.stderr.count("型別像使用者訊息卻不認得") >= 2, \
         f"item.type 改名與 role=user 兩種漂移都要出聲，實得 stderr：{r.stderr}"
+
+    # I：同格式緊鄰同文＝真的重打（佇列送兩次），判重只准認跨格式的雙表示 → 4 則全留
+    i_md = md_of(sid_i)
+    assert i_md.count("### 👤 You") == 4, \
+        f"同格式連續同文（新×2＋舊×2）應全部保留共 4 則，實得 {i_md.count('### 👤 You')}"
+    # 一則都沒被判重才算真的守住——判重計數器出聲就代表又把真實發問吃掉了
+    assert "QUEUEQ" in i_md and "OLDQ" in i_md, "同格式重送的兩句都應呈現"
+
+    # J：event_msg 這一層的漂移（payload.type 換名／改帶 role=user）必須出聲，不得靜默丟光
+    j_md = md_of(sid_j)
+    assert j_md.count("### 👤 You") == 0, "認不得的事件型別不應硬收成回合"
+    assert r.stderr.count("型別像使用者發言卻不認得") >= 1, \
+        f"event_msg 層漂移應對 stderr 出聲，實得 stderr：{r.stderr}"
+    assert "LOSTQ" not in j_md and "ROLELOST" not in j_md, "沒收下的內容不應憑空出現"
+
+    # K：型別還在、文字欄位搬家 → 收不到回合，但必須出聲（否則整則靜默消失）
+    k_md = md_of(sid_k)
+    assert k_md.count("### 👤 You") == 0, "取不出文字的那則不得硬收成空回合"
+    assert "FIELDMOVEQ" not in k_md, "沒收下的內容不應憑空出現"
+    assert r.stderr.count("取不出文字") >= 2, \
+        f"user_message 與 UserMessage 兩種欄位漂移都要出聲，實得 stderr：{r.stderr}"
+
+    # L：item 那一層整組搬到 payload 層 → 收不到回合，但哨兵必須接住
+    l_md = md_of(sid_l)
+    assert l_md.count("### 👤 You") == 0, "認不得的形狀不應硬收成回合"
+    assert "LAYERMOVEQ" not in l_md, "沒收下的內容不應憑空出現"
+    assert r.stderr.count("型別像使用者訊息卻不認得") >= 3, \
+        f"item 層改名、role=user、以及欄位搬到 payload 層三種都要出聲，實得 stderr：{r.stderr}"
+
+    # M：最外層事件型別漂移 → 收不到回合，但哨兵必須接住（內兩層都進不來）
+    m_md = md_of(sid_m)
+    assert m_md.count("### 👤 You") == 0, "認不得的外層形狀不應硬收成回合"
+    assert "OUTERQ" not in m_md, "沒收下的內容不應憑空出現"
+    assert "最外層型別不認得" in r.stderr, \
+        f"最外層事件型別漂移應對 stderr 出聲，實得 stderr：{r.stderr}"
 
     idx = (out / "index.html").read_text(encoding="utf-8")
     assert "新格式問句NEWFMTQ" in idx, "索引標題應取到新格式的首句，而非 fallback 成 (無對話)"
@@ -1820,6 +1964,93 @@ def test_account_switch_cause(tmp_path=None):
     assert d_none["kpi"]["comply_n"] == 1, \
         "沒有帳號邊界的 evict 仍要留在風險集裡，否則是排除過頭"
     assert d_acct["causes_total"]["acct"] == 1, "排除統計不得影響成因計數"
+
+    # acct 也要勝過 **<2 分的 intra**：帳號邊界是 history.jsonl 記下的直接證據，intra 是由間隔
+    # 推論出來的；快取此時本來還活著，冷啟的原因就是換了組織。少了這一格，切完帳號兩分鐘內
+    # 接著做事的那筆人因浪費會在索引與報告上「一致地」消失——兩邊數字仍然相等，但一致地錯。
+    near = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
+            [base + 60, 0, 100000, 100000, 0, 100000, 0, 0, 0]]
+    assert "intra" in v.classify_cache_causes(near, models, []).values(), \
+        "沒有帳號資料時 <2 分冷啟仍該是 intra（對照組）"
+    c_near = v.classify_cache_causes(near, models, [[base + 60, "acct"]])
+    assert "acct" in c_near.values(), f"<2 分內的帳號邊界應判 acct，實得 {c_near}"
+    assert "intra" not in c_near.values(), "直接證據應取代推論，不得兩者並存"
+    d_near = v.build_cache_report([dict(_row([[base + 60, "acct"]]), cache_steps=near)])
+    assert d_near["causes_total"]["acct"] == 1 and d_near["causes_total"]["intra"] == 0, \
+        f"報告端必須與 classify 同規則，實得 {dict(d_near['causes_total'])}"
+    s.cache_steps, s.cache_events = near, [[base + 60, "acct"]]
+    n_near, usd_near, _p = v.session_waste(s)
+    assert n_near == 1 and usd_near > 0, f"<2 分內的切帳號應計入索引的人因浪費，實得 n={n_near}"
+    assert n_near == d_near["kpi"]["avoid_n"], \
+        f"索引與報告的人因次數必須同口徑，實得 {n_near} vs {d_near['kpi']['avoid_n']}"
+    s.cache_steps, s.cache_events = steps, [[base + 600, "acct"]]   # 還原給後面的索引呈現測試
+
+    # history.jsonl 的健康狀態：回空 dict 有三種完全不同的意思，不可混為一談。
+    # ① 數字被序列化成**字串**時仍要收得到（只認 int/float 的話整份 history 靜默歸零，
+    #    而呼叫端看到的是「這台沒切過帳號」）。
+    cfg_s1 = cfg_a.parent / "cfgS1"
+    cfg_s2 = cfg_a.parent / "cfgS2"
+    for c, t in ((cfg_s1, base), (cfg_s2, base + 600)):
+        c.mkdir(parents=True, exist_ok=True)
+        (c / "history.jsonl").write_text(json.dumps(
+            {"display": "字串時間", "timestamp": str(t * 1000), "sessionId": "str-sid"}) + "\n",
+            encoding="utf-8")
+    assert "str-sid" in v.load_account_switches([cfg_s1, cfg_s2]), \
+        "timestamp 寫成數字字串時仍須認得，否則整份 history 靜默歸零"
+    # ② 帳號身分是**實體路徑**、不是目錄名：不同位置的 config 很容易同名（都叫 .claude），
+    #    用目錄名當身分會把兩個帳號併成一個，它們之間的切換就永遠偵測不到。
+    same_name = cfg_a.parent / "boxX" / ".claude", cfg_a.parent / "boxY" / ".claude"
+    for c, t in zip(same_name, (base, base + 600)):
+        c.mkdir(parents=True, exist_ok=True)
+        (c / "history.jsonl").write_text(json.dumps(
+            {"display": "同名目錄", "timestamp": t * 1000, "sessionId": "samename-sid"}) + "\n",
+            encoding="utf-8")
+    assert "samename-sid" in v.load_account_switches(list(same_name)), \
+        "兩個同名但不同路徑的 config 目錄是兩個帳號，不得被併成一個"
+    # ③ 涵蓋率要能被呼叫端讀到，報告才有辦法揭露「0 次」是哪一種 0
+    health = {}
+    v.load_account_switches([cfg_s1, cfg_s2], health)
+    assert health["files"] == 2 and health["rows"] == 2 and health["bad_rows"] == 0, \
+        f"health 應回報掃描涵蓋率，實得 {health}"
+    bad = cfg_a.parent / "cfgBad"
+    bad.mkdir(parents=True, exist_ok=True)
+    (bad / "history.jsonl").write_text('{"sessionId": "x", "timestamp": {"nested": 1}}\n',
+                                       encoding="utf-8")
+    h_bad = {}
+    assert v.load_account_switches([bad], h_bad) == {}
+    assert h_bad["bad_rows"] == 1, f"認不得的列要被數出來，實得 {h_bad}"
+    # ⑤ 非有限值要被當成壞列擋下。inf／nan 過得了 float()，卻會在後面轉 int() 時丟
+    #    OverflowError——**一列壞資料中止整個建置**。這是選配資料源，壞列只能被計為壞列。
+    #    裸 Infinity/NaN（JSON 非標準但 Python 解得出來）與字串形式都要擋。
+    for i, form in enumerate(("Infinity", "-Infinity", "NaN", '"Infinity"', '"nan"')):
+        i1, i2 = cfg_a.parent / f"cfgInf{i}a", cfg_a.parent / f"cfgInf{i}b"
+        for d, t in ((i1, "1780000000000"), (i2, form)):
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "history.jsonl").write_text(
+                '{"sessionId":"inf-sid","timestamp":%s}\n' % t, encoding="utf-8")
+        h_inf = {}
+        got_inf = v.load_account_switches([i1, i2], h_inf)      # 這一行本身不得丟例外
+        assert got_inf == {}, f"非有限 timestamp 不得產生切換標記（{form}），實得 {got_inf}"
+        assert h_inf["bad_rows"] == 1, f"非有限 timestamp 應計為壞列（{form}），實得 {h_inf}"
+    # ④ 偵測範圍要**在兩種報告上、且不論次數是不是 0** 都揭露：0 有三種意思（沒切過／單帳號／
+    #    讀不到），只在 >0 時附註等於讓最需要保留懷疑的那個數字裸奔。少一種輸出＝那一種在隱瞞。
+    for d_case, label in ((d_none, "acct=0"), (d_acct, "acct=1")):
+        for render in (v.render_cache_report_html, v.render_cache_report_md):
+            txt = render(d_case)
+            assert "只在多帳號的本機資料上成立" in txt, f"{label} 的 {render.__name__} 應揭露偵測範圍"
+            assert "顯示 0 不代表沒發生過" in txt, f"{label} 的 {render.__name__} 應說明 0 的歧義"
+    # ⑥ 涵蓋率要真的走到報告上——只把 health 填好、呼叫端不接，使用者看到的仍是沒有脈絡的 0。
+    d_h = v.build_cache_report([_row([])],
+                               acct_health={"dirs": 4, "files": 4, "rows": 2464,
+                                            "bad_rows": 0, "read_errors": 0, "accounts": 4})
+    assert d_h["acct_health"]["accounts"] == 4, "報告資料應帶著偵測涵蓋率"
+    for render in (v.render_cache_report_html, v.render_cache_report_md):
+        txt = render(d_h)
+        assert "掃了 4 個 config 目錄" in txt and "2464 列" in txt and "4 個帳號" in txt, \
+            f"{render.__name__} 應把實際涵蓋率寫出來"
+    for render in (v.render_cache_report_html, v.render_cache_report_md):
+        assert "沒有量到偵測涵蓋率" in render(d_none), \
+            f"{render.__name__} 在沒量到涵蓋率時要跟『量到 0』分開講"
 
     # 切帳號資料來自 repo 外的 history.jsonl：transcript 沒變也可能改變歸因 → 必須進指紋，
     # 否則增量建置會沿用舊 row，把 acct 歸因與「浪費」欄靜默停在舊值。

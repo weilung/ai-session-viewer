@@ -266,6 +266,10 @@ API_MISS_NOTES = {
 # previous_message_not_found／unavailable 不在此列：那正是「快取真的不在了」的形態，仍當失效候選。
 # 前綴變動類對應到報告成因鍵（REPORT_CAUSES）；model_changed 併入既有的 "model"。
 # （這個 dict 的 key 集合就是「前綴變動類」的唯一定義，不另立常數以免兩處分岔。）
+# **範圍限制 SCOPE-UNMAPPED-MISS-CODE**：沒有列在這裡的自報碼在成因判定裡不參與——那一步
+# 會照「邊界／間隔」推論走完，推論的結果可能落進人因桶。`previous_message_not_found` 不列
+# 是刻意的（它是「快取沒中」的症狀本身，實測橫跨各種成因都出現，不是成因）；`unavailable`
+# 是伺服器側形態、同樣未列。詳見 planning/scope-limits.md 的 SCOPE-UNMAPPED-MISS-CODE。
 API_MISS_CAUSE = {"tools_changed": "tools", "system_changed": "system",
                   "messages_changed": "msgs", "model_changed": "model"}
 # cache_steps 內以整數碼存成因（0＝無），避免 manifest 塞一堆重複字串。
@@ -876,6 +880,43 @@ def load_codex_thread_names(sessions_root: Path) -> dict:
     return names
 
 
+# event_msg 這一層我們實際處理的型別；其餘一律不認得。哨兵用它當「已知」白名單，
+# 不認得又長得像使用者發言時才出聲（見 _codex_event_user_like）。
+_CODEX_HANDLED_EVENTS = ("task_started", "user_message", "item_completed", "token_count")
+
+
+def _codex_dual_shape(pending, text, kind):
+    """`pending`（前一則尚未被內容事件隔開的 prompt）與這一則**看起來像**同一則的兩種表述。
+
+    三個條件缺一不可：**文字相同**、**非空**、**來源格式不同**。
+    ⚠ 「看起來像」不等於「是」：使用者在佇列裡連送兩次同一句話，若那兩次分別被記成不同格式，
+    形狀與雙表示**完全相同**。兩種格式都不帶可互相關聯的 turn／item 身分 → 分不出來。
+    所以本判斷**只用來出聲**（見 `n_dual_shape`），**不授權刪掉任何一則**：多顯示一則是看得見
+    的雜訊，刪掉一則是看不見的資料遺失，兩者不對等。
+    ⚠ 空字串不算：取不出文字該由 `n_empty_user_items` 那個哨兵接手。
+
+    **範圍限制 SCOPE-DUAL-SHAPE-UNMARKED**：出聲的管道只有 stderr；兩則在**輸出頁面上不帶
+    任何標記**，讀的人看到的是兩則相鄰的普通提問。詳見 planning/scope-limits.md 的
+    SCOPE-DUAL-SHAPE-UNMARKED。"""
+    if not pending or not text or not text.strip():
+        return False
+    return pending[0] == text and pending[2] != kind
+
+
+def _codex_event_user_like(payload, ptype):
+    """這個**未知的 event_msg 型別**看起來是不是「使用者發言」。
+    0.147 的漂移是把 user_message 換成 item_completed（item 那一層有哨兵接住）；
+    但下一次上游大可再換成別的 payload.type，那時整場 prompt 會一則不剩而毫無聲音——
+    item 層的哨兵看不到這種，因為它根本進不了 item_completed 那一支。
+    判準與 item 層同一套：**型別名帶 user，或 payload 自報 role=user**（實測 485 個本機 rollout：
+    帶 user 的型別只有已處理的 user_message、event_msg 從不帶 role → 現有資料零誤報）。"""
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("role") or "").lower() == "user":
+        return True
+    return "user" in str(ptype or "").lower()
+
+
 def load_codex_session(path: Path, account: str = "default", thread_names=None) -> Session:
     s = Session(path, "codex", SOURCE_CODEX)
     s.account = account
@@ -890,14 +931,18 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     # 兩種都要收，且**不可整檔擇一**：resume 會往同一個 rollout 追加（本機 473 檔 ↔ 473 thread，
     # 每檔恰好一個 session_meta），而格式跟著「當下的執行模式」走、不跟著 thread 走 → 同一檔可以
     # 前半舊格式、後半新格式。整檔擇一會把其中一半整段吃掉，且無聲。
-    # 判重範圍因此縮到「**緊鄰**的同文字雙表示」：若某版兩種格式都發同一則 prompt，兩筆之間
-    # 不會夾任何內容事件；使用者真的重打同一句話，中間必然隔著助手的回答。
-    # ⚠ 不可用「同一個 task_started 回合窗＋同文字」——實測本機 corpus 有 11 個 window 內含多則
-    # user 記錄（最多 7 則，排隊送出），那種 window 裡重打同一句話會被誤刪。
-    pending_legacy = None                    # (文字, raw index)：剛收下、尚未被內容事件隔開的舊格式 prompt
-    n_empty_user_items = 0                   # UserMessage 取不出文字的筆數（content 形狀漂移訊號）
+    # ⚠ **兩則都收，一則都不刪。** 「同一則被兩種格式各發一次」與「使用者在佇列裡連送兩次同一
+    # 句話、剛好被記成不同格式」在資料上長得一模一樣，而兩種格式都沒有可互相關聯的身分欄位
+    # → 判不出來。歧義下刪資料違反「判重不得誤刪真實資料」；多顯示一則只是雜訊，且看得見。
+    # 實測本機 corpus 490 檔、646 則 user 紀錄：緊鄰同文（不論同格式或跨格式）出現 **0 次**，
+    # 所以保留兩則在現有資料上不會產生任何重複顯示。
+    # 形狀仍要記錄並出聲（`n_dual_shape`）：上游哪天真的開始雙發，這個數字會先跳出來。
+    pending_user = None                      # (文字, raw index, 格式)：剛收下、尚未被內容事件隔開的 prompt
+    n_empty_user_items = 0                   # 使用者訊息取不出文字的筆數（欄位形狀漂移訊號）
     n_unhandled_user_items = 0               # item.type 像使用者訊息、卻不是我們認得的那個名字
-    n_dedup_suppressed = 0                   # 同窗同文被判為重複而略過的筆數
+    n_unhandled_user_events = 0              # event_msg 的 payload.type 像使用者發言、卻不認得
+    n_unhandled_user_outer = 0               # 最外層的事件 type 就不認得、而 payload 像使用者發言
+    n_dual_shape = 0                         # 緊鄰的跨格式同文筆數（可能雙表示；全部保留，只出聲）
 
     for i, e in enumerate(raw):
         payload = e.get("payload") or {}
@@ -926,41 +971,54 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
 
         if e.get("type") == "event_msg":
             if ptype == "task_started":
-                pending_legacy = None            # 新回合：上一則舊格式已不可能是「同一則」
+                pending_user = None              # 新回合：上一則已不可能是「同一則」
                 continue
             user_text = None
             if ptype == "user_message":
                 user_text = str(payload.get("message") or "")
-                if pending_legacy is not None and pending_legacy[0] == user_text:
-                    # 反序的同一則（新格式先、舊格式後）。判重必須對稱：只認 legacy→new 的話，
-                    # 上游若換個順序發就會同一則收兩次，而且一樣沒有任何跡象。
+                if not user_text.strip():
+                    # 型別還在、文字取不出來＝承載文字的欄位換了位置（`message` 改名或搬層）。
+                    # 不可當成空回合收下：空 content 的事件會被 group_turns 丟掉而完全看不見，
+                    # 等於把漏收藏得更深。記成異常、由收尾哨兵出聲。
                     user_text = None
-                    n_dedup_suppressed += 1
-                    pending_legacy = None
+                    n_empty_user_items += 1
+                    pending_user = None
                 else:
-                    pending_legacy = (user_text, i)
+                    if _codex_dual_shape(pending_user, user_text, "legacy"):
+                        n_dual_shape += 1          # 反序（新格式先、舊格式後）也要數：形狀對稱
+                    pending_user = (user_text, i, "legacy")
             elif ptype == "item_completed":
-                item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+                raw_item = payload.get("item")
+                item = raw_item if isinstance(raw_item, dict) else {}
                 itype = str(item.get("type") or "")
                 if itype == "UserMessage":
                     user_text = _codex_content_text(item.get("content"), "text")
-                    if pending_legacy is not None and pending_legacy[0] == user_text:
-                        user_text = None            # 緊鄰同文＝同一則的另一種表述
-                        n_dedup_suppressed += 1
-                        pending_legacy = None
-                    elif not user_text.strip():
-                        # 取不出文字＝content 形狀與預期不符（element type 改名、純圖片/音訊…）。
-                        # 不可當成空回合收下：空 content 的事件會被 group_turns 丟掉而完全看不見，
-                        # 等於把漏收藏得更深。記成異常、由收尾哨兵出聲。
+                    if not user_text.strip():
+                        # 同上：content 形狀與預期不符（element type 改名、純圖片/音訊…）。
                         user_text = None
                         n_empty_user_items += 1
+                        pending_user = None
                     else:
-                        pending_legacy = (user_text, i)   # 供反序判重（新格式先、舊格式後）
+                        if _codex_dual_shape(pending_user, user_text, "new"):
+                            n_dual_shape += 1
+                        pending_user = (user_text, i, "new")
                 elif "user" in itype.lower() or str(item.get("role") or "").lower() == "user":
                     # 看得出是使用者訊息、卻不是我們認得的那個型別 → 上游可能又改名了
                     # （0.147 就是這樣整段消失的）。**型別名與 role 都要看**：若上游改成通用的
                     # item.type="Message" ＋ role="user"，只比對型別名會整個穿過去而毫無聲音。
                     n_unhandled_user_items += 1
+                elif _codex_event_user_like(payload, ptype):
+                    # item 這一層看不出東西（`item` 不是 dict、或 role/content 整組搬到 payload
+                    # 這一層），但 payload 自己看得出是使用者發言。哨兵要**逐層**都有：只看 item
+                    # 那一層的話，欄位往上搬一層就整段穿過去，又是「頁面看起來完整、prompt 一則
+                    # 不剩」。已知的非 user item（AssistantMessage／Reasoning…）不帶 payload 層
+                    # role，不會誤報。
+                    n_unhandled_user_items += 1
+            elif ptype not in _CODEX_HANDLED_EVENTS and _codex_event_user_like(payload, ptype):
+                # 上一層的漂移：連 event_msg 的 payload.type 本身都換掉了。item 層那個哨兵
+                # 接不到這種（根本進不了 item_completed 那一支），漏掉就又是「整場 prompt
+                # 一則不剩、頁面看起來完整」——0.147 那次的失效樣態。
+                n_unhandled_user_events += 1
             if user_text is not None:
                 # Codex also emits response_item role=user, but those can include injected context
                 # （實測 0.147 那些就是注入的 AGENTS.md 全文）。event_msg 這一則才是使用者可見的 turn。
@@ -996,9 +1054,17 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             continue
 
         if e.get("type") != "response_item":
+            # **最外層**的漂移：連事件自己的 `type` 都換掉了（payload 仍是使用者發言）。
+            # 內兩層的哨兵都進不來——它們掛在 `event_msg` 那一支底下。哨兵要蓋滿每一層，
+            # 少一層就是一個洞，而每個洞的症狀都一樣：頁面看起來完整、prompt 一則不剩。
+            # 實測本機 corpus 除了四種已處理的外層型別，另有 compacted／world_state／
+            # inter_agent_communication_metadata，三者都不帶 user 樣態 → 現有資料零誤報。
+            if (_codex_event_user_like(payload, ptype)
+                    or "user" in str(e.get("type") or "").lower()):
+                n_unhandled_user_outer += 1
             continue
         # 內容事件把「同一則的兩種表述」隔開：之後再出現同文字的 UserMessage 就是真的重打了。
-        pending_legacy = None
+        pending_user = None
 
         if ptype == "message":
             role = payload.get("role")
@@ -1085,13 +1151,20 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     if n_unhandled_user_items:
         print(f"  ! {path.name}: {n_unhandled_user_items} 則 item_completed 的型別像使用者訊息卻不認得"
               f"——Codex 格式可能又改名了，這些回合不會出現在輸出裡", file=sys.stderr)
+    if n_unhandled_user_events:
+        print(f"  ! {path.name}: {n_unhandled_user_events} 則 event_msg 的型別像使用者發言卻不認得"
+              f"——Codex 可能又換了事件形狀，這些回合不會出現在輸出裡", file=sys.stderr)
+    if n_unhandled_user_outer:
+        print(f"  ! {path.name}: {n_unhandled_user_outer} 則事件的最外層型別不認得、內容卻像"
+              f"使用者發言——Codex 可能改了事件外殼，這些回合不會出現在輸出裡", file=sys.stderr)
     if n_empty_user_items:
-        print(f"  ! {path.name}: {n_empty_user_items} 則 UserMessage 取不出文字"
-              f"（content 形狀可能變了，或是純圖片/音訊的 prompt），該回合不會出現在輸出裡",
+        print(f"  ! {path.name}: {n_empty_user_items} 則使用者訊息取不出文字"
+              f"（承載文字的欄位形狀可能變了，或是純圖片/音訊的 prompt），該回合不會出現在輸出裡",
               file=sys.stderr)
-    if n_dedup_suppressed:
-        print(f"  ! {path.name}: {n_dedup_suppressed} 則 prompt 同時有新舊兩種格式、已判為重複只收一次"
-              f"——請確認判重範圍仍然正確", file=sys.stderr)
+    if n_dual_shape:
+        print(f"  ! {path.name}: {n_dual_shape} 則 prompt 出現緊鄰的跨格式同文——可能是同一則的兩種"
+              f"表述，也可能是使用者連送兩次；**兩則都已保留**，請確認顯示是否出現重複",
+              file=sys.stderr)
 
     dts = [e.get("_dt") for e in raw if e.get("_dt")]
     if dts:
@@ -1454,7 +1527,7 @@ def analyze(s, acct_switches=None):
                     for b in g["blocks"] if b.get("type") == "tool_use")
     s.n_turns = len(s.main_groups) + len(s.side_groups)
     _collect_usage(s)
-    s.cache_steps, s.cache_models, s.cache_events = collect_cache_steps(s, acct_switches)
+    s.cache_steps, s.cache_models, s.cache_events, _step_mids = collect_cache_steps(s, acct_switches)
     s.waste_n, s.waste_usd, s.waste_partial = session_waste(s)
     # 步驟時間正規化成「該次呼叫的起點」＝該 message.id 第一筆事件的時間，與 cache_steps 同鍵。
     # 必要原因：`_step` 標記是掛在第一筆**有可呈現內容**的事件上（group_turns 對 assistant 有
@@ -1477,14 +1550,26 @@ def analyze(s, acct_switches=None):
     if s.source_kind != SOURCE_CODEX:
         causes = (classify_cache_causes(s.cache_steps, s.cache_models, s.cache_events)
                   if s.cache_steps else {})
-        seen_t = {}          # epoch -> 已出現次數：同秒多次呼叫時用來消歧義（見 _cause_key）
+        # join 用 **message.id**，不用「同秒第幾次」的序號：序號的兩端母體不同——生產端
+        # （classify_cache_causes）只數得出 usage 的呼叫，消費端這裡走的是**所有** `_step` 區塊，
+        # 而沒有 usage 的呼叫照樣會產生 `_step`（group_turns 對每個新 message.id 都插一個）。
+        # 同一秒裡只要夾進一個沒有 usage 的步，其後的序號就整批錯位，成因掛到錯的步驟上，
+        # 而徽章看起來一切正常。id 是兩端共有的身分，數不數得到 usage 都不會偏移。
+        # 生產端的鍵仍照 _cause_key 算（同秒同 usage 的多次呼叫仍需序號消歧義），這裡只是把
+        # 「哪個 id 對應哪把鍵」先建好，讓消費端不必自己數。
+        seen_t, key_by_mid = {}, {}
+        for st, mid in zip(s.cache_steps, _step_mids):
+            n = seen_t.get(st[0], 0)
+            seen_t[st[0]] = n + 1
+            if mid:
+                key_by_mid[mid] = _cause_key(st[0], n)
         for g in s.main_groups:
             for b in g.get("blocks", []):
                 if b.get("type") == "_step":
-                    t = b.get("t")
-                    n = seen_t.get(t, 0)
-                    seen_t[t] = n + 1
-                    b["cause"] = causes.get(_cause_key(t, n), "")
+                    # 對不到 id 的步（無 message.id、或不在 cache_steps 裡）留空＝「已分析、
+                    # 非失效成因」。寧可不標，也不要靠位置猜一個掛上去——那是把推論講成實據。
+                    k = key_by_mid.get(b.get("mid"))
+                    b["cause"] = causes.get(k, "") if k is not None else ""
     # 每步「距上一步多久」：同一條對話軸（主對話／子代理各自算）上一次 API 呼叫到這次的間隔——
     # 快取 TTL 是「距上次使用」在算的，這個數字才是判讀冷熱的直接依據（statusline 的 (Xs ago) 同義）。
     for groups in [s.main_groups] + list(s.subagent_map.values()):   # 子代理各自一條軸，不與主對話相混
@@ -1642,7 +1727,13 @@ def claude_config_dirs(project_roots=()) -> set:
     各帳號的 `projects/` 常是指向同一實體的 junction（本機四個帳號就是），會被收斂成一個 —— 對
     掃 session 是對的（避免重複工），但 `history.jsonl` 是**各帳號各一份、沒有共用**，跟著收斂就
     只剩一份、切帳號永遠偵測不到（實測：真實建置得到 acct=0，逐檔跑卻有 10）。
-    所以這裡獨立列舉 ~/.claude*，另把外部指定來源的上層也算進來（自訂佈局仍能work）。"""
+    所以這裡獨立列舉 ~/.claude*，另把外部指定來源的上層也算進來（自訂佈局仍能work）。
+
+    **範圍限制 SCOPE-CFG-DEDUP**：完整涵蓋的是 `~/.claude*` 樣式的佈局（靠下面那行直接列舉）。
+    `project_roots` 這條補充路徑由呼叫端提供，主流程餵進來的是 collect_sources() 之後的清單
+    ——那份已經過 realpath 去重，所以「多個帳號的 projects/ 指向同一實體」時，這條路徑只會
+    補進一個 config 目錄。**config 目錄不在 `~/.claude*` 樣式底下的佈局，切帳號偵測的涵蓋率
+    以這條路徑為準。** 詳見 planning/scope-limits.md 的 SCOPE-CFG-DEDUP。"""
     dirs = {d for d in Path.home().glob(".claude*") if d.is_dir()}
     for root in project_roots:
         parent = Path(root).parent
@@ -1651,7 +1742,31 @@ def claude_config_dirs(project_roots=()) -> set:
     return dirs
 
 
-def load_account_switches(config_dirs) -> dict:
+def _history_epoch_ms(ts):
+    """history.jsonl 一列的 timestamp → epoch 毫秒（float）；取不出來回 None。
+
+    ⚠ 數字也可能被序列化成**字串**。只認 int/float 的話，整份 history 一列都收不到、回空 dict，
+    而呼叫端看到的是「這台沒切過帳號」——與「讀不到」完全無法區分，正是「不得靜默丟資料」
+    要擋的形狀。bool 是 int 的子型別，要先排掉，否則 `true` 會被當成 1 毫秒。
+    ⚠ **非有限值一定要在這裡擋掉**（`inf`／`nan`；JSON 的裸 `Infinity`／`NaN` 與字串
+    `"Infinity"` 都產得出來）。它們過得了 `float()`，卻會在後面轉 `int()` 時丟 OverflowError
+    ——**一列壞資料就中止整個建置**。這是選配資料源，它的壞列只能被計為壞列，
+    不可以把整個轉換一起拖下水。"""
+    if isinstance(ts, bool):
+        return None
+    if isinstance(ts, (int, float)):
+        val = float(ts)
+    elif isinstance(ts, str):
+        try:
+            val = float(ts.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return val if math.isfinite(val) else None
+
+
+def load_account_switches(config_dirs, health=None) -> dict:
     """跨帳號切換邊界 → {sessionId: [切換時刻 epoch, …]}。
 
     偵測依據：每個帳號的 config 目錄各有**自己的** `history.jsonl`（與 `projects/` 不同，它不是
@@ -1662,21 +1777,37 @@ def load_account_switches(config_dirs) -> dict:
     **不會**留下 429/401，transcript 裡沒有任何欄位標示帳號 → 那一步只會被看成「1h TTL 內卻冷啟」
     而歸成 evict（實測本機 22 個切換邊界有 10 次落在 evict，佔 evict 總數的 38%）。
 
-    ⚠ 兩個已知限制（報告文案要照實寫，不可假裝偵測完備）：
+    ⚠ 三個已知限制（報告文案要照實寫，不可假裝偵測完備）：
       ① 只有多帳號的機器才有東西可偵測；單帳號時回空 dict，整條路徑自然失效。
       ② history.jsonl 是**本機**狀態：跨機同步過來的 transcript，另一台的 history 不在這裡，
          那台發生的切換偵測不到。
+      ③ 上游的列格式若整個換掉，這裡會收不到任何列。**回空 dict 有三種完全不同的意思**
+         （沒切過／沒有檔案／讀得到但一列都認不得），所以 `health` 要一起帶出去讓報告揭露，
+         否則「0 次切換」會被讀成「你沒切過帳號」。
     只讀 sessionId／timestamp；**不讀 `display`**（那是 prompt 內文，不該進入本工具的資料流）。
+
+    `health`：呼叫端可傳入一個 dict 收集涵蓋率（掃了幾個目錄／幾個檔／幾列／幾列認不得）。
+    刻意用「傳入被填寫」而不是改回傳值——回傳值有多個呼叫端與測試在用，形狀不動。
     """
+    h = {"dirs": 0, "files": 0, "rows": 0, "bad_rows": 0, "read_errors": 0}
     by_sid: dict[str, list] = {}
     for cfg in config_dirs:
+        h["dirs"] += 1
         hist = Path(cfg) / "history.jsonl"
         if not hist.is_file():
             continue
-        label = Path(cfg).name
+        # 帳號身分＝**正規化後的實體路徑**，不是目錄名。不同位置的 config 目錄很容易同名（都叫
+        # `.claude`），拿目錄名當身分會把兩個帳號併成一個 → 它們之間的切換永遠偵測不到。
+        # 反向也對：同一個目錄的別名（junction／symlink）會收斂成同一個身分，本來就不算切換。
+        try:
+            label = str(Path(cfg).resolve()).casefold()
+        except OSError:
+            label = str(cfg).casefold()
+        h["files"] += 1
         try:
             fh = hist.open("r", encoding="utf-8", errors="replace")
         except Exception as e:
+            h["read_errors"] += 1
             print(f"  ! 讀取失敗 {hist}: {e}", file=sys.stderr)
             continue
         with fh:
@@ -1684,13 +1815,18 @@ def load_account_switches(config_dirs) -> dict:
                 line = line.strip()
                 if not line:
                     continue
+                h["rows"] += 1
                 try:
                     o = json.loads(line)
                 except Exception:
+                    h["bad_rows"] += 1
                     continue
-                sid, ts = o.get("sessionId"), o.get("timestamp")
-                if isinstance(sid, str) and isinstance(ts, (int, float)):
-                    by_sid.setdefault(sid, []).append((ts / 1000.0, label))
+                sid = o.get("sessionId") if isinstance(o, dict) else None
+                ms = _history_epoch_ms(o.get("timestamp")) if isinstance(o, dict) else None
+                if isinstance(sid, str) and sid and ms is not None:
+                    by_sid.setdefault(sid, []).append((ms / 1000.0, label))
+                else:
+                    h["bad_rows"] += 1
     out = {}
     for sid, rows in by_sid.items():
         # 同一個 timestamp 出現在多個帳號＝**同一列被複製到另一個 config**（手動跨機同步、備份
@@ -1708,6 +1844,15 @@ def load_account_switches(config_dirs) -> dict:
             prev_acc = acc
         if marks:
             out[sid] = marks
+    h["accounts"] = len({acc for rows in by_sid.values() for _, acc in rows})
+    h["switch_sessions"] = len(out)
+    if h["files"] and not by_sid:
+        # 檔案讀到了、卻一列都認不得＝上游列格式換過。這種「靜默歸零」與「真的沒切過」在
+        # 回傳值上完全同形，不出聲就只能等人肉眼發現。
+        print(f"  ! 切帳號偵測：讀了 {h['files']} 個 history.jsonl／{h['rows']} 列，"
+              f"認得的列 0 筆——列格式可能變了，切帳號歸因這一輪等於沒有作用", file=sys.stderr)
+    if isinstance(health, dict):
+        health.update(h)
     return out
 
 
@@ -1726,8 +1871,9 @@ def collect_cache_steps(s, acct_switches=None):
     Codex 略過：非因序列問題（usage 已按呼叫掛在步驟起點），而是本報告的 TTL 細分、計價與成因模型
     是 Anthropic 專屬——OpenAI 自動快取無 cache_creation/TTL 資料可對應。"""
     if s.source_kind == SOURCE_CODEX:
-        return [], [], []
+        return [], [], [], []
     steps, seen = [], set()
+    step_mids = []                 # 與 steps 等長：每一步的 message.id（無則 None），供成因 join
     models, midx = [], {}
     evs = sorted((e for e in s.events
                   if e.get("type") == "assistant" and not e.get("isSidechain")),
@@ -1758,6 +1904,7 @@ def collect_cache_steps(s, acct_switches=None):
         code = (API_MISS_CODES.index(reason) if reason in API_MISS_CODES
                 else API_MISS_UNKNOWN_CODE if reason else 0)   # 未知的新成因：存哨兵碼，次數/長度不吞
         steps.append([int(dt.timestamp()), c2, total_in, c1, c5, c1h, midx.get(mdl, -1), code, mtok])
+        step_mids.append(mid)
     events = []
     for e in s.events:
         if e.get("isSidechain"):
@@ -1791,7 +1938,9 @@ def collect_cache_steps(s, acct_switches=None):
     for t in (acct_switches or {}).get(s.session_id, ()):
         events.append([int(t), "acct"])
     events.sort()
-    return steps, models, events
+    # step_mids 刻意**不放進 steps 裡面**：steps 會被存進 manifest（增量建置沿用），改動它的形狀
+    # 等於讓所有既有 manifest 失效。id 只有「掛徽章」這條路徑要用，而那條路徑不走 manifest。
+    return steps, models, events, step_mids
 
 
 def collect_codex_steps(s):
@@ -1875,6 +2024,9 @@ def classify_cache_causes(raw, models, events):
             # 兩個觀測步之間夾著被 REPORT_MIN_CTX 濾掉的「前綴變動」步時，這一對照樣被污染——
             # 前綴在中間就被改掉了。不看的話結構性實據會被分析門檻吃掉，下游冷啟被誤判成 evict
             # （實測 ctx 差 1 個 token 結論就翻轉）。ctx 門檻只該管「由命中率推論」，不管前綴事實。
+            # **範圍限制 SCOPE-FILTERED-STEP-CAUSE**：借來的成因掛在**後一步**上，而它描述的是
+            # 中間那一步。兩步的成因不同時，後一步顯示的是中間步的成因。詳見
+            # planning/scope-limits.md 的 SCOPE-FILTERED-STEP-CAUSE。
             api_cause = next((c for r in raw[ip + 1:ic]
                               if (c := API_MISS_CAUSE.get(_step_miss(r)[0]))), None)
         if api_cause == "msgs" and boundary == "compact":
@@ -1890,10 +2042,16 @@ def classify_cache_causes(raw, models, events):
                 causes[ckeys[ic]] = boundary
             elif gap >= ttl_bound:
                 causes[ckeys[ic]] = "expiry"
+            elif "acct" in kinds:
+                # 帳號邊界是**直接證據**（history.jsonl 記著那一刻換了帳號），intra／evict 是由
+                # 間隔推論出來的。快取此時本來還活著（沒過 TTL），冷啟的原因就是換了組織 → 直接
+                # 證據勝過推論，**不分間隔長短**。
+                # ⚠ 仍然讓位給更強的三種：API 自報、被迫切換/換模型/壓縮（boundary）、已過 TTL
+                # （expiry —— 那時快取本來就會死，切帳號不是綁定成因）。三者都在上面先攔下。
+                # 少了這一格，2 分鐘內的切換會被 intra 吃掉，人因浪費在索引與報告上一致地消失。
+                causes[ckeys[ic]] = "acct"
             elif gap >= REPORT_INTRA_SEC:
-                # acct 刻意**只**搶這一格：間隔已超過 TTL 時快取本來就會死（切帳號不是綁定成因，
-                # 維持 expiry）；有 429/401 時是被迫的（維持 switch，上面的 boundary 已先攔下）。
-                causes[ckeys[ic]] = "acct" if "acct" in kinds else "evict"
+                causes[ckeys[ic]] = "evict"
             else:
                 causes[ckeys[ic]] = "intra"
         # 與 build_cache_report 同序：api_cause 這對整對略過，再輪到 boundary。
@@ -3229,7 +3387,7 @@ def _break_category(gap):
     return "> 6 時（隔夜／長假級）"
 
 
-def build_cache_report(rows, stratify=True):
+def build_cache_report(rows, stratify=True, acct_health=None):
     """從各 session 的 cache_steps／cache_events 彙整快取分析（v2）。回傳 dict（has_data=False 代表沒資料）。
     四條主線：
       (A) 成因分解──每個冷啟恰好歸一因，優先序為 **API 自報 > 邊界事件(switch/model/compact) > 間隔推論**
@@ -3244,7 +3402,7 @@ def build_cache_report(rows, stratify=True):
           KPI「TTL 遵約率」＝1h cohort 在應命中帶 [REPORT_INTRA_SEC, REPORT_TTL_SAFE_SEC) 的命中率，
           其補數＝「提早失效率」（1h 快取理論上帶內必命中；TTL 每次使用會刷新，gap＝距上次使用）。
       (C) 重暖作息──各帳號時間軸閒置 ≥ REPORT_BREAK_SEC 後的冷啟，本地時段直方圖
-          （平日/假日 × 可避免/非閒置造成，正規化為 次/活躍日）。
+          （平日/假日 × 可避免/異常 vs 非閒置造成，正規化為 次/活躍日）。
       (D) 尖峰假設──應命中帶內（1h cohort）依 UTC 分時看提早失效率；依 gap 分層做 CMH 勝算比＋卡方，
           控制「午休/夜間本來就閒得久」的混雜。
       (E) 脈絡假設──同一批帶內樣本依「前一步脈絡」分箱看失效率（Cochran–Armitage 趨勢），
@@ -3371,6 +3529,7 @@ def build_cache_report(rows, stratify=True):
             api_cause = API_MISS_CAUSE.get(_step_miss(cur)[0])
             if not api_cause:
                 # 同 classify_cache_causes：夾在中間、被 ctx 門檻濾掉的前綴變動步照樣污染這一對。
+                # 範圍限制 SCOPE-FILTERED-STEP-CAUSE 同樣適用於此（兩處是刻意的雙胞胎）。
                 api_cause = next((c for r in raw[ip + 1:ic]
                                   if (c := API_MISS_CAUSE.get(_step_miss(r)[0]))), None)
             if api_cause == "msgs" and boundary == "compact":
@@ -3391,9 +3550,12 @@ def build_cache_report(rows, stratify=True):
                     cause = boundary
                 elif gap >= ttl_bound:
                     cause = "expiry"
+                elif "acct" in kinds:
+                    # 與 classify_cache_causes 同規則（兩邊由 test_smoke 的一致性測試釘住）：
+                    # 直接的帳號邊界證據勝過由間隔推論的 intra／evict，不分間隔長短。
+                    cause = "acct"
                 elif gap >= REPORT_INTRA_SEC:
-                    # 與 classify_cache_causes 同規則（兩邊由 test_smoke 的一致性測試釘住）
-                    cause = "acct" if "acct" in kinds else "evict"
+                    cause = "evict"
                 else:
                     cause = "intra"
                 causes_total[cause] += 1
@@ -3626,6 +3788,9 @@ def build_cache_report(rows, stratify=True):
         "limits_wd": lim_wd, "limits_we": lim_we,
         "neg_gaps": neg_gaps,
         "by_kind": by_kind,       # {kind: 子報告 dict}；型態分層比較用（None＝母體只有單一型態，不比較）
+        # 切帳號偵測的涵蓋率（load_account_switches 的 health）：報告要據此說明「acct 的 0」
+        # 是哪一種 0。{} ＝ 這次建置沒有量到（例如 --no-claude），文案要跟「量到 0」分開講。
+        "acct_health": dict(acct_health or {}),
     }
 
 
@@ -3644,7 +3809,8 @@ def _pct(x, digits=0):
 
 
 def _hour_chart2(cells, days, mx, lo, hi):
-    """時段圖（每列一小時）：bar 分兩段＝可避免（實色）＋非閒置造成（同色調淡；含 API 自報的前綴變動），
+    """時段圖（每列一小時）：bar 分兩段＝可避免/異常（實色；_AVOIDABLE_CAUSES＝人因兩種＋提早失效）
+    ＋非閒置造成（同色調淡；含 API 自報的前綴變動），
     寬度＝次/活躍日、依傳入 mx 正規化讓平日/假日共用刻度；只畫 lo..hi 小時。"""
     mx = mx or 1
     days = days or 1
@@ -3656,7 +3822,8 @@ def _hour_chart2(cells, days, mx, lo, hi):
         rows.append(
             f'<div class="hrow"><span class="hh">{h:02d} 時</span>'
             f'<span class="hbarwrap">'
-            f'<span class="hseg a" style="width:{wa}px" title="可避免（閒置過期/提早失效）：{a} 次"></span>'
+            f'<span class="hseg a" style="width:{wa}px" '
+            f'title="可避免/異常（人因：閒置過期／自行切帳號＋伺服器側：提早失效）：{a} 次"></span>'
             f'<span class="hseg u" style="width:{wu}px" title="非閒置造成（第一句/切帳號/換模型/壓縮，或 API 自報的前綴變動）：{u} 次"></span>'
             f'</span><span class="hn">{(a + u) or ""}</span></div>')
     return "".join(rows)
@@ -3948,6 +4115,26 @@ def _kind_compare_data(d):
     return headers, rows
 
 
+def _acct_scope_note(d, html=True) -> str:
+    """切帳號偵測的範圍與實際涵蓋率。
+
+    兩種報告共用同一份文字：分成兩份寫，遲早只有一邊會被改到，那時就有一種輸出在隱瞞。
+    ⚠ 一律輸出、不看次數是不是 0——0 有三種意思（真的沒切過／這台只有一個帳號／
+    history 讀不到或列格式變了），涵蓋率就是分辨它們的那份資料。"""
+    b = "<b>{}</b>" if html else "**{}**"
+    note = ("「自行切帳號」偵測自各帳號的 history.jsonl，"
+            + b.format("只在多帳號的本機資料上成立")
+            + "（跨機同步來的紀錄看不到另一台的切換）——"
+            + b.format("顯示 0 不代表沒發生過") + "。")
+    h = d.get("acct_health") or {}
+    if not h.get("dirs"):
+        return note + "本次建置沒有量到偵測涵蓋率。"
+    return note + (f"本次掃了 {h['dirs']} 個 config 目錄、讀到 {h.get('files', 0)} 份 history 共 "
+                   f"{h.get('rows', 0)} 列（認不得 {h.get('bad_rows', 0)} 列"
+                   + (f"、讀取失敗 {h['read_errors']} 個" if h.get("read_errors") else "")
+                   + f"），辨識出 {h.get('accounts', 0)} 個帳號。")
+
+
 def render_cache_report_html(d) -> str:
     parts = []
     # 導言
@@ -4064,9 +4251,11 @@ def render_cache_report_html(d) -> str:
                 + f"＋提早失效 {ct['evict']}）、"
                 f"回合內雜訊 {ct['intra']}。")
         if ct["acct"]:
-            ins2 += ("「自行切帳號」是沒撞 limit 就換帳號——快取按組織隔離，等於自己把前綴丟掉；"
-                     "偵測自各帳號的 history.jsonl，<b>只在多帳號的本機資料上成立</b>"
-                     "（跨機同步來的紀錄看不到另一台的切換）。")
+            ins2 += "「自行切帳號」是沒撞 limit 就換帳號——快取按組織隔離，等於自己把前綴丟掉。"
+        # 偵測範圍**一律揭露，不看數字是不是 0**：0 有三種完全不同的意思（真的沒切過／這台
+        # 只有一個帳號／history 讀不到或列格式變了）。只在 >0 時才附註，等於讓最需要保留懷疑
+        # 的那個數字裸奔——讀者會把「沒偵測到」讀成「沒發生」。
+        ins2 += _acct_scope_note(d, html=True)
         if api_n:
             ins2 += (f"「前綴變動」是 API 自報的（工具定義 {ct['tools']}／系統提示 {ct['system']}／"
                      f"前文 {ct['msgs']}）——不是快取沒撐住，是這次請求的前綴跟上次不一樣了、"
@@ -4091,8 +4280,10 @@ def render_cache_report_html(d) -> str:
     n_res = d["n_resumes"]
     parts.append(f'<div class="lead">各帳號活動軸上「閒置 ≥ {fmt_dur(REPORT_BREAK_SEC)} 後、確實冷啟的第一步」'
                  f"＝一次重新開工，共 <b>{n_res}</b> 次（閒置夠久卻仍命中 1h 快取者不算）。"
-                 "bar 分兩段：<b>實色＝可避免</b>（閒置過期/提早失效——早點回來或先 ping 就能省）、"
-                 "淡色＝不是閒置造成的（session 第一句/切帳號/換模型/壓縮，以及 API 自報的前綴變動——"
+                 "bar 分兩段：<b>實色＝可避免/異常</b>（<b>人因</b>：閒置過期——早點回來就能省、"
+                 "自行切帳號——沒撞 limit 就別換；<b>加上伺服器側異常</b>：提早失效＝1h TTL 內卻冷啟，"
+                 "<b>那一種不是你能控制的</b>，所以索引的「浪費」欄與②的人因 KPI 都不計它）、"
+                 "淡色＝不是閒置造成的（session 第一句/被迫切帳號/換模型/壓縮，以及 API 自報的前綴變動——"
                  "那類要改習慣才省得到，不是「早點回來」能解決的）。已正規化為「次/活躍日」，平日假日可直接比。</div>")
     wd_tot = [c["a"] + c["u"] for c in d["clock_wd"]]
     we_tot = [c["a"] + c["u"] for c in d["clock_we"]]
@@ -4214,6 +4405,8 @@ def render_cache_report_md(d) -> str:
                    + f"可避免/異常 {sum(ct[c] for c in _AVOIDABLE_CAUSES)}"
                    + (f"（含自行切帳號 {ct['acct']}）" if ct["acct"] else "")
                    + f"、回合內雜訊 {ct['intra']}。")
+        # 與 HTML 共用同一份揭露（_acct_scope_note）：兩種報告口徑必須一致。
+        out.append(_acct_scope_note(d, html=False))
         if api_n:
             out.append(f"「前綴變動」是 API 自報的（工具定義 {ct['tools']}／系統提示 {ct['system']}／"
                        f"前文 {ct['msgs']}）——不是快取沒撐住，多為中途載工具或改 CLAUDE.md 造成"
@@ -4234,15 +4427,18 @@ def render_cache_report_md(d) -> str:
 
     out += ["", "## ③ 重暖作息（冷啟時段）", "",
             f"閒置 ≥ {fmt_dur(REPORT_BREAK_SEC)} 後、確實冷啟的第一步＝重新開工，共 {d['n_resumes']} 次"
-            "（可避免＝閒置過期/提早失效；非閒置造成＝第一句/切帳號/換模型/壓縮，以及 API 自報的"
-            "前綴變動——工具定義/系統提示/前文，那類要改習慣才省得到，不是「早點回來」能解決的）。"]
+            "（可避免/異常＝人因的閒置過期／自行切帳號，加上伺服器側的提早失效——最後那種不是你能"
+            "控制的，索引「浪費」欄與②的人因 KPI 都不計它；非閒置造成＝第一句/被迫切帳號/換模型/壓縮，"
+            "以及 API 自報的前綴變動——工具定義/系統提示/前文，那類要改習慣才省得到，"
+            "不是「早點回來」能解決的）。"]
     wd_tot = [c["a"] + c["u"] for c in d["clock_wd"]]
     we_tot = [c["a"] + c["u"] for c in d["clock_we"]]
     if sum(wd_tot):
         out.append(f"- 平日 {sum(wd_tot)} 次／{d['wd_days']} 個活躍日，集中 {_hours_label(_top_hours(wd_tot))}")
     if sum(we_tot):
         out.append(f"- 假日 {sum(we_tot)} 次／{d['we_days']} 個活躍日，集中 {_hours_label(_top_hours(we_tot))}")
-    out += ["", "| 時 | 平日可避免 | 平日非閒置 | 假日可避免 | 假日非閒置 |", "|---|---:|---:|---:|---:|"]
+    out += ["", "| 時 | 平日可避免/異常 | 平日非閒置 | 假日可避免/異常 | 假日非閒置 |",
+            "|---|---:|---:|---:|---:|"]
     for h in range(24):
         if wd_tot[h] or we_tot[h]:
             out.append(f"| {h:02d} | {d['clock_wd'][h]['a'] or ''} | {d['clock_wd'][h]['u'] or ''} "
@@ -4712,8 +4908,10 @@ border-radius:6px;padding:4px 10px;font-size:13px;cursor:pointer}
 .turn.user{border-left:3px solid var(--user)}
 .turn.assistant{border-left:3px solid var(--assistant)}
 .turn.side{opacity:.95;background:var(--panel2)}
-.turn .head{display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid var(--border);
-font-size:13px;background:rgba(127,127,127,.06)}
+/* flex-wrap 是必要的：.meter 各自 white-space:nowrap、彼此間又沒有空白可斷行，勾滿補充徽章時
+   單行塞不下就會把靠 margin-left:auto 推到右邊的時間戳擠出畫面。換行後時間跟著落到最後一行右端。 */
+.turn .head{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:7px 12px;
+border-bottom:1px solid var(--border);font-size:13px;background:rgba(127,127,127,.06)}
 .turn .who{font-weight:600}.turn .when{margin-left:auto;color:var(--muted);font-size:12px;cursor:help;text-decoration:underline dotted transparent}
 .turn .when:hover{text-decoration-color:var(--muted)}
 .badge{background:var(--border);border-radius:10px;padding:1px 8px;font-size:11px;color:var(--muted)}
@@ -5563,9 +5761,20 @@ def main():
     n_raw = len(files)
     files = _dedupe_claude_sessions(files)          # 跨來源同 sessionId 的複本只留一份，避免雙倍計
     # 自願切帳號的偵測資料：各帳號 config 目錄下的 history.jsonl
+    # health 一定要接住並顯示：切帳號歸因是選配資料源，「0 次切換」有三種完全不同的意思
+    # （真的沒切過／這台只有一個帳號／history 讀不到或列格式變了）。函式填得出涵蓋率，
+    # 呼叫端不接等於那份資料只存在函式裡面，使用者看到的仍然是一個沒有脈絡的 0。
+    acct_health = {}
     acct_switches = ({} if args.no_claude
-                     else load_account_switches(claude_config_dirs(p for _, p in accounts)))
+                     else load_account_switches(claude_config_dirs(p for _, p in accounts),
+                                                acct_health))
     print(f"Claude 帳號：{', '.join(a for a, _ in accounts) or '(無)'}")
+    if acct_health.get("dirs"):
+        print(f"切帳號偵測：掃 {acct_health['dirs']} 個 config／讀到 {acct_health.get('files', 0)} 份 "
+              f"history（{acct_health.get('rows', 0)} 列，認不得 {acct_health.get('bad_rows', 0)}"
+              + (f"，讀取失敗 {acct_health['read_errors']}" if acct_health.get("read_errors") else "")
+              + f"）→ {acct_health.get('accounts', 0)} 個帳號、"
+              f"{acct_health.get('switch_sessions', 0)} 場有切換")
     if codex_accounts:
         print(f"Codex 來源：{', '.join(a for a, _ in codex_accounts)}")
     if not files:
@@ -5717,7 +5926,7 @@ def main():
                         pass
 
     # 快取分析報告：彙整所有 Claude session 的 cache_steps（增量建置時沿用 row 內存的序列，免重讀）
-    cache_data = build_cache_report(rows)
+    cache_data = build_cache_report(rows, acct_health=acct_health)
     has_report = cache_data["has_data"]
     if has_report and want_html:
         (out / "cache-report.html").write_text(render_cache_report_html(cache_data), encoding="utf-8")

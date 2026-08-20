@@ -12,6 +12,7 @@ ai_session_viewer 的煙霧測試（不含任何真實對話）。
 回合錨點（HTML id ↔ MD {#tN} 標記）與 --search 全文搜尋結果頁。
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -591,9 +592,12 @@ def test_codex_step_badges(tmp_path=None):
     assert htmls, "應產生 Codex session HTML"
     html = htmls[0].read_text(encoding="utf-8")
     assert "CODEXQMARK" in html and "CODEXDONE" in html, "對話內容應照常呈現"
-    # 三步都應有步驟分隔列；步驟1 冷啟紅標；❄最低徽章指向步驟1
-    assert "步驟 1</span>" in html and "步驟 3</span>" in html, "多步回合應有逐步分隔列"
-    assert '步驟 1</span><span class="meter m-cache cold"' in html, "冷啟步驟應紅標（m-cache cold）"
+    # 三步都應有步驟分隔列（含時刻）；步驟1 冷啟紅標；❄最低徽章指向步驟1
+    STEP_T = "步驟 %d · [0-9]{2}:[0-9]{2}:[0-9]{2}</span>"
+    assert re.search(STEP_T % 1, html) and re.search(STEP_T % 3, html), (
+        "多步回合應有逐步分隔列（含時刻）")
+    assert re.search(STEP_T % 1 + '<span class="meter m-cache cold"', html), (
+        "冷啟步驟應紅標（m-cache cold）")
     assert "❄最低 0%·步驟1" in html, "回合徽章應標出最低步驟"
     # 總帳：孤兒丟棄、重播去重 → total_in=6700、cache_read=4400 → 66%
     #（孤兒未丟會成 61%；重播重計會成 74%）
@@ -1117,10 +1121,19 @@ def test_api_miss_reason(tmp_path=None):
         "effort max": "步驟徽章應顯示 effort",
         "⏱36秒": "多段耗時要累加（21s＋5s＋掛在無內容事件上的 10s），不是只留最後一段、也不得漏掉後者",
         "⚠ 快取被打斷 3 次": "session 表頭應彙總被打斷次數",
-        "hide-gap hide-dur hide-eff": "新增欄位應預設隱藏",
+        "hide-dur hide-eff": "耗時與 effort 應預設隱藏",
         "%)": "脈絡徽章應附佔 context 視窗的 %",
     }.items():
         assert needle in html, f"{msg}（找不到 {needle!r}）"
+    # 「距上一步」預設開啟：DEF 與 body class 必須同步，否則載入時會先隱藏再由 JS 補顯示，
+    # 關掉 JS 更是完全不成立。
+    bodycls = re.search(r'<body class="([^"]*)"', html)
+    assert bodycls and "hide-gap" not in bodycls.group(1),         "「距上一步」預設開啟，不應同時被 body class 隱藏：" + (bodycls.group(1) if bodycls else "(無)")
+    m_def = re.search(r"DEF=\{([^}]*)\}", html)
+    assert m_def and "gap:1" in m_def.group(1), (
+        "「距上一步」的 DEF 應為 1；⚠ 要對準 DEF 那一段——CSS 是每頁共用的常數，"
+        "裡面的 gap:12px／gap:14px 會讓整頁搜尋「gap:1」永遠命中："
+        + (m_def.group(1) if m_def else "(找不到 DEF)"))
     assert "工具定義變動" in mdtxt and "⚠" in mdtxt, "MD 也要看得到自報成因"
     # 24.6% 那步：⚡ 要著色成冷啟，緊接的 ⚠ 必須是整段失效樣式（非 m-miss part）；
     # 且**顯示也要寫 24.6%**——寫成 25% 會與報告的「門檻＝命中率 < 25%」打架（G10 F2）。
@@ -2077,6 +2090,475 @@ def test_account_switch_cause(tmp_path=None):
     print("OK: account switch cause test passed")
 
 
+def test_acct_separator_and_step_time(tmp_path=None):
+    # 涵蓋 session 頁顯示層三件事：逐步分隔列帶時刻、「距上一步」的預設值，
+    # 以及主對話跨過切帳號時刻時插入的分隔線（時刻取自 cache_events 的 acct 標記）。
+    import ai_session_viewer as v
+    from datetime import datetime, timedelta, timezone
+
+    root = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+
+    def ep(iso):
+        # 保留小數：切換時刻的次秒精度是被測行為之一
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+    def hhmmss(iso):
+        # 期望值用與產品碼同一條轉換算出來，斷言才不綁死在某個時區
+        return datetime.fromtimestamp(ep(iso)).strftime("%H:%M:%S")
+
+    def build(tag, evs, rows_a, rows_b):
+        """一場 session ＋ 兩個帳號的 history，跑一次建置，回傳 (html, md)。
+        rows_a／rows_b 是各帳號 history 的時刻（ISO）；同一 sid 出現在兩邊＝中途換過帳號。"""
+        tmp = root / tag
+        cfg_a, cfg_b = tmp / "cfgA", tmp / "cfgB"
+        proj = cfg_a / "projects" / "demo-proj"
+        proj.mkdir(parents=True, exist_ok=True)
+        (cfg_b / "projects").mkdir(parents=True, exist_ok=True)
+        sid = evs[0]["sessionId"]
+        (proj / (sid + ".jsonl")).write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+        for cfg, rows in ((cfg_a, rows_a), (cfg_b, rows_b)):
+            (cfg / "history.jsonl").write_text("\n".join(
+                json.dumps({"display": "x", "timestamp": int(ep(x) * 1000), "sessionId": sid})
+                for x in rows) + "\n", encoding="utf-8")
+        out = tmp / "out"
+        # ⚠ HOME 要指到空目錄：切帳號偵測會無條件列舉 `~/.claude*`，不隔離的話這個單元測試
+        # 會去讀這台機器上真實、且正在被寫入的 history.jsonl（結果隨環境浮動）。
+        iso = tmp / "home"; iso.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, HOME=str(iso), USERPROFILE=str(iso))
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--claude-source", "A=" + str(cfg_a / "projects"),
+             "--claude-source", "B=" + str(cfg_b / "projects"),
+             "--no-codex", "--out", str(out)],
+            capture_output=True, text=True, encoding="utf-8", env=env)
+        assert r.returncode == 0, "非零退出\nSTDOUT:" + r.stdout + "\nSTDERR:" + r.stderr
+        html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+        md = [p for p in (out / "sessions").rglob("*.md")][0].read_text(encoding="utf-8")
+        return html, md
+
+    def user(uid, parent, iso, sid, text):
+        return {"type": "user", "uuid": uid, "parentUuid": parent, "timestamp": iso,
+                "cwd": "/x/Proj", "gitBranch": "main", "version": "2.1.150", "sessionId": sid,
+                "message": {"role": "user", "content": text}}
+
+    def asst(uid, parent, iso, sid, mid, blocks):
+        return {"type": "assistant", "uuid": uid, "parentUuid": parent, "timestamp": iso,
+                "sessionId": sid,
+                "message": {"role": "assistant", "model": "claude-opus-4-7", "id": mid,
+                            "usage": {"input_tokens": 100, "output_tokens": 20},
+                            "content": blocks}}
+
+    txt = lambda s: [{"type": "text", "text": s}]
+
+    # ── 情境 1：一次切換 —— 位置要夾在前後兩則之間，HTML 與 MD 條數要相等 ──────────
+    sid1 = "019f0200-0000-7000-8000-0000000005a1"
+    t0, t1 = "2026-05-28T10:00:00.000Z", "2026-05-28T10:20:00.000Z"
+    html, md = build("one", [
+        user("a1", None, t0, sid1, "換帳號前的訊息BEFORESWITCH。"),
+        asst("a2", "a1", "2026-05-28T10:00:05.000Z", sid1, "m1", txt("前半段的回覆。")),
+        user("a3", "a2", t1, sid1, "換帳號後的訊息AFTERSWITCH。"),
+        asst("a4", "a3", "2026-05-28T10:20:05.000Z", sid1, "m2", txt("後半段的回覆。")),
+    ], [t0], [t1])
+    assert html.count('class="acct-sep"') == 1, "只換一次帳號就只該有一條線"
+    assert "換了登入帳號" in html, "分隔線應標出換過登入帳號"
+    # ⚠ 顯示層不得使用成因層的判定詞：「自行切帳號」＝沒撞 limit（人因可避免）、
+    # 「limit/切帳號」＝撞了 429/401（不可避免）。畫線不看有沒有 limit 邊界，貼上任一個
+    # 都會有一部分的線與正下方那一步的成因徽章講相反的話。
+    for verdict_word in ("自行切帳號", "limit/切帳號"):
+        assert verdict_word not in html and verdict_word not in md, (
+            "分隔線不得使用成因層的判定詞：" + verdict_word)
+    assert html.index("BEFORESWITCH") < html.index('class="acct-sep"') < html.index("AFTERSWITCH"), \
+        "分隔線要夾在換帳號的前後兩則之間"
+    assert md.count("換了登入帳號") == html.count('class="acct-sep"'), "HTML 與 MD 條數必須相等"
+    assert md.index("BEFORESWITCH") < md.index("換了登入帳號") < md.index("AFTERSWITCH"), \
+        "MD 的分隔線位置要與 HTML 一致"
+    # MD 全篇沒有日期可對照（回合標頭只有時分秒）→ 切帳號線一律帶日期；
+    # HTML 上方有日期分隔線，同一天就不必重複印。
+    want_d1 = datetime.fromtimestamp(ep(t1)).strftime("%m-%d")
+    i_md1 = md.index("換了登入帳號")
+    assert want_d1 in md[i_md1:i_md1 + 40], "MD 的切帳號線要帶日期：" + md[i_md1:i_md1 + 40]
+    i_h1 = html.index('class="acct-sep"')
+    assert want_d1 not in html[i_h1:i_h1 + 60], (
+        "HTML 同一天不必重複印日期：" + html[i_h1:i_h1 + 60])
+
+    # 分隔線不屬於任何一則：--search 切塊不得把它併進**前**一則（那一則屬於舊帳號，
+    # 會變成錨點指錯、片段全是樣板的固定命中，每個切過帳號的 session 都多一筆）
+    chunk_bodies = [c[-1] for c in v.iter_turn_chunks(md)]
+    assert chunk_bodies, "應切得出回合"
+    assert not any("換了登入帳號" in b for b in chunk_bodies), (
+        "切帳號分隔線不得落進任何一則的搜尋內文")
+    # ⚠ 只比「有沒有那幾個字」釘不住：這條線**配套插進去的裝飾**（曾經有一條 `---`）一樣
+    # 不屬於任何一則，卻照樣會落進前一則。改成比對「同一場但沒切帳號」的切塊結果——
+    # 有沒有切帳號，都不該改動任何一則的搜尋內文。
+    _, md_nosw = build("one_nosw", [
+        user("a1", None, t0, sid1, "換帳號前的訊息BEFORESWITCH。"),
+        asst("a2", "a1", "2026-05-28T10:00:05.000Z", sid1, "m1", txt("前半段的回覆。")),
+        user("a3", "a2", t1, sid1, "換帳號後的訊息AFTERSWITCH。"),
+        asst("a4", "a3", "2026-05-28T10:20:05.000Z", sid1, "m2", txt("後半段的回覆。")),
+    ], [t0], [])
+    assert "換了登入帳號" not in md_nosw, "對照組不該有切帳號線，否則下面那條比對沒有意義"
+    nosw_bodies = [c[-1] for c in v.iter_turn_chunks(md_nosw)]
+    assert nosw_bodies == chunk_bodies, (
+        "切帳號分隔線不得改動任何一則的搜尋內文（含它自己插的裝飾與空行）：\n"
+        "有切帳號：" + repr(chunk_bodies) + "\n沒切帳號：" + repr(nosw_bodies))
+    # ⚠ 反過來也要釘：使用者自己的訊息可以用 `**🔑 ` 開頭（粗體加鑰匙 emoji 沒有保留意義）。
+    # 切塊端只比前綴的話，會把那一則的內文**靜默刪掉**——全文搜尋從此漏報，畫面上毫無跡象。
+    fake = "### 👤 You · 12:00:00 {#t1}\n\n**🔑 KEEPMESEARCHABLE** 這是使用者自己寫的\n"
+    fake_body = list(v.iter_turn_chunks(fake))[0][-1]
+    assert "KEEPMESEARCHABLE" in fake_body, \
+        "以 **🔑 開頭的使用者內容不得被切塊端當成分隔線刪掉，得到：" + repr(fake_body)
+    # 真的分隔線仍要被跳過。期望值用**渲染端自己的常數**組，兩邊不會在改文案時分岔。
+    real = ("### 👤 You · 12:00:00 {#t1}\n\n"
+            + v.MD_ACCT_SEP_PREFIX + v.acct_sep_label(ep(t1)) + v.MD_ACCT_SEP_SUFFIX + "\n")
+    real_body = list(v.iter_turn_chunks(real))[0][-1]
+    assert "換了登入帳號" not in real_body, \
+        "真的切帳號分隔線仍要被跳過，得到：" + repr(real_body)
+
+    # 顯示層只陳述實據，不得替快取結果背書（畫線這條路徑沒有任何命中率證據要求）
+    assert "前綴不共用" not in html and "前綴不共用" not in md, \
+        "分隔線不得宣稱快取後果——那是成因層的判斷"
+    m_def = re.search(r"DEF=\{([^}]*)\}", html)
+    assert m_def and "gap:1" in m_def.group(1), (
+        "「距上一步」應預設開啟（DEF 的 gap）；要對準 DEF 那一段，別對整頁搜尋："
+        + (m_def.group(1) if m_def else "(找不到 DEF)"))
+    bodycls = re.search(r'<body class="([^"]*)"', html)
+    assert bodycls and "hide-gap" not in bodycls.group(1),         "預設開啟的度量不應同時被 body class 隱藏：" + (bodycls.group(1) if bodycls else "(無)")
+
+    # ── 情境 2：切換落在最後一則之後 —— 兩種輸出都是 0 條（不得只有一邊丟掉）────────
+    sid2 = "019f0200-0000-7000-8000-0000000005a2"
+    html, md = build("after", [
+        user("b1", None, "2026-05-28T10:00:00.000Z", sid2, "只有這一則ONLYTURN。"),
+        asst("b2", "b1", "2026-05-28T10:00:05.000Z", sid2, "m1", txt("回覆。")),
+    ], ["2026-05-28T10:00:00.000Z"], ["2026-05-28T11:00:00.000Z"])
+    assert html.count('class="acct-sep"') == 0 and md.count("換了登入帳號") == 0, \
+        "落在最後一則之後的切換不畫，且兩種輸出要一致"
+
+    # ── 情境 3：只有一種輸出畫得出來的回合 —— 條數仍須相等 ───────────────────────
+    # redacted_thinking 只有 HTML 收、MD 不收；若切帳號線跟著各自的渲染結果推進，
+    # 這一則又是最後一則，MD 那條線就會被丟掉而 HTML 留著。
+    sid3 = "019f0200-0000-7000-8000-0000000005a3"
+    html, md = build("skew", [
+        user("c1", None, "2026-05-28T10:00:00.000Z", sid3, "第一則FIRSTTURN。"),
+        asst("c2", "c1", "2026-05-28T10:00:05.000Z", sid3, "m1", txt("回覆。")),
+        user("c3", "c2", "2026-05-28T10:00:50.000Z", sid3, "第二則SECONDTURN。"),
+        asst("c4", "c3", "2026-05-28T10:02:00.000Z", sid3, "m2",
+             [{"type": "redacted_thinking", "data": "zzz"}]),
+    ], ["2026-05-28T10:00:00.000Z"], ["2026-05-28T10:01:40.000Z"])
+    assert html.count('class="acct-sep"') == md.count("換了登入帳號") == 1, \
+        "某一則只有一種輸出畫得出來時，兩邊的分隔線條數仍須相等"
+    # ↑ 條數相等的代價：這一條在 MD 落在**檔尾**（最後一則只有 HTML 畫得出來）。
+    #   所以 MD 的文案不得宣稱「以下」有東西，也不得叫人去看 MD 根本沒有的逐步徽章。
+    tail = md[md.index(v.MD_ACCT_SEP_PREFIX):]
+    assert tail.strip().count("\n") == 0, \
+        "這個 fixture 要保證 MD 的分隔線真的在檔尾（下面沒有內容），否則下面幾條斷言白做：" + tail
+    assert "換了登入帳號" in tail, "上面那句話要對的是切帳號那一行，抓錯行了：" + tail
+    for bad in ("以下屬於另一個帳號", "徽章"):
+        assert bad not in tail, \
+            "MD 的切帳號分隔線不得出現「" + bad + "」（檔尾沒有「以下」、MD 也沒有徽章）：" + tail
+
+    # ── 情境 3c：最前端的過濾與 pending_acct 必須是**同一條規則** ─────────────────────
+    # 兩邊各寫一份的話，「時刻完全相等」這一格會分岔：`ts > 第一則時刻` 一律丟掉，但
+    # pending_acct 的收線規則是「`< gt` 或（`== gt` 且該則是 user）」。首則是 assistant 時
+    # 那個標記該畫在第二則之前（上面有第一則可隔），不該被丟掉。
+    class _FakeSession:                      # acct_marks 只用這兩個屬性
+        pass
+
+    def marks_and_positions(roles, group_ts, mark_ts):
+        st = _FakeSession()
+        base = datetime(2026, 5, 28, 10, 0, 0, tzinfo=timezone.utc)
+        st.main_groups = [{"role": r, "dt": base + timedelta(seconds=x)}
+                          for r, x in zip(roles, group_ts)]
+        st.acct_times = [(base + timedelta(seconds=x)).timestamp() for x in mark_ts]
+        kept, i, drawn = v.acct_marks(st), 0, []
+        for gi, g in enumerate(st.main_groups):
+            hits, i = v.pending_acct(kept, i, g)
+            drawn += [(gi, round(ts - base.timestamp())) for ts in hits]
+        return drawn
+
+    # 首則是 assistant、標記與它同刻 → 兩個標記都畫在第二則之前
+    assert marks_and_positions(("assistant", "assistant"), (0, 5), (0, 3)) == [(1, 0), (1, 3)], \
+        "首則是 assistant 時，同刻的標記不得被最前端過濾吃掉——它該畫在第二則之前"
+    # 首則是 user、標記與它同刻 → 該收在第一則之前，而上面空無一物 → 丟掉
+    assert marks_and_positions(("user", "assistant"), (0, 5), (0,)) == [], \
+        "首則是 user 時，同刻的標記收在第一則之前，而那上面空無一物 → 不畫"
+    # 早於第一則的一律丟掉（不分角色）
+    assert marks_and_positions(("assistant", "user"), (10, 20), (5,)) == [], \
+        "早於第一則的標記上方空無一物 → 不畫"
+
+    # ── 情境 3b：負的小數 epoch —— `int()` 往零截會把 1969 顯示成 1970 ────────────────
+    # 直接測 `epoch_str` 採不到這個：錯在「怎麼把事件時間變成 `_step` 的 `t`」那一步。
+    neg = datetime(1969, 12, 31, 23, 59, 59, 500000, tzinfo=timezone.utc)
+    assert v._epoch({"_dt": neg}) == -1, \
+        "負的小數 epoch 要往下取整（包含該時刻的那一秒），得到：" + str(v._epoch({"_dt": neg}))
+    pos = datetime(2026, 5, 28, 10, 0, 0, 500000, tzinfo=timezone.utc)
+    assert v._epoch({"_dt": pos}) == int(pos.timestamp()), \
+        "正的 epoch 行為不得改變（真實資料全落在這一側）"
+
+    # ── 情境 4：多步回合 —— 逐步時刻必須是「各步自己的時刻」，不是回合時間 ──────────
+    sid4 = "019f0200-0000-7000-8000-0000000005a4"
+    s1, s2, s3 = ("2026-05-28T10:00:05.000Z", "2026-05-28T10:00:20.000Z",
+                  "2026-05-28T10:00:45.000Z")
+    html, md = build("steps", [
+        user("d1", None, "2026-05-28T10:00:00.000Z", sid4, "多步回合MULTISTEP。"),
+        asst("d2", "d1", s1, sid4, "n1", txt("第一步。")),
+        asst("d3", "d2", s2, sid4, "n2", txt("第二步。")),
+        asst("d4", "d3", s3, sid4, "n3", txt("第三步。")),
+    ], ["2026-05-28T10:00:00.000Z"], [])
+    for i, iso in enumerate((s1, s2, s3), start=1):
+        want = "步驟 " + str(i) + " · " + hhmmss(iso) + "</span>"
+        assert want in html, "逐步時刻應為該步自己的時刻，缺少：" + want
+    # 三步時刻互異 → 若誤用回合時間，上面三條至少有兩條會落空
+    assert len({hhmmss(x) for x in (s1, s2, s3)}) == 3, "fixture 自身要保證三步時刻互異"
+
+    # ── 情境 4b：呼叫起點早於「第一筆可呈現事件」—— 步驟列要印呼叫起點 ────────────────
+    # ⚠ 上面那個 fixture 每一筆都有可呈現內容，`analyze` 的正規化在那裡是 **no-op**（整段刪掉
+    # 也照樣過），所以「呼叫起點 vs 第一筆可呈現事件」這一格等於零覆蓋。實測近六成呼叫的首事件
+    # 沒有可呈現內容（純 thinking 簽章等），兩者可以差 1〜30+ 秒——那正是不變量①要釘的東西。
+    sid4b = "019f0200-0000-7000-8000-0000000005a6"
+    c0 = "2026-05-28T10:00:05.000Z"        # 呼叫起點：只有空白 thinking，畫不出來
+    c1 = "2026-05-28T10:00:38.000Z"        # 同一次呼叫（同 message.id）的第一筆可呈現內容
+    html, md = build("callstart", [
+        user("f1", None, "2026-05-28T10:00:00.000Z", sid4b, "呼叫起點CALLSTART。"),
+        asst("f2", "f1", c0, sid4b, "p1", [{"type": "thinking", "thinking": "   "}]),
+        asst("f3", "f2", c1, sid4b, "p1", txt("第一步的內容。")),
+        asst("f4", "f3", "2026-05-28T10:01:10.000Z", sid4b, "p2", txt("第二步。")),
+    ], ["2026-05-28T10:00:00.000Z"], [])
+    assert "步驟 1 · " + hhmmss(c0) + "</span>" in html, \
+        "步驟列要印**呼叫起點**：首事件雖然畫不出來，那次呼叫就是在那時開始的。缺少 " + hhmmss(c0)
+    assert "步驟 1 · " + hhmmss(c1) + "</span>" not in html, \
+        "步驟 1 不得改印「第一筆可呈現事件」的時刻（" + hhmmss(c1) + "）"
+    assert hhmmss(c0) != hhmmss(c1), "fixture 自身要保證兩個時刻不同，否則上面兩條斷言沒有意義"
+
+    # ── 情境 5：切換與相鄰回合落在**同一秒**內 —— 次秒先後不得被截掉 ─────────────
+    # history 的時刻本來就有毫秒。若切換時刻被截成整秒，同一秒內「比切換更早」的那一則
+    # 會被判成在切換之後，分隔線就畫早了。
+    sid5 = "019f0200-0000-7000-8000-0000000005a5"
+    html, md = build("subsec", [
+        user("e1", None, "2026-05-28T10:00:00.000Z", sid5, "同秒第一則FIRSTMARK。"),
+        asst("e2", "e1", "2026-05-28T10:00:00.100Z", sid5, "m1", txt("同秒第二則SECONDMARK。")),
+        user("e3", "e2", "2026-05-28T10:00:00.900Z", sid5, "換帳號後THIRDMARK。"),
+        asst("e4", "e3", "2026-05-28T10:00:01.500Z", sid5, "m2", txt("之後的回覆。")),
+    ], ["2026-05-28T09:59:00.000Z"], ["2026-05-28T10:00:00.900Z"])
+    assert html.count('class="acct-sep"') == 1, "同秒情境仍應只有一條分隔線"
+    assert html.index("SECONDMARK") < html.index('class="acct-sep"') < html.index("THIRDMARK"),         "切換時刻的次秒精度被截掉時，分隔線會畫在同一秒內較早的那一則之前"
+    assert md.index("SECONDMARK") < md.index("換了登入帳號") < md.index("THIRDMARK"),         "MD 同上"
+
+    # ── 情境 6：跨午夜 —— 切帳號線要排在它所屬那天的日期分隔線之後 ─────────────
+    # 排在日期線之前會被讀成「換日之前就換了帳號」。
+    sid6 = "019f0200-0000-7000-8000-0000000005a6"
+    html, md = build("midnight", [
+        user("f1", None, "2026-05-28T15:59:30.000Z", sid6, "換日前DAYONE。"),
+        asst("f2", "f1", "2026-05-28T15:59:35.000Z", sid6, "m1", txt("前一天的回覆。")),
+        user("f3", "f2", "2026-05-28T16:01:00.000Z", sid6, "換日後DAYTWO。"),
+        asst("f4", "f3", "2026-05-28T16:01:05.000Z", sid6, "m2", txt("後一天的回覆。")),
+    ], ["2026-05-28T15:59:30.000Z"], ["2026-05-28T16:01:00.000Z"])
+    day_seps = [m.start() for m in re.finditer(r'class="day-sep"', html)]
+    assert len(day_seps) == 2, "跨日應有兩條日期分隔線（起始日＋換日），實得 %d" % len(day_seps)
+    i_acct = html.index('class="acct-sep"')
+    assert day_seps[1] < i_acct, "切帳號線要排在它所屬那天的日期分隔線之後"
+    assert html.index("DAYONE") < day_seps[1] < i_acct < html.index("DAYTWO"), \
+        "順序應為：前一天的回合 → 日期線 → 切帳號線 → 後一天的回合"
+    assert md.count("換了登入帳號") == 1, "MD 也應恰有一條"
+    # MD 沒有日期分隔線：跨日之後的切帳線要自己帶日期，否則只印時分會被讀成起始日的時刻。
+    # HTML 那邊有日期線可讀，維持精簡（不重複印日期）。
+    want6 = datetime.fromtimestamp(ep("2026-05-28T16:01:00.000Z")).strftime("%m-%d")
+    i_md6 = md.index("換了登入帳號")
+    assert want6 in md[i_md6:i_md6 + 40], "MD 跨日後的切帳線要帶日期：" + md[i_md6:i_md6 + 40]
+    i_h6 = html.index('class="acct-sep"')
+    assert want6 not in html[i_h6:i_h6 + 60], (
+        "HTML 已有日期線，切帳線不必再印一次日期：" + html[i_h6:i_h6 + 60])
+
+    # 逐步時刻要帶完整日期的 tooltip：跨午夜時光看 00:01:00 無從判斷是哪一天
+    step_html = v.render_step_meters(2, None, t=int(datetime(2026, 5, 29, 0, 1, 0).timestamp()))
+    assert 'title="2026-05-29 00:01:00"' in step_html, \
+        "逐步分隔列應把完整日期掛在 title：" + step_html
+
+    # ── 指紋精度：必須與「顯示定位」同精度 ───────────────────────────────────
+    # 同一秒內的切換時刻變動（.700 → .300）會跨過某個回合而改變分隔線位置；指紋若截成整秒，
+    # 增量建置就會沿用畫錯位置的舊頁。
+    sigp = root / "sig.jsonl"
+    sigp.write_text("{}", encoding="utf-8")
+    assert v.session_signature(sigp, [1780000000.700]) != v.session_signature(sigp, [1780000000.300]), \
+        "同一秒內的切換時刻變動必須改變 session 指紋"
+
+    # ── 情境 7：切換早於第一則 —— 與「晚於最後一則不畫」對稱，兩端都不畫 ───────────
+    # 線的作用是把前後隔開；上方空無一物的線會暗示「這份 transcript 裡看得到一次切換」。
+    sid7 = "019f0200-0000-7000-8000-0000000005a7"
+    html, md = build("before", [
+        user("g1", None, "2026-05-28T10:00:00.000Z", sid7, "整場都屬於新帳號MARKFIRST。"),
+        asst("g2", "g1", "2026-05-28T10:00:05.000Z", sid7, "m1", txt("回覆。")),
+    ], ["2026-05-28T09:00:00.000Z"], ["2026-05-28T09:30:00.000Z"])
+    assert html.count('class="acct-sep"') == 0 and md.count("換了登入帳號") == 0, (
+        "切換早於第一則時不畫（與晚於最後一則同一條規則）")
+
+    # ── 情境 8：開頭那幾則沒有時間 —— 線的上方不是空的，仍要畫 ────────────────────
+    # 「早於第一個**有時間**的回合」與「上面沒有回合」不是同一件事：開頭沒有時間戳時，
+    # 拿前者當判準會把落在它們之後的切換整條吃掉（HTML 與 MD 都不見）。
+    sid8 = "019f0200-0000-7000-8000-0000000005a8"
+    html, md = build("undated", [
+        user("h1", None, None, sid8, "沒有時間的第一則NOSTAMP。"),
+        user("h2", "h1", "2026-05-28T10:10:00.000Z", sid8, "換帳號後AFTERSTAMP。"),
+        asst("h3", "h2", "2026-05-28T10:10:05.000Z", sid8, "m1", txt("回覆。")),
+    ], ["2026-05-28T10:00:00.000Z"], ["2026-05-28T10:05:00.000Z"])
+    assert html.count('class="acct-sep"') == md.count("換了登入帳號") == 1, (
+        "開頭的回合沒有時間時，落在它之後的切換仍要畫，且兩種輸出一致")
+    # ⚠ 頁面／檔頭標題取自第一個**有時間**的回合，也含 AFTERSTAMP；位置比較要看主對話裡
+    # 那一次（rindex），拿 index 會比到標題上去。
+    assert html.index("NOSTAMP") < html.index('class="acct-sep"') < html.rindex("AFTERSTAMP"), (
+        "線要落在沒有時間的那一則與第一個有時間的回合之間")
+    assert md.index("NOSTAMP") < md.index("換了登入帳號") < md.rindex("AFTERSTAMP"), "MD 同上"
+
+    # ── 情境 9：切換時刻與前一則**完全相等** —— 收在新帳號的 user 之前 ──────────────
+    # 切換時刻取自新帳號的第一個 prompt；同刻的 assistant 是切換前那一則，
+    # 線收在它前面會把前後兩邊畫反（情境 5 的次秒版本擋不到完全相等這一格）。
+    sid9 = "019f0200-0000-7000-8000-0000000005a9"
+    teq = "2026-05-28T10:10:00.000Z"
+    html, md = build("tie", [
+        user("i1", None, "2026-05-28T10:09:00.000Z", sid9, "切換前TIEBEFORE。"),
+        asst("i2", "i1", teq, sid9, "m1", txt("同刻的回覆TIEASST。")),
+        user("i3", "i2", teq, sid9, "換帳號後TIEAFTER。"),
+        asst("i4", "i3", "2026-05-28T10:10:30.000Z", sid9, "m2", txt("之後的回覆。")),
+    ], ["2026-05-28T10:09:00.000Z"], [teq])
+    assert html.count('class="acct-sep"') == md.count("換了登入帳號") == 1, "同刻情境仍只有一條線"
+    assert html.index("TIEASST") < html.index('class="acct-sep"') < html.index("TIEAFTER"), (
+        "時刻完全相等時，線要收在新帳號的 user 之前，不是同刻 assistant 之前")
+    assert md.index("TIEASST") < md.index("換了登入帳號") < md.index("TIEAFTER"), "MD 同上"
+
+    # ── 情境 10：切換不屬於它插進去的那一天 —— 標籤要自己帶日期 ─────────────────────
+    # 切換與下一個可見回合相隔一天以上（中間那些畫不出來）時，線會落在後者的日期底下；
+    # 標籤只印時分就會被讀成那一天的時刻。兩端相隔 24h 以上，任何時區下本地日期都不同。
+    sid10 = "019f0200-0000-7000-8000-0000000005aa"
+    mark10 = "2026-05-29T10:00:00.000Z"
+    html, md = build("crossday", [
+        user("j1", None, "2026-05-28T10:00:00.000Z", sid10, "切換前CROSSBEFORE。"),
+        asst("j2", "j1", "2026-05-28T10:00:05.000Z", sid10, "m1", txt("回覆。")),
+        user("j3", "j2", "2026-05-30T10:00:00.000Z", sid10, "兩天後CROSSAFTER。"),
+        asst("j4", "j3", "2026-05-30T10:00:05.000Z", sid10, "m2", txt("後來的回覆。")),
+    ], ["2026-05-28T10:00:00.000Z"], [mark10])
+    want_day = datetime.fromtimestamp(ep(mark10)).strftime("%m-%d")
+    i_sep = html.index('class="acct-sep"')
+    assert want_day in html[i_sep:i_sep + 200], (
+        "線所屬的日期與插入處不同時，標籤要帶日期（缺 %s）：%s" % (want_day, html[i_sep:i_sep + 160]))
+    i_sep_md = md.index("換了登入帳號")
+    assert want_day in md[i_sep_md - 40:i_sep_md + 60], "MD 同上：" + md[i_sep_md - 40:i_sep_md + 60]
+    # 位置也要對：線屬於更早的那一天，排在後一天的日期列**之後**會讓畫面上的時間軸倒退
+    # （日期列寫 05-30、它下面第一條線卻寫 05-29）。
+    day_seps10 = [m.start() for m in re.finditer(r'class="day-sep"', html)]
+    assert len(day_seps10) == 2, "跨兩天應有兩條日期線，實得 %d" % len(day_seps10)
+    assert day_seps10[0] < i_sep < day_seps10[1], (
+        "屬於更早那一天的切帳號線，要排在後一天的日期列之前")
+
+    # 同一天就不要多印日期（不是「一律加上去」，那會讓常見情形變吵）
+    ts10 = ep(mark10)
+    same_day = datetime.fromtimestamp(ts10).strftime("%Y-%m-%d")
+    assert v.acct_sep_label(ts10, same_day) == (
+        "換了登入帳號 · " + datetime.fromtimestamp(ts10).strftime("%H:%M")), (
+        "所屬日期相同時只印時分：" + v.acct_sep_label(ts10, same_day))
+    assert want_day in v.acct_sep_label(ts10, "2999-01-01"), "日期不同時要補上日期"
+    assert v.acct_sep_label(ts10) == v.acct_sep_label(ts10, ""), "沒給日期就維持原樣"
+
+    # ── 情境 11：增量建置 —— 切換時刻在同一秒內移動，沿用的頁面必須跟著重建 ─────────────
+    # 那份時刻來自 repo 外的 history.jsonl：transcript 一個 byte 都沒動，分隔線位置卻會變。
+    # 只比對指紋字串看不出這件事——要真的建置兩次，看沿用那條路徑上的線有沒有跟著動。
+    sid11 = "019f0200-0000-7000-8000-0000000005ab"
+    tmp11 = root / "incr"
+    cfg_a11, cfg_b11 = tmp11 / "cfgA", tmp11 / "cfgB"
+    proj11 = cfg_a11 / "projects" / "demo-proj"
+    proj11.mkdir(parents=True, exist_ok=True)
+    (cfg_b11 / "projects").mkdir(parents=True, exist_ok=True)
+    (proj11 / (sid11 + ".jsonl")).write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        user("k1", None, "2026-05-28T10:00:00.000Z", sid11, "第一則INCRONE。"),
+        asst("k2", "k1", "2026-05-28T10:00:00.500Z", sid11, "m1", txt("同秒的回覆INCRTWO。")),
+        user("k3", "k2", "2026-05-28T10:00:00.900Z", sid11, "第三則INCRTHREE。"),
+        asst("k4", "k3", "2026-05-28T10:00:02.000Z", sid11, "m2", txt("最後的回覆。")),
+    ]), encoding="utf-8")
+    out11 = tmp11 / "out"
+    home11 = tmp11 / "home"
+    home11.mkdir(parents=True, exist_ok=True)
+    env11 = dict(os.environ, HOME=str(home11), USERPROFILE=str(home11))
+
+    def build11(mark_iso):
+        """只改 history 的切換時刻（transcript 不動），重跑一次建置。回傳 (輸出訊息, html)。"""
+        for cfg, rows in ((cfg_a11, ["2026-05-28T09:59:00.000Z"]), (cfg_b11, [mark_iso])):
+            (cfg / "history.jsonl").write_text("\n".join(
+                json.dumps({"display": "x", "timestamp": int(ep(x) * 1000), "sessionId": sid11})
+                for x in rows) + "\n", encoding="utf-8")
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--claude-source", "A=" + str(cfg_a11 / "projects"),
+             "--claude-source", "B=" + str(cfg_b11 / "projects"),
+             "--no-codex", "--out", str(out11)],
+            capture_output=True, text=True, encoding="utf-8", env=env11)
+        assert r.returncode == 0, "非零退出\nSTDOUT:" + r.stdout + "\nSTDERR:" + r.stderr
+        page = [q for q in (out11 / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+        return (r.stdout + r.stderr), page
+
+    _, h11a = build11("2026-05-28T10:00:00.700Z")
+    assert h11a.index("INCRTWO") < h11a.index('class="acct-sep"') < h11a.index("INCRTHREE"), (
+        ".700 的切換要落在同一秒內的前後兩則之間")
+    log11b, h11b = build11("2026-05-28T10:00:00.300Z")
+    assert "新建/更新 1" in log11b, (
+        "切換時刻在同一秒內變動（transcript 沒動）必須觸發重建，實得：" + log11b.strip()[-200:])
+    assert h11b.rindex("INCRONE") < h11b.index('class="acct-sep"') < h11b.index("INCRTWO"), (
+        "重建後分隔線要跟著移到 .300 該在的位置")
+    log11c, h11c = build11("2026-05-28T10:00:00.300Z")
+    assert "沿用 1" in log11c, "什麼都沒變就該沿用，實得：" + log11c.strip()[-200:]
+    assert h11c.rindex("INCRONE") < h11c.index('class="acct-sep"') < h11c.index("INCRTWO"), (
+        "沿用的頁面仍須保有位置正確的分隔線")
+
+    # ── 毫秒正規化：指紋用 %.3f，切換時刻的精度就不得比毫秒更細 ────────────────────
+    # 更細的話，同一秒內相差次毫秒、卻落在同一回合**兩側**的兩個標記會產生相同的指紋字串
+    # → 顯示定位看得出差異、指紋看不出來 → 增量建置沿用畫錯位置的舊頁。
+    cfg_m1, cfg_m2 = root / "ms" / "cfgA", root / "ms" / "cfgB"
+    for c in (cfg_m1, cfg_m2):
+        c.mkdir(parents=True, exist_ok=True)
+    sid_ms = "019f0200-0000-7000-8000-0000000005ac"
+    (cfg_m1 / "history.jsonl").write_text(json.dumps(
+        {"display": "x", "timestamp": 1780000000000, "sessionId": sid_ms}) + "\n", encoding="utf-8")
+    (cfg_m2 / "history.jsonl").write_text(json.dumps(
+        {"display": "x", "timestamp": 1780000600000.4001, "sessionId": sid_ms}) + "\n", encoding="utf-8")
+    mk = v.load_account_switches([cfg_m1, cfg_m2]).get(sid_ms) or []
+    assert mk, "同一 sessionId 出現在兩個帳號的 history，應偵測得到切換"
+    assert all(float("%.3f" % t) == t for t in mk), (
+        "切換時刻必須正規化到毫秒，否則會與 session_signature 的 %%.3f 精度不一致：" + repr(mk))
+    assert v.session_signature(sigp, mk) == v.session_signature(sigp, [round(x, 3) for x in mk]), (
+        "指紋不得因次毫秒殘留而漂移")
+
+    # ── 邊界：沒有時間的回合不推進索引；取不出來的時刻不顯示也不炸 ─────────────────
+    marks = [100, 200]
+    assert v.pending_acct(marks, 0, {"dt": None}) == ([], 0), "沒有時間的回合不得吃掉切換點"
+    assert v.pending_acct(marks, 0, {"dt": datetime.fromtimestamp(150, timezone.utc)}) == ([100], 1), \
+        "只補畫已經跨過的那些"
+    # 完全相等：同刻的 assistant 不收線（它在切換之前），同刻的 user 才收
+    at100 = datetime.fromtimestamp(100, timezone.utc)
+    assert v.pending_acct(marks, 0, {"dt": at100, "role": "assistant"}) == ([], 0), (
+        "同刻的 assistant 是切換前那一則，不得在它之前收線")
+    assert v.pending_acct(marks, 0, {"dt": at100, "role": "user"}) == ([100], 1), (
+        "同刻的 user 是新帳號的第一則，線要收在它之前")
+
+    # acct_marks 最前端的判準：看「上面還有沒有回合」，不是「早於第一個有時間的回合」
+    class _Fake:
+        pass
+    at200 = datetime.fromtimestamp(200, timezone.utc)
+    f1 = _Fake(); f1.acct_times = [150.0]; f1.main_groups = [{"dt": None}, {"dt": at200}]
+    assert v.acct_marks(f1) == [150.0], "第一個有時間的回合上面還有回合 → 不得擋掉"
+    f2 = _Fake(); f2.acct_times = [150.0]; f2.main_groups = [{"dt": at200}]
+    assert v.acct_marks(f2) == [], "上面真的沒有回合 → 照舊不畫"
+    f3 = _Fake(); f3.acct_times = [150.0]; f3.main_groups = [{"dt": None}]
+    assert v.pending_acct(v.acct_marks(f3), 0, {"dt": None}) == ([], 0), (
+        "整場都沒有時間的回合：留著標記也畫不出來，不得因此炸掉")
+    # epoch_str 的契約：取不出來就回空字串，絕不讓建置失敗。失敗路徑用「一定超出範圍」的值測
+    # ——負值在各平台行為不同（Windows 丟 OSError、POSIX 直接給 1969），不能拿來當跨平台契約。
+    BAD = 10 ** 18
+    assert v.epoch_str(None) == "", "None 應回空字串"
+    assert v.epoch_str(BAD) == "", "超出範圍的時刻應回空字串，不得拋例外"
+    assert v.epoch_str(0) != "", "0 是合法時刻（1970-01-01），不得與「取不出來」同形"
+    assert v.render_step_meters(1, None, t=BAD).startswith("<div"), "取不出時刻仍要畫得出分隔列"
+    assert "步驟 1</span>" in v.render_step_meters(1, None, t=BAD), "取不出時刻就整個不印，不留半截"
+    assert v.acct_sep_label(BAD) == "換了登入帳號", "取不出時刻就只留標籤，不留半截"
+    print("OK: acct separator and step time test passed")
+
 if __name__ == "__main__":
     test_smoke()
     test_search()
@@ -2096,3 +2578,4 @@ if __name__ == "__main__":
     test_codex_ai_label()
     test_codex_item_completed_user()
     test_account_switch_cause()
+    test_acct_separator_and_step_time()

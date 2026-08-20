@@ -47,7 +47,7 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
-RENDERER_VERSION = 38  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
+RENDERER_VERSION = 39  # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -450,6 +450,19 @@ def local_str(dt, fmt="%Y-%m-%d %H:%M"):
 WEEKDAYS_TW = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 
 
+def epoch_str(ts, fmt="%H:%M"):
+    """epoch 秒 → 本地時間字串；取不出來就回空字串。
+
+    比照 `local_str` 的防護：`datetime.fromtimestamp` 對負值／極大值在部分平台會丟 `OSError`，
+    顯示層不該因為一個取不出來的時刻就讓整頁建置失敗。"""
+    if ts is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).strftime(fmt)
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
 def day_label(dt):
     """本地日期＋星期，例如 2026-05-21 週三（給 session 頁的換日分隔線用）。"""
     if not dt:
@@ -659,6 +672,7 @@ class Session:
         self.ai_title = ""
         self.rename = ""
         self.exec_origin = False    # Codex 無頭執行（session_meta.originator == "codex_exec"）
+        self.acct_times = []        # 切帳號時刻（epoch 秒，含小數；analyze 時由 acct_switches 填）
         self.kind = "chat"          # 型態 review/exec/chat（analyze 時判定，見 REVIEW_RE 註解）
         self.models = []
         self.tok_out = 0
@@ -1301,10 +1315,16 @@ def _cause_key(t, n):
 
 
 def _epoch(e):
-    """事件的 epoch 秒（int）或 None——與 cache_steps 存的 int(dt.timestamp()) 同源，供成因 join。
-    同一秒的多次呼叫由 `_cause_key` 的出現序號消歧義。"""
+    """事件所屬的 epoch 秒（int）或 None——供 `_step` 區塊的 `t`（顯示用時刻與「距上一步」）。
+
+    ⚠ **用 `math.floor` 不用 `int()`**：`int()` 對負值是往零截（`-0.5` → `0`），會把 1969 年的
+    時刻顯示成 1970 年——那就不是「那一步自己的時刻」了。floor 取的才是「包含這個時刻的那一秒」。
+    `t >= 0` 時兩者完全相同，真實資料的行為不變。
+
+    ⚠ 本函式**不是成因 join 的鍵**：join 走的是 `message.id`（見 `analyze` 裡的 `key_by_mid`），
+    鍵由 `_cause_key` 從 `cache_steps` 算。兩邊不共用本函式，所以這裡取 floor 不會造成錯位。"""
     dt = e.get("_dt")
-    return int(dt.timestamp()) if dt else None
+    return math.floor(dt.timestamp()) if dt else None
 
 
 def _new_turn_usage():
@@ -1528,6 +1548,9 @@ def analyze(s, acct_switches=None):
     s.n_turns = len(s.main_groups) + len(s.side_groups)
     _collect_usage(s)
     s.cache_steps, s.cache_models, s.cache_events, _step_mids = collect_cache_steps(s, acct_switches)
+    # 顯示層要的是**未被截成整秒**的切換時刻（`cache_events` 裡那份是整秒，給歸因用的）。
+    # 兩者同源於 load_account_switches，精度不同各取所需。
+    s.acct_times = sorted((acct_switches or {}).get(s.session_id, ()))
     s.waste_n, s.waste_usd, s.waste_partial = session_waste(s)
     # 步驟時間正規化成「該次呼叫的起點」＝該 message.id 第一筆事件的時間，與 cache_steps 同鍵。
     # 必要原因：`_step` 標記是掛在第一筆**有可呈現內容**的事件上（group_turns 對 assistant 有
@@ -1840,7 +1863,14 @@ def load_account_switches(config_dirs, health=None) -> dict:
         prev_acc = None
         for t, acc in clean:
             if prev_acc is not None and acc != prev_acc:
-                marks.append(int(t))       # 新帳號的第一個 prompt＝切換已經發生
+                # 新帳號的第一個 prompt＝切換已經發生。**保留次秒精度**：history 的時刻本來就有
+                # 毫秒，截成整秒會讓「同一秒內、但比切換更早」的那一則被判成在切換之後。
+                # ⚠ 一律正規化到**毫秒**（history 的原生精度）：顯示定位用這個值，
+                # `session_signature` 也用同一個值（`%.3f`）。兩邊必須同精度——留著比毫秒更細的
+                # 位數，指紋就會把「落在同一回合兩側」的兩個標記寫成同一個字串，增量建置於是
+                # 沿用畫錯位置的舊頁。歸因那條線不受影響：`collect_cache_steps` 的 acct 事件
+                # 仍各自 int() 取整秒。
+                marks.append(round(t, 3))
             prev_acc = acc
         if marks:
             out[sid] = marks
@@ -2479,14 +2509,28 @@ def render_turn_meters(group):
     return out
 
 
-def render_step_meters(idx, u, cause=None, gap=None):
+def render_step_meters(idx, u, cause=None, gap=None, t=None):
     """回合內單一步驟（API 呼叫）的分隔列：步驟序號＋該步的快取% / (可勾)細分 / ctx / 產出，
     另加 API 自報的失效成因（有才出現）與可勾選的「距上一步 / effort」。
     沿用 m-cache/m-in/m-cw/m-cr/m-ctx/m-out class，與整段彙總共用同一組勾選開關（cost 不在步驟層顯示）。
     冷啟著色分兩級：真失效（閒置過期/異常逐出）紅底白字；結構性或未歸因（首呼叫/回合內斷點…）中性灰，
-    並在 title 說明成因。紅標＝有證據是真的快取失效；灰＝沒命中但非失效（或未分析，如 Codex）。"""
+    並在 title 說明成因。紅標＝有證據是真的快取失效；灰＝沒命中但非失效（或未分析，如 Codex）。
+
+    `t`＝這一步的 epoch 秒（`_step` 區塊的 `t`），`analyze` 已把它正規化成**該次呼叫的起點**。
+    標上時刻，頁面上才找得到「某個時間點發生了什麼事」。
+
+    ⚠ **逐步時刻常比正上方的回合標頭更早**（本機語料上多數多步回合都如此；精確筆數隨語料
+    浮動，重量測的口徑見 `planning/cache-attribution-next.md`），那不是 bug：
+    步驟列所在的是 assistant 回合，它的標頭時間是**第一筆有可呈現內容的事件**，而呼叫起點在
+    那之前——一次呼叫往往先產生思考或工具呼叫，之後才有可呈現的內容。兩個值各自都對。"""
+    stamp = epoch_str(t, "%H:%M:%S")
+    when = f" · {stamp}" if stamp else ""
+    # 版面只印鐘點，完整日期掛在同一個 span 的 title——跨午夜的回合裡光看 00:01:00 無從判斷
+    # 是哪一天；與回合標頭 `class="when"` 的 title 同一個作法，也不多包一層 span。
+    full = epoch_str(t, "%Y-%m-%d %H:%M:%S")
+    ntip = f' title="{esc_attr(full)}"' if full else ""
     if not u:
-        return f'<div class="step-sep"><span class="step-n">步驟 {idx}</span></div>'
+        return f'<div class="step-sep"><span class="step-n"{ntip}>步驟 {idx}{when}</span></div>'
     pct = _pct_display(u["cache_read"], u["total_in"])
     # 冷/熱的界線一律用整數交叉相乘（與 _step_cold／_acc_turn_usage／報告同一判準），不用四捨五入後的
     # pct——否則 24.6〜24.99% 這種邊界會顯示成「⚡25% 沒著色」卻同時掛著整段失效的 ⚠，自相矛盾。
@@ -2501,7 +2545,7 @@ def render_step_meters(idx, u, cause=None, gap=None):
         cold = " " + _cold_display(cause)
         note = _COLD_CAUSE_NOTE.get(cause)
         title = ("此步驟未命中快取——" + note) if note else "此步驟未命中快取（未歸因，多為暖機/瑣碎呼叫或未分析來源）"
-    return (f'<div class="step-sep"><span class="step-n">步驟 {idx}</span>'
+    return (f'<div class="step-sep"><span class="step-n"{ntip}>步驟 {idx}{when}</span>'
             f'<span class="meter m-cache{cold}" title="{esc_attr(title)}">⚡{pct}%</span>'
             + _miss_meter(u.get("miss"), u.get("miss_tok", 0), u.get("miss_usd"),
                           partial=(bool(u["total_in"]) and not cold_now),
@@ -2567,7 +2611,8 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         t = b.get("type")
         if t == "_step":
             if multi_step:
-                parts.append(render_step_meters(b.get("idx", 0), b.get("u"), b.get("cause"), b.get("gap")))
+                parts.append(render_step_meters(b.get("idx", 0), b.get("u"), b.get("cause"),
+                                                b.get("gap"), b.get("t")))
             continue
         if t == "text":
             raw = b.get("text") or ""
@@ -2606,6 +2651,84 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
             f'<div class="body">{"".join(parts)}</div></div>')
 
 
+def acct_marks(s):
+    """這場 session 的切帳號時刻（epoch 秒，含小數，升冪）。
+
+    來源是 `analyze()` 從 `load_account_switches` 填進來的 `s.acct_times`，**不是** `cache_events`
+    裡那份——那份被 `int()` 截成整秒（歸因與整秒的步驟時間比對，本來就只需要整秒），
+    拿來跟回合的 `dt.timestamp()`（含毫秒）比較會讓同一秒內、但比切換更早的那一則被判成在切換之後。
+    兩者同源、精度不同，各取所需；這裡不另拉資料線，也不碰任何成因判斷。"""
+    marks = sorted(getattr(s, "acct_times", []) or [])
+    # 兩端同一條規則：線的作用是「把前後隔開」，一端沒有東西就沒有可隔的。
+    # 晚於最後一則的由 `pending_acct` 單調消耗天然不畫；最前面這端要自己擋，
+    # 否則會在整頁最上面畫一條上方空無一物的線，暗示「這份 transcript 裡看得到一次切換」。
+    # ⚠ 判準是**上面還有沒有回合**，不是「早於第一個有時間的回合」——開頭那幾則沒有時間時
+    # 兩者不是同一件事：線會畫在第一個有時間的回合之前，而那上面仍有可隔的內容。
+    # 範圍限制 SCOPE-ACCT-MARK-AFTER-LAST-TURN：涵蓋到「畫或不畫」為止——上下真的空無一物的
+    # 標記兩端都不畫，輸出上也不另外標示被略過了幾筆。詳見 planning/scope-limits.md。
+    groups = getattr(s, "main_groups", []) or []
+    first_i = next((i for i, g in enumerate(groups) if g.get("dt")), None)
+    if first_i is None or first_i > 0:
+        # 沒有任何有時間的回合（`pending_acct` 推不動，天然畫不出來）；
+        # 或第一個有時間的回合前面還有回合 → 線的上方不是空的，這裡不擋。
+        return marks
+    # ⚠ **要丟掉哪些，直接問 `pending_acct`，不要另寫一個比較。** 「這個標記收在這一則之前嗎」
+    # 是同一條規則，各寫一份就會在邊角分岔——`ts > dt` 與 `pending_acct` 的
+    # 「`< gt` 或（`== gt` 且該則是 user）」對**時刻完全相等**的處理不同：首則是 assistant 時
+    # 前者把它丟掉，但它真正該畫的位置在第二則之前，上面明明有第一則可隔。
+    # `pending_acct` 從 0 開始單調消耗，吐出來的必定是 marks 的前綴，所以切掉那段就是答案。
+    dropped, _ = pending_acct(marks, 0, groups[first_i])
+    return marks[len(dropped):]
+
+
+def pending_acct(marks, i, group):
+    """回合 `group` 之前應補畫幾條切帳號線。回傳 (要畫的時刻 list, 新索引)。
+
+    沒有時間的回合不推進索引——留給下一個有時間的回合一起補，才不會把線畫丟。
+    落在最後一個回合之後的切換不畫：那時對話已經結束，畫一條下面什麼都沒有的線只會誤導。
+
+    時刻**完全相等**時只在 user 回合前收線：切換時刻取自新帳號的第一個 prompt，
+    同一時刻的 assistant 回合是切換之前的那一則，線收在它前面會把前後兩邊畫反。
+
+    **範圍限制 SCOPE-ACCT-SEP-HEAD-BASIS**：定位只看回合標頭的 `dt`（＝該回合第一筆**可呈現**
+    事件的時刻）。同一次呼叫的**起點**可能更早——`_step` 的 `t` 印的就是那個，兩者常差幾十秒。
+    切換時刻落在這兩者之間時，線收在整個回合之前，而該回合的首步其實在切換之前就開始了。
+    詳見 planning/scope-limits.md 的 SCOPE-ACCT-SEP-HEAD-BASIS。"""
+    dt = group.get("dt")
+    if dt is None:
+        return [], i
+    gt = dt.timestamp()
+    take_equal = group.get("role") == "user"
+    out = []
+    while i < len(marks) and (marks[i] < gt or (take_equal and marks[i] == gt)):
+        out.append(marks[i])
+        i += 1
+    return out, i
+
+
+def acct_sep_label(ts, day=""):
+    """切帳號分隔線的文字。**只陳述實據**：這裡換了登入帳號，以及時刻。
+
+    ⚠ **不得使用成因層的判定詞。**「自行切帳號」（`acct`）在本檔是專有名詞，意思是
+    **沒撞 limit 就換**（人因可避免）；撞了 429/401 才換的，由 `classify_cache_causes` 的
+    boundary 優先規則判成 `switch`（「limit/切帳號」，不可避免）。而畫線的條件只有
+    「history 裡有這個時刻」，完全不看有沒有 limit/auth 邊界——貼上任一個判定詞，都會有
+    一部分的線與正下方那一步的成因徽章講相反的話。**自行／被迫的判斷歸成因層。**
+
+    同理也不講快取後果：畫線不要求任何命中率證據，而掛 `acct` 前要先過 `_step_cold`。
+
+    `day`（`%Y-%m-%d`）是**讀者在那個位置已經看得到的日期**——HTML 傳該則所屬的日期
+    （頁面上方就有日期分隔線可對照）。不同就補上日期，否則只印時分會被讀成當天的時刻。
+
+    ⚠ **不給 `day`＝那個輸出沒有任何日期上下文**（MD 就是這樣：回合標頭只有 `%H:%M:%S`），
+    此時一律帶日期。MD 不能挑基準：挑起始日，「切換在起始日、下一則在數日後」那格會裸奔；
+    挑插入處那一則的日期，「切換在更早那天」那格又會裸奔——兩格都只有「一律帶」才自洽。"""
+    stamp = epoch_str(ts, "%H:%M")
+    if stamp and epoch_str(ts, "%Y-%m-%d") != day:
+        stamp = epoch_str(ts, "%m-%d %H:%M")
+    return f"換了登入帳號 · {stamp}" if stamp else "換了登入帳號"
+
+
 def render_session_html(s: Session, index_href: str, memory_href: str = "") -> str:
     if not hasattr(s, "main_groups"):
         analyze(s)
@@ -2614,17 +2737,45 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
     ai = ai_name(s.source_kind)          # 回合標頭 AI 那方的名（Claude/Codex）
     used = set()
     rendered_sub = set()
-    # 主對話：換日時插入日期分隔線
+    # 主對話：換日插日期分隔線；跨過切帳號時刻插切帳號分隔線
     turns = []
     last_day = None
+    amarks, acct_i = acct_marks(s), 0
+
+    def sep_div(ts, day):
+        # ⚠ 後綴**不指向「該步的成因徽章」**：單步回合根本不畫逐步分隔列（`render_turn_html`
+        # 的 multi_step 閘門），後續步驟不冷啟時也沒有成因色可看——那個指標會懸空。
+        # 「以下屬於另一個帳號」這半句在 HTML **是**成立的（線一定有下一則：`pending_acct`
+        # 不會吐出最後一則之後的標記，而「畫不出來的回合」那條分支在主對話不可達），
+        # 所以這裡保留、MD 那邊不保留。兩邊的差異是有依據的，不是分岔。
+        return (f'<div class="acct-sep"><span>🔑 {esc(acct_sep_label(ts, day))}'
+                ' — 以下屬於另一個帳號；是自行切換或撞到額度，這條線不做判定'
+                '</span></div>')
+
     for g in s.main_groups:
         h = render_turn_html(g, s.tmap, used, smap, smeta, rendered_sub, ai)
-        if not h:
-            continue
+        # 切帳號線依**所有回合**的時間推進，不看這一則在這種輸出畫不畫得出來：HTML 與
+        # Markdown 對「畫得出來」的判定並不相同（例如 redacted_thinking 只有 HTML 收），
+        # 跟著各自的結果推進，兩種輸出的分隔線條數就會不一致。
+        hits, acct_i = pending_acct(amarks, acct_i, g)
         d = local_str(g.get("dt"), "%Y-%m-%d") if g.get("dt") else ""
+        # 線相對於日期列的位置，取決於它屬於哪一天：
+        #   同一天   → 排在日期列**之後**（排在之前會讀成「換日之前就換了帳號」）
+        #   更早那天 → 排在日期列**之前**：它不屬於下面那一天，排在之後會讓時間軸倒退
+        # 兩者會分開，是因為線與下一則之間可以隔好幾天（中間那些畫不出來的回合不佔位置）。
+        earlier, same_day = [], []
+        for ts in hits:
+            (earlier if (d and epoch_str(ts, "%Y-%m-%d") not in ("", d)) else same_day).append(ts)
+        if not h:
+            # 這一則畫不出來，線仍要補（否則 MD 會多一條）。沒有日期列要插，但仍走同一條
+            # 分流順序——這條分支目前構造不出來，真的可達時排序才不會與上面那條打架。
+            turns += [sep_div(ts, d) for ts in earlier + same_day]
+            continue
+        turns += [sep_div(ts, d) for ts in earlier]
         if d and d != last_day:
             turns.append(f'<div class="day-sep"><span>{esc(day_label(g.get("dt")))}</span></div>')
             last_day = d
+        turns += [sep_div(ts, d) for ts in same_day]
         turns.append(h)
 
     inline_tids = set(rendered_sub)   # 已就地接在 Task 底下的子代理
@@ -2738,7 +2889,7 @@ function openSub(id){{var el=document.getElementById(id);if(!el)return true;
  el.scrollIntoView({{behavior:'smooth',block:'start'}});history.replaceState(null,'',  '#'+id);return false;}}
 if(location.hash.length>1){{setTimeout(function(){{openSub(location.hash.slice(1));}},0);}}
 var MET=['cache','miss','cost','in','cw','cr','ctx','out','gap','dur','eff'],
-    DEF={{cache:1,miss:1,cost:1,in:0,cw:0,cr:0,ctx:0,out:0,gap:0,dur:0,eff:0}};
+    DEF={{cache:1,miss:1,cost:1,in:0,cw:0,cr:0,ctx:0,out:0,gap:1,dur:0,eff:0}};
 function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
 function lsSet(k,v){{try{{localStorage.setItem(k,v);}}catch(e){{}}}}
 function applyMet(){{MET.forEach(function(k){{var v=lsGet('m_'+k);v=(v===null)?DEF[k]:(v==='1'?1:0);document.body.classList.toggle('hide-'+k,!v);var cb=document.getElementById('cb_'+k);if(cb)cb.checked=!!v;}});}}
@@ -2747,7 +2898,7 @@ applyMet();
 </script>
 """
     return html_page(s.title, body,
-                     body_class="hide-in hide-cw hide-cr hide-ctx hide-out hide-gap hide-dur hide-eff")
+                     body_class="hide-in hide-cw hide-cr hide-ctx hide-out hide-dur hide-eff")
 
 
 # =========================================================================
@@ -2858,6 +3009,21 @@ def render_turn_md(group, tmap, ai="Claude"):
     return f"\n### {side}{icon} · {when}{meters}{mark}\n\n" + "\n\n".join(parts) + "\n"
 
 
+# MD 的切帳號分隔線。**渲染端與搜尋端共用同一份定義**：那行不屬於任何一則回合，
+# `iter_turn_chunks` 要靠它辨識，兩邊各寫一份字串就會在改文案時默默分岔。
+MD_ACCT_SEP_PREFIX = "**🔑 "
+MD_ACCT_SEP_SUFFIX = "** — 自行切換或撞到額度都有可能，本檔不做判定"
+
+
+def is_md_acct_sep(line):
+    """這一行是不是渲染端插進去的切帳號分隔線。
+
+    ⚠ **要比整行的形狀，不能只看開頭。** 使用者自己的訊息也可以用 `**🔑 ` 開頭（粗體加鑰匙
+    emoji 沒有任何保留意義），只比前綴會把那一則的內文**靜默刪掉**——全文搜尋從此漏報那段話，
+    而且畫面上沒有任何跡象。前後綴都是本模組自己產的字串，使用者要同時撞上兩端才會誤判。"""
+    return line.startswith(MD_ACCT_SEP_PREFIX) and line.endswith(MD_ACCT_SEP_SUFFIX)
+
+
 def render_session_md(s: Session) -> str:
     if not hasattr(s, "main_groups"):
         analyze(s)
@@ -2883,8 +3049,33 @@ def render_session_md(s: Session) -> str:
         "", "---",
     ]
     ai = ai_name(s.source_kind)          # 回合標頭 AI 那方的名（Claude/Codex）
-    parts = [render_turn_md(g, s.tmap, ai) for g in s.main_groups]
-    parts = [p for p in parts if p]
+    # 切帳號分隔線：MD 也要有（否則 grep 不到），與 HTML 共用 acct_marks／pending_acct，
+    # 同一組時刻、同一條插入規則，兩邊不會分岔。
+    amarks, acct_i = acct_marks(s), 0
+    # ⚠ 這裡**不傳日期基準**：MD 全篇沒有日期可對照（回合標頭只有時分秒），任何基準都會有
+    # 一格裸奔成沒有日期的時分。不傳＝一律帶日期，理由見 `acct_sep_label` 的 docstring。
+    parts = []
+    for g in s.main_groups:
+        md = render_turn_md(g, s.tmap, ai)
+        # 與 HTML 同一條推進規則（理由見 render_session_html），兩邊條數與位置才會一致。
+        hits, acct_i = pending_acct(amarks, acct_i, g)
+        for ts in hits:
+            # ⚠ 後綴**不可照抄 HTML 那一條**（`sep_div`）：它說「以下屬於另一個帳號」，
+            # 而 MD **不一定有「以下」**——條數與位置是跟著**所有回合**推進的（理由見
+            # `render_session_html`），但有些回合只有 HTML 畫得出來（如 `redacted_thinking`）。
+            # 那種回合落在最後一則時，MD 這條線就在檔尾、下面真的什麼都沒有。HTML 沒有這一格：
+            # 反方向（HTML 畫不出來）的那條分支在主對話不可達，`sep_div` 的註解有說明。
+            # 所以 MD 只陳述實據（換了帳號、什麼時刻）、不宣稱方向；
+            # 兩種輸出的條數與位置仍然一致（不與最高不變量③衝突）。
+            sep = MD_ACCT_SEP_PREFIX + acct_sep_label(ts) + MD_ACCT_SEP_SUFFIX + "\n"
+            # ⚠ **這裡不補 `---`。** 那條橫線與這條分隔線一樣不屬於任何一則回合，但
+            # `iter_turn_chunks` 只認得 `MD_ACCT_SEP_PREFIX` 那一行 → `---` 會落進**前**一則的
+            # 搜尋內文與片段裡（而前一則屬於舊帳號）。**每多插一種裝飾，就多一個消費者得跟著
+            # 學會跳過的形狀**；回合本來就有 `### ` 標頭當視覺分界，這條粗體 🔑 行自己也夠顯眼。
+            parts.append("\n" + sep)
+        if not md:
+            continue
+        parts.append(md)
     out = "\n".join(x for x in head if x is not None) + "\n" + "\n".join(parts)
     if s.side_groups:
         sparts = [render_turn_md(g, s.tmap, ai) for g in s.side_groups]
@@ -5005,6 +5196,9 @@ details.mcard.mindex>summary{color:var(--accent)}
 .compact-sep{display:flex;align-items:center;text-align:center;color:#d2963c;font-size:12px;margin:20px 0 8px}
 .compact-sep::before,.compact-sep::after{content:"";flex:1;border-top:1px dashed rgba(210,150,60,.5)}
 .compact-sep span{padding:0 12px}
+.acct-sep{display:flex;align-items:center;text-align:center;color:var(--accent);font-size:12px;margin:20px 0 8px}
+.acct-sep::before,.acct-sep::after{content:"";flex:1;border-top:1px dashed var(--accent);opacity:.5}
+.acct-sep span{padding:0 12px}
 .compact-sum>summary{color:#d2963c}
 .sub-toc{margin:12px 0;border:1px solid var(--border);border-radius:8px;background:var(--panel2);padding:6px 12px}
 .sub-toc>summary{cursor:pointer;color:var(--muted);font-size:13px}
@@ -5127,11 +5321,11 @@ def iter_codex_session_files(source: Path):
         yield sf
 
 
-def session_signature(main_path: Path, acct_marks=()) -> str:
+def session_signature(main_path: Path, marks=()) -> str:
     """主檔 + 外部子代理檔 + 同專案 memory/ 的 (檔名, mtime, size) 組合，作為變動指紋。
     把 memory 納入：memory 新增/變動/移除時，session 會重建（頁頂 🧠 連結與 row 的 mem_href 才會更新）。
 
-    `acct_marks` 是這場 session 的切帳號時刻（load_account_switches 的結果）。**必須進指紋**：
+    `marks` 是這場 session 的切帳號時刻（load_account_switches 的結果）。**必須進指紋**：
     那份資料來自 repo 外的 history.jsonl，transcript 完全沒變也可能改變歸因結果（新增一個帳號、
     還原備份都會）。不納入的話，增量建置會沿用舊 row，把 acct 歸因與「浪費」欄靜默停在舊值——
     使用者看到的是過期的結論而且沒有任何跡象。空值與非空值會產生不同字串，所以增減兩個方向都會觸發重建。"""
@@ -5150,8 +5344,11 @@ def session_signature(main_path: Path, acct_marks=()) -> str:
             parts.append(f"{tag}{p.name}:{st.st_mtime_ns}:{st.st_size}")
         except OSError:
             pass
-    if acct_marks:
-        parts.append("acct:" + ",".join(str(int(t)) for t in acct_marks))
+    if marks:
+        # ⚠ 精度必須與**顯示定位用的精度**一致。截成整秒的話，同一秒內的切換時刻變動
+        # （例如 .700 → .300，會跨過某個回合）不會改變指紋 → 增量建置沿用舊頁，
+        # 分隔線就停在錯的位置。毫秒是 history.jsonl 的原生精度，`.3f` 穩定可重現。
+        parts.append("acct:" + ",".join(f"{float(t):.3f}" for t in marks))
     return "|".join(parts)
 
 
@@ -5476,19 +5673,25 @@ def _term_pattern(text, is_phrase, flags):
 def iter_turn_chunks(md_text):
     """把 session 的 .md 切成 (錨點, 是否子代理, 角色字串, 時間, 內文)；第一個回合前的 session 標頭不納入
     （標題/專案/cwd 等 metadata 搜尋 index.html 就有，這裡專搜對話內容）。"""
+    # ⚠ 內文**尾端一律 rstrip**。回合之間插進來的東西（目前是切帳號分隔線）除了自己那一行，
+    # 前後還會帶空行，那些會落進**前**一則的內文。與其讓這裡去認得每一種插入物的形狀
+    # （認漏一種就是一個缺陷，而形狀會隨渲染端改動），不如直接不讓尾端空白有意義——
+    # 命中位置不可能落在尾端空白裡，片段本來也會把空白壓平，所以砍掉不損失任何東西。
     cur, buf = None, []
     for line in md_text.splitlines():
         m = _TURN_HEAD_RE.match(line)
         if m:
             if cur:
-                yield (*cur, "\n".join(buf))
+                yield (*cur, "\n".join(buf).rstrip())
             tm = _TIME_RE.search(m.group("rest") or "")
             cur = (m.group("a"), bool(m.group("side")), m.group("who"), tm.group(0) if tm else "")
             buf = []
         elif cur is not None:
+            if is_md_acct_sep(line):
+                continue      # 回合**之間**的切帳號分隔線：不屬於前一則，也不屬於後一則
             buf.append(line)
     if cur:
-        yield (*cur, "\n".join(buf))
+        yield (*cur, "\n".join(buf).rstrip())
 
 
 def _merge_spans(spans, length):

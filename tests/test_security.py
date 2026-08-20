@@ -162,6 +162,16 @@ def test_unknown_model_cost_is_partial():
     assert viewer.model_price("gpt-5") is None
 
 
+def _isolated_home_env(tmp):
+    """子行程用的環境：HOME／USERPROFILE 指到空目錄。
+
+    掃描起點取自 HOME（`~/.claude*`／`~/.codex`），不隔離的話測試讀到的是這台機器上
+    真實且正在變動的資料，斷言就不再只取決於 fixture。"""
+    home = Path(tmp) / "_home"
+    home.mkdir(parents=True, exist_ok=True)
+    return dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+
+
 def test_force_project_keeps_unfiltered_manifest_rows():
     tmp = Path(tempfile.mkdtemp())
     projects = tmp / "projects"
@@ -169,13 +179,16 @@ def test_force_project_keeps_unfiltered_manifest_rows():
     _write_session(projects, "proj-a", "aaaaaaaa", "Alpha request")
     _write_session(projects, "proj-b", "bbbbbbbb", "Beta request")
 
+    # ⚠ HOME 一律隔離：本工具會無條件列舉 ~/.claude* 與 ~/.codex，不隔離的話這裡會去掃
+    # 這台機器上真實、且正在被寫入的資料——結果隨環境浮動（實測曾因此偶發失敗）。
+    env = _isolated_home_env(tmp)
     subprocess.run(
         [sys.executable, str(SCRIPT), "--claude-source", f"demo={projects}", "--out", str(out)],
-        check=True, capture_output=True, text=True, encoding="utf-8")
+        check=True, capture_output=True, text=True, encoding="utf-8", env=env)
     subprocess.run(
         [sys.executable, str(SCRIPT), "--claude-source", f"demo={projects}", "--out", str(out),
          "--project", "proj-a", "--force"],
-        check=True, capture_output=True, text=True, encoding="utf-8")
+        check=True, capture_output=True, text=True, encoding="utf-8", env=env)
 
     index = (out / "index.html").read_text(encoding="utf-8")
     assert "Alpha request" in index
@@ -197,7 +210,8 @@ def test_codex_source_renders_in_own_namespace():
     subprocess.run(
         [sys.executable, str(SCRIPT), "--no-claude", "--codex-source", f"demo={codex_file}",
          "--out", str(out)],
-        check=True, capture_output=True, text=True, encoding="utf-8")
+        check=True, capture_output=True, text=True, encoding="utf-8",
+        env=_isolated_home_env(tmp))
 
     index = (out / "index.html").read_text(encoding="utf-8")
     assert "Codex hello" in index

@@ -11,6 +11,8 @@ ai_session_viewer 的煙霧測試（不含任何真實對話）。
 表格算繪、工具摺疊、圖片內嵌、/rename 標題、模型/token、不安全連結被移除、
 回合錨點（HTML id ↔ MD {#tN} 標記）與 --search 全文搜尋結果頁。
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -947,6 +949,38 @@ def test_cold_cause_badges(tmp_path=None):
         f"真冷啟那步應拿到自己的成因，實得 {by_mid}"
     assert not by_mid.get("m_x"), \
         f"沒有 usage、不在 cache_steps 裡的步不得被掛上別人的成因，實得 {by_mid}"
+    # (v36-fam3 F2) **單步回合**：不畫逐步分隔列，也不符合 ❄ 的 `n_steps >= 2` → 成因與並列標籤
+    #   原本在頁面上一個字都看不到，而 `_masked_human_note`／`_srv_excluded_note` 對讀者寫的正是
+    #   「逐步徽章會兩個都標」。規則要與多步回合一致：成因進 title、並列條件攤到版面上；
+    #   MD 沒有 title 可掛，所以成因一律攤在版面上。
+    def _one(cause, masked, n_steps=1):
+        su = {"input": 3000, "cache_create": 0, "cache_read": 100, "total_in": 3100,
+              "output": 40, "miss": "", "miss_tok": 0, "miss_usd": None,
+              "miss_usd_partial": False, "win": None, "effort": None}
+        gu = v._new_turn_usage()
+        gu.update({"input": 3000, "cache_create": 0, "cache_read": 100, "output": 40,
+                   "ctx_max": 3100, "cost": 0.01})
+        return {"role": "assistant", "u": gu, "n_steps": n_steps,
+                "blocks": [{"type": "_step", "idx": 1, "u": su, "cause": cause,
+                            "cause_masked": masked, "t": 1780000000, "gap": None}]}
+
+    g1 = _one("unavail", ["expiry"])          # 實據勝出、但同一步仍成立人因條件
+    h1, m1 = v.render_turn_meters(g1), v.turn_meters_md(g1)
+    both = v._cold_cause_label("unavail", ["expiry"])       # 「閒置過期＋伺服器不可用」
+    assert both in h1, f"單步回合的整段徽章要把並列成因攤到版面上，實得 {h1}"
+    assert both in m1, f"MD 的單步回合同樣要看得到並列成因，實得 {m1}"
+    assert "只算一次" in h1, "並列的是顯示不是記帳：title 要講明金額記在哪一邊"
+    # (v36-fam4 #2) 並列時 tooltip **不得自相矛盾**：前半句原本由 turn_cold_class 決定
+    #   （只看勝出成因 → unavail 判成「非快取失效」），後半句卻在說「閒置過期（可避免）」。
+    for bad in ("非快取失效", "含真正的快取失效"):
+        assert bad not in h1, (
+            f"並列成因時前半句不得預判「是不是失效」（與後半句打架），實得 {h1[:300]}")
+    g2 = _one("expiry", None)                 # 沒有並列條件：成因進 title（與多步的 ❄ 同規則）
+    h2, m2 = v.render_turn_meters(g2), v.turn_meters_md(g2)
+    assert v._COLD_CAUSE_NOTE["expiry"] in h2, f"單步回合的 title 要講得出成因，實得 {h2}"
+    assert v._cold_cause_label("expiry", None) in m2, f"MD 沒有 title，成因一律上版面：{m2}"
+    # ⚠ 既有的「是不是真失效」判讀不得被換掉——換掉等於把原本有的資訊換走（那是回歸不是修正）
+    assert "非快取失效" in v.render_turn_meters(_one("first", None)),         "結構性冷啟的單步回合仍要說明非失效"
     print("OK: cold cause badges test passed")
 
 
@@ -1427,7 +1461,7 @@ def test_ctx_window_and_coldest(tmp_path=None):
     g = {"n_steps": 2, "blocks": [
         {"type": "_step", "idx": 1, "u": {"cache_read": 9000, "total_in": 10000, "output": 0}},
         {"type": "_step", "idx": 2, "u": {"cache_read": 2460, "total_in": 10000, "output": 0}}]}
-    mp, mi, mc, mcold = v.coldest_step(g)
+    mp, mi, mc, mcold, _mm = v.coldest_step(g)
     assert (mp, mcold) == ("24.6", True), f"24.6% 最低步應判冷，且顯示 24.6 不四捨五入：{(mp, mi, mcold)}"
     g2 = {"n_steps": 2, "blocks": [
         {"type": "_step", "idx": 1, "u": {"cache_read": 9000, "total_in": 10000, "output": 0}},
@@ -1499,6 +1533,13 @@ def test_ctx_window_and_coldest(tmp_path=None):
         {"type": "_step", "idx": 2, "u": {"cache_read": 2460, "total_in": 10000, "output": 0}}]}
     r3 = v.coldest_step(g3)
     assert (r3[1], r3[3]) == (2, True), f"同 round(25%) 時要選真正最冷步並標冷：{r3}"
+    # `[1m]` 後綴本身就是視窗大小：走版本表會把它判成 200k，ctx 佔比一口氣差 5 倍
+    # （100 萬 ctx 顯示成 500%）。
+    assert v.context_window("claude-sonnet-4-5-20250929[1m]") == 1_000_000, \
+        "[1m] 後綴要直接決定視窗，不可再走版本表"
+    assert v.context_window("claude-sonnet-4-5-20250929") == 200_000, \
+        "對照組：沒有後綴的舊版本仍是 200k"
+
     # (G10) 門檻邊界的「顯示」也要與判定一致：24.6% 不得寫成 25%（報告說門檻是「< 25%」）。
     assert v._pct_display(2460, 10000) == "24.6", "剛好進位到門檻時要多給一位小數"
     assert v._pct_display(2500, 10000) == "25", "正好 25% 照常取整（它不是冷啟）"
@@ -1797,6 +1838,206 @@ def test_codex_item_completed_user(tmp_path=None):
                                     "content": [{"type": "output_text", "text": "答OUTERA。"}]}),
     ]), encoding="utf-8")
 
+    # N：`item` **容器本身**漂了——不是 dict 而是包著 dict 的 list。舊寫法直接換成 {}，
+    #    於是 item 層每一個哨兵都看不到東西；payload 這一層又不帶 role（實測 485 個 rollout 皆然），
+    #    event 層哨兵也接不到 → 整則 prompt 靜默消失、沒有任何一個計數會動。
+    sid_n = "019f0011-0000-7000-8000-000000000011"
+    (sess_dir / f"rollout-2026-06-08T05-10-00-{sid_n}.jsonl").write_text("\n".join([
+        line(140, "session_meta", {"id": sid_n, "cwd": "/x/ItemList", "cli_version": "0.999.0"}),
+        line(141, "turn_context", {"cwd": "/x/ItemList", "model": "gpt-5.6"}),
+        started(142),
+        line(143, "event_msg", {"type": "item_completed", "item": [
+            {"type": "UserMessage", "id": "item-n1",
+             "content": [{"type": "text", "text": "容器漂移CONTAINERQ。"}]}]}),
+        line(144, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答CONTAINERA。"}]}),
+    ]), encoding="utf-8")
+
+    # O：**混合內容**的 prompt（文字＋圖片）。抽得到文字 → 不會觸發「取不出文字」那個哨兵，
+    #    但圖片那個 block 被靜默丟掉。頁面看起來完整、內容卻少了一半，正是要擋的形狀。
+    sid_o = "019f0012-0000-7000-8000-000000000012"
+    (sess_dir / f"rollout-2026-06-08T05-20-00-{sid_o}.jsonl").write_text("\n".join([
+        line(150, "session_meta", {"id": sid_o, "cwd": "/x/Mixed", "cli_version": "0.148.0"}),
+        line(151, "turn_context", {"cwd": "/x/Mixed", "model": "gpt-5.6"}),
+        started(152),
+        line(153, "event_msg", {"type": "item_completed", "item": {
+            "type": "UserMessage", "id": "item-o1",
+            "content": [{"type": "text", "text": "混合內容MIXEDQ。"},
+                        {"type": "image", "image_url": "data:image/png;base64,AA"}]}}),
+        line(154, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答MIXEDA。"}]}),
+    ]), encoding="utf-8")
+
+    # P：**`payload` 容器本身**不是 dict（list 包 dict）。清成 {} 之後 ptype 是 None
+    #    → 進不了 user_message／item_completed 任何一支，`_codex_event_user_like({}, None)`
+    #    也恆為 False → 整則 prompt 靜默消失、每一個計數都停在 0。哨兵要蓋滿每一層容器。
+    sid_p = "019f0013-0000-7000-8000-000000000013"
+    (sess_dir / f"rollout-2026-06-08T05-30-00-{sid_p}.jsonl").write_text("\n".join([
+        line(160, "session_meta", {"id": sid_p, "cwd": "/x/PayloadList", "cli_version": "0.999.0"}),
+        line(161, "turn_context", {"cwd": "/x/PayloadList", "model": "gpt-5.6"}),
+        started(162),
+        line(163, "event_msg", [{"type": "user_message", "message": "payload容器漂移PAYQ。"}]),
+        line(164, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答PAYA。"}]}),
+    ]), encoding="utf-8")
+
+    # Q：`item` 被**序列化成 JSON 字串**。型別名還在字串裡，但 isinstance(raw_item, dict) 是
+    #    False → 換成 {} 之後與 N 同一種失效：整則消失且無聲。只認 list 容器接不到這一格。
+    sid_q = "019f0014-0000-7000-8000-000000000014"
+    (sess_dir / f"rollout-2026-06-08T05-40-00-{sid_q}.jsonl").write_text("\n".join([
+        line(170, "session_meta", {"id": sid_q, "cwd": "/x/ItemStr", "cli_version": "0.999.0"}),
+        line(171, "turn_context", {"cwd": "/x/ItemStr", "model": "gpt-5.6"}),
+        started(172),
+        line(173, "event_msg", {"type": "item_completed", "item": json.dumps(
+            {"type": "UserMessage", "id": "item-q1",
+             "content": [{"type": "text", "text": "字串容器STRQ。"}]}, ensure_ascii=False)}),
+        line(174, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答STRA。"}]}),
+    ]), encoding="utf-8")
+
+    # R：`response_item` 的 payload 容器漂移。`response_item` 是**認得**的外層型別，而它的
+    #    role=user 本來就是注入的脈絡（AGENTS.md 全文之類）、不是使用者打的字 → 不可歸到
+    #    「最外層型別不認得」，那既指錯層也會誤報。
+    sid_r = "019f0015-0000-7000-8000-000000000015"
+    (sess_dir / f"rollout-2026-06-08T05-50-00-{sid_r}.jsonl").write_text("\n".join([
+        line(180, "session_meta", {"id": sid_r, "cwd": "/x/RespItem", "cli_version": "0.999.0"}),
+        line(181, "turn_context", {"cwd": "/x/RespItem", "model": "gpt-5.6"}),
+        started(182),
+        line(183, "event_msg", {"type": "user_message", "message": "正常問句RESPQ。"}),
+        line(184, "response_item", [{"type": "message", "role": "user",
+                                     "content": [{"type": "input_text", "text": "注入脈絡"}]}]),
+        line(185, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答RESPA。"}]}),
+    ]), encoding="utf-8")
+
+    # S：型別名**不含 user**、也不帶 role（`Prompt`）。五個既有哨兵的判準同源，這種漂移會讓它們
+    #    **同時**是 0——正是 0.147 那次「頁面完整、prompt 一則不剩、stderr 全靜」的樣態。
+    #    形狀無關的那一條（有助理回合、卻零使用者回合）必須接住。
+    sid_s = "019f0016-0000-7000-8000-000000000016"
+    (sess_dir / f"rollout-2026-06-08T06-00-00-{sid_s}.jsonl").write_text("\n".join([
+        line(190, "session_meta", {"id": sid_s, "cwd": "/x/Shapeless", "cli_version": "0.999.0"}),
+        line(191, "turn_context", {"cwd": "/x/Shapeless", "model": "gpt-5.6"}),
+        started(192),
+        line(193, "event_msg", {"type": "item_completed", "item": {
+            "type": "Prompt", "id": "item-s1",
+            "content": [{"type": "text", "text": "無痕漂移SHAPEQ。"}]}}),
+        line(194, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答SHAPEA。"}]}),
+    ]), encoding="utf-8")
+
+    # T：與 S 同形，但這是**子代理執行緒**（session_meta.source.subagent）——本來就沒有人打字，
+    #    形狀無關那條哨兵不得對它出聲，否則每個子代理都會誤報一次。
+    sid_t = "019f0017-0000-7000-8000-000000000017"
+    (sess_dir / f"rollout-2026-06-08T06-10-00-{sid_t}.jsonl").write_text("\n".join([
+        line(200, "session_meta", {"id": sid_t, "cwd": "/x/Sub", "cli_version": "0.999.0",
+                                   "source": {"subagent": {"thread_spawn": {
+                                       "parent_thread_id": "019fef69-a1b5-7061-a9c6-a9e6652edf15",
+                                       "depth": 1}}}}),
+        line(201, "turn_context", {"cwd": "/x/Sub", "model": "gpt-5.6"}),
+        started(202),
+        line(203, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答SUBA。"}]}),
+    ]), encoding="utf-8")
+
+    # U：漂移的 prompt ＋**工具結果**。工具結果也是以 `type=="user"` 存的，所以「數 user 事件」
+    #    那種寫法在這裡會看到 1、以為沒事——但真實的使用者 prompt 一則都沒收到。
+    sid_u = "019f0018-0000-7000-8000-000000000018"
+    (sess_dir / f"rollout-2026-06-08T06-20-00-{sid_u}.jsonl").write_text("\n".join([
+        line(210, "session_meta", {"id": sid_u, "cwd": "/x/ToolOnly", "cli_version": "0.999.0"}),
+        line(211, "turn_context", {"cwd": "/x/ToolOnly", "model": "gpt-5.6"}),
+        started(212),
+        line(213, "event_msg", {"type": "item_completed", "item": {
+            "type": "Prompt", "id": "item-u1",
+            "content": [{"type": "text", "text": "漂移問句TOOLQ。"}]}}),
+        line(214, "response_item", {"type": "function_call_output", "call_id": "call-u1",
+                                    "output": "工具輸出TOOLOUT"}),
+        line(215, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答TOOLA。"}]}),
+    ]), encoding="utf-8")
+
+    # W：**一場中途才漂移**：前半舊格式收得到、後半漂成未知型別全丟。只看「有沒有收到任何
+    #    一則」的哨兵會完全穿過去（收到 1 則就閉嘴），但實際上少了一則真實發問。
+    sid_w = "019f0019-0000-7000-8000-000000000019"
+    (sess_dir / f"rollout-2026-06-08T06-30-00-{sid_w}.jsonl").write_text("\n".join([
+        line(220, "session_meta", {"id": sid_w, "cwd": "/x/MidDrift", "cli_version": "0.999.0"}),
+        line(221, "turn_context", {"cwd": "/x/MidDrift", "model": "gpt-5.6"}),
+        started(222),
+        line(223, "event_msg", {"type": "user_message", "message": "前半收得到MIDQ1。"}),
+        line(224, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答MIDA1。"}]}),
+        started(225),
+        line(226, "event_msg", {"type": "item_completed", "item": {
+            "type": "HumanTurn", "id": "item-w1",
+            "content": [{"type": "text", "text": "後半全丟MIDQ2。"}]}}),
+        line(227, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答MIDA2。"}]}),
+    ]), encoding="utf-8")
+
+    # X：**被中止的回合**沒有 prompt 是正常的（真實語料上有三份），不得誤報。
+    sid_x = "019f001a-0000-7000-8000-00000000001a"
+    (sess_dir / f"rollout-2026-06-08T06-40-00-{sid_x}.jsonl").write_text("\n".join([
+        line(230, "session_meta", {"id": sid_x, "cwd": "/x/Aborted", "cli_version": "0.999.0"}),
+        line(231, "turn_context", {"cwd": "/x/Aborted", "model": "gpt-5.6"}),
+        started(232),
+        line(233, "event_msg", {"type": "user_message", "message": "有收到ABORTQ。"}),
+        line(234, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答ABORTA。"}]}),
+        started(235),
+        line(236, "event_msg", {"type": "turn_aborted", "reason": "interrupted"}),
+    ]), encoding="utf-8")
+
+    # Y：**一個回合連送多則 prompt**（真實語料上有 38 回合／47 則的 session）。整檔拿
+    #    「回合總數 vs prompt 總數」相減的話，這種 session 的漏收會全部沉在門檻底下——
+    #    第二個回合整窗空了也不會出聲。逐回合窗記帳才抓得到。
+    sid_y = "019f001b-0000-7000-8000-00000000001b"
+    (sess_dir / f"rollout-2026-06-08T06-50-00-{sid_y}.jsonl").write_text("\n".join([
+        line(240, "session_meta", {"id": sid_y, "cwd": "/x/Queued", "cli_version": "0.999.0"}),
+        line(241, "turn_context", {"cwd": "/x/Queued", "model": "gpt-5.6"}),
+        started(242),
+        line(243, "event_msg", {"type": "user_message", "message": "連送一QUEUE1。"}),
+        line(244, "event_msg", {"type": "user_message", "message": "連送二QUEUE2。"}),
+        line(245, "event_msg", {"type": "user_message", "message": "連送三QUEUE3。"}),
+        line(246, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答QUEUEA。"}]}),
+        started(247),
+        line(248, "event_msg", {"type": "item_completed", "item": {
+            "type": "Prompt", "id": "item-y1",
+            "content": [{"type": "text", "text": "整窗空QUEUELOST。"}]}}),
+        line(249, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答QUEUEB。"}]}),
+    ]), encoding="utf-8")
+
+    # Z：(v36-fam3 F3) **舊格式** user_message 的 `message` 從字串漂成 content block 陣列。
+    #    原本是 `str(payload.get("message") or "")` → Python 的 repr 整包被當成 prompt 收下，
+    #    而三層哨兵全靜：repr 非空（不觸發「取不出文字」）、型別名還在（不觸發型別哨兵）、
+    #    不走 item 分支（不數 dropped block）。圖片 block 無聲消失、頁面看起來完整。
+    #    新格式那條路徑早就有 `_codex_content_text` ＋ unconsumed 兩層，舊格式這側要對稱。
+    sid_z = "019f001c-0000-7000-8000-00000000001c"
+    (sess_dir / f"rollout-2026-06-08T07-00-00-{sid_z}.jsonl").write_text("\n".join([
+        line(250, "session_meta", {"id": sid_z, "cwd": "/x/LegacyDrift", "cli_version": "0.999.0"}),
+        line(251, "turn_context", {"cwd": "/x/LegacyDrift", "model": "gpt-5.6"}),
+        started(252),
+        line(253, "event_msg", {"type": "user_message", "message": [
+            {"type": "text", "text": "舊格式漂移LEGACYDRIFTQ。"},
+            {"type": "image", "image_url": "data:image/png;base64,AA"}]}),
+        line(254, "response_item", {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "答LEGACYDRIFTA。"}]}),
+    ]), encoding="utf-8")
+
+    # ZR：(v36-fam4 #4) `response_item` 的**容器**漂了（list 包 dict）。助理訊息、reasoning 與
+    #    工具呼叫全走這一支 → 整場回答消失、頁面是「一則提問、零則回答」。而既有哨兵一個都
+    #    接不到：容器層那條只在「看起來像使用者發言」時計數，收尾那條形狀無關的又被
+    #    `n_ai_turns` 擋住（助理事件正好是 0）。
+    sid_zr = "019f001d-0000-7000-8000-00000000001d"
+    (sess_dir / f"rollout-2026-06-08T07-10-00-{sid_zr}.jsonl").write_text("\n".join([
+        line(260, "session_meta", {"id": sid_zr, "cwd": "/x/RespDrift", "cli_version": "0.999.0"}),
+        line(261, "turn_context", {"cwd": "/x/RespDrift", "model": "gpt-5.6"}),
+        started(262),
+        line(263, "event_msg", {"type": "user_message", "message": "回答會消失RESPDRIFTQ。"}),
+        line(264, "response_item", [{"type": "message", "role": "assistant",
+                                     "content": [{"type": "output_text", "text": "答RESPDRIFTA。"}]}]),
+    ]), encoding="utf-8")
+
     out = tmp / "out"
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "--codex-source", f"demo={tmp / 'sessions'}",
@@ -1889,6 +2130,90 @@ def test_codex_item_completed_user(tmp_path=None):
     assert "最外層型別不認得" in r.stderr, \
         f"最外層事件型別漂移應對 stderr 出聲，實得 stderr：{r.stderr}"
 
+    # N：item 容器不是 dict → 收不到回合，但**必須**出聲（舊寫法換成 {} 之後三層哨兵全都接不到）
+    n_md = md_of(sid_n)
+    assert n_md.count("### 👤 You") == 0, "認不得的容器形狀不應硬收成回合"
+    assert "CONTAINERQ" not in n_md, "沒收下的內容不應憑空出現"
+    assert r.stderr.count("型別像使用者訊息卻不認得") >= 4, \
+        f"item 容器漂移（非 dict）也要進同一個哨兵，實得 stderr：{r.stderr}"
+
+    # O：混合內容 → 文字照收，但被丟掉的 block 要有人數得出來
+    o_md = md_of(sid_o)
+    assert "MIXEDQ" in o_md, ("混合內容的文字部分仍要收得到；實得檔案清單："
+                              + repr(sorted(mds)) + "\n這一份的內容：" + o_md[:400])
+    assert "block 沒被收進來" in r.stderr, \
+        f"混合內容有 block 被丟掉時必須出聲，實得 stderr：{r.stderr}"
+    # ⚠ 這一格與 E（純圖片、取不出文字）是**不同**的哨兵：E 那條靠「抽不到任何文字」觸發，
+    #    混合內容抽得到文字，所以只有 E 那條的話這裡完全無聲。
+    assert "MIXEDQ" in o_md and o_md.count("### 👤 You") == 1, "混合內容仍是一則正常回合"
+
+    # Z：(v36-fam3 F3) 舊格式的型別漂移要走與新格式同一組檢查——文字照收、被丟掉的 block
+    #    要數得出來，而 Python 的 repr **不得**被當成 prompt 收下。
+    z_md = md_of(sid_z)
+    assert "舊格式漂移LEGACYDRIFTQ" in z_md, \
+        f"舊格式 content block 陣列的文字部分仍要收得到：{z_md[:400]}"
+    assert "'type': 'text'" not in z_md and "image_url" not in z_md, \
+        f"Python 的 repr 不得被當成 prompt 收下（三層哨兵都認不出來，只能靠這裡擋）：{z_md[:400]}"
+
+    # ZR：(v36-fam4 #4) 助理內容整批消失時必須出聲——這是「看起來完整、少了東西」的另一半，
+    #    而它原本完全無聲（頁面：一則提問、零則回答）。
+    zr_md = md_of(sid_zr)
+    assert "回答會消失RESPDRIFTQ" in zr_md, f"同一場的 prompt 仍要收得到：{zr_md[:300]}"
+    assert "答RESPDRIFTA" not in zr_md, "對照：容器漂掉的助理內容本來就解析不出來"
+    assert "response_item 的容器形狀不認得" in r.stderr, (
+        f"response_item 容器漂移必須出聲，實得 stderr：{r.stderr}")
+
+    # P：payload 容器漂移 → 收不到回合，但哨兵必須接住（item 層與最外層哨兵都進不來）
+    p_md = md_of(sid_p)
+    assert p_md.count("### 👤 You") == 0, "認不得的容器形狀不應硬收成回合"
+    assert "PAYQ" not in p_md, "沒收下的內容不應憑空出現"
+    assert r.stderr.count("型別像使用者發言卻不認得") >= 2, (
+        f"payload 容器漂移（非 dict）也要進 event 層哨兵，實得 stderr：{r.stderr}")
+
+    # Q：item 被序列化成 JSON 字串 → 與 N 同一個哨兵（只是容器換一種形態）
+    q_md = md_of(sid_q)
+    assert q_md.count("### 👤 You") == 0, "認不得的容器形狀不應硬收成回合"
+    assert "STRQ" not in q_md, "沒收下的內容不應憑空出現"
+    assert r.stderr.count("型別像使用者訊息卻不認得") >= 5, (
+        f"item 被序列化成字串也要進同一個哨兵，實得 stderr：{r.stderr}")
+
+    # R：`response_item` 是認得的外層型別 → 不得多報一次「最外層型別不認得」（M 那格才是）
+    assert r.stderr.count("最外層型別不認得") == 1, (
+        f"只有真的認不得的外層型別該出這條；response_item 的注入脈絡不算，實得 stderr：{r.stderr}")
+    assert "正常問句RESPQ" in md_of(sid_r), "同一場的正常 prompt 仍要收得到"
+
+    # E（純圖片）不該同時觸發兩個哨兵：取不出文字那條已經報過，再數一次 dropped block
+    # 會讓同一則訊息出兩行警告，看起來像兩個獨立問題。
+    # 該出這條的只有兩格：O（新格式混合內容）與 Z（舊格式漂成 content block 陣列）——
+    # 兩側對稱，所以計數是 2 不是 1。
+    assert r.stderr.count("block 沒被收進來") == 2, (
+        f"新舊兩種格式的混合內容各該報一次 dropped block，實得 stderr：{r.stderr}")
+
+    # S：五個型別哨兵同時失明時，形狀無關的那一條要接住
+    shapeless = [ln for ln in r.stderr.splitlines() if "個回合開始了卻沒收到" in ln]
+    assert any(sid_s[:8] in ln for ln in shapeless), (
+        f"型別名不含 user、也不帶 role 的漂移必須被形狀無關的哨兵接住，實得：{shapeless}")
+    # T：子代理執行緒本來就沒有人打字，不得誤報
+    assert not any(sid_t[:8] in ln for ln in shapeless), (
+        f"子代理執行緒不得觸發這條哨兵，實得：{shapeless}")
+    # U：工具結果也是以 type=="user" 存的——拿它當「有收到 prompt」的證據會讓哨兵閉嘴
+    assert any(sid_u[:8] in ln for ln in shapeless), (
+        f"只有工具結果、沒有真實 prompt 時哨兵必須出聲，實得：{shapeless}")
+    assert "TOOLQ" not in md_of(sid_u), "沒收下的內容不應憑空出現"
+    # W：一場中途才漂移（收到 1 則、實際 2 則）——只看「有沒有收到任何一則」會整個穿過去
+    assert any(sid_w[:8] in ln for ln in shapeless), (
+        f"部分遺失（前半收得到、後半全丟）同樣要出聲，實得：{shapeless}")
+    assert "前半收得到MIDQ1" in md_of(sid_w) and "MIDQ2" not in md_of(sid_w), (
+        "收得到的那一則仍要呈現，收不到的不得憑空出現")
+    # X：被中止的回合沒有 prompt 是正常的，不得誤報
+    assert not any(sid_x[:8] in ln for ln in shapeless), (
+        f"turn_aborted 的回合本來就沒有 prompt，不得誤報，實得：{shapeless}")
+    # Y：一個回合連送多則時，整檔總數相減會被淹掉——逐窗記帳才抓得到那個空掉的回合
+    assert any(sid_y[:8] in ln for ln in shapeless), (
+        f"一個回合連送多則的 session，漏收同樣要出聲，實得：{shapeless}")
+    assert "連送一QUEUE1" in md_of(sid_y) and "QUEUELOST" not in md_of(sid_y), (
+        "收得到的三則仍要呈現，收不到的不得憑空出現")
+
     idx = (out / "index.html").read_text(encoding="utf-8")
     assert "新格式問句NEWFMTQ" in idx, "索引標題應取到新格式的首句，而非 fallback 成 (無對話)"
     assert f"(無對話) {sid_a[:8]}" not in idx, "有 prompt 的 session 不應被標成 (無對話)"
@@ -1921,6 +2246,24 @@ def test_account_switch_cause(tmp_path=None):
     found = v.claude_config_dirs([cfg_a / "projects", cfg_b / "projects"])
     assert cfg_a in found and cfg_b in found, \
         f"兩個帳號的 config 目錄都要列出（不得被 projects/ 的去重收斂掉），實得 {found}"
+
+    # 上面那段是直接餵函式；**組裝那一段也要測**——函式對、組裝錯的話這條路徑照樣靜默失效。
+    # 自訂佈局（--claude-source）下兩個 config 的 projects/ junction 到同一實體時：掃 session
+    # 要去重（重複掃是白工、同一場會被計兩次），掃 history 不能去重（history.jsonl 各帳號各一
+    # 份、沒有共用）。兩者必須走不同的來源清單。
+    cfg_j = cfg_a.parent / "cfgJ"
+    cfg_j.mkdir(parents=True, exist_ok=True)
+    try:
+        (cfg_j / "projects").symlink_to(cfg_a / "projects", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pass                                  # 建不出 symlink 的平台略過這一格
+    else:
+        cs_args = [f"a={cfg_a / 'projects'}", f"j={cfg_j / 'projects'}"]
+        assert len(v.collect_sources(cs_args, "")) == 1, (
+            "掃 session 的來源仍要按 realpath 去重（同一實體重複掃是白工、同一場會被計兩次）")
+        asm = v.claude_config_dirs(pp for _, pp in v.claude_source_items(cs_args, ""))
+        assert cfg_a in asm and cfg_j in asm, (
+            f"掃 history 的 config 清單必須保留去重前的兩個來源，實得 {asm}")
 
     # 同一列被複製到另一個 config（手動跨機同步/備份還原）不是換帳號：同 timestamp 出現在
     # 多個帳號 → 無法歸屬 → 整組排除，不得憑空生出一次 acct 而誣賴使用者。
@@ -2010,6 +2353,34 @@ def test_account_switch_cause(tmp_path=None):
             encoding="utf-8")
     assert "str-sid" in v.load_account_switches([cfg_s1, cfg_s2]), \
         "timestamp 寫成數字字串時仍須認得，否則整份 history 靜默歸零"
+    # ①-b 單位漂移：這一欄是 epoch **毫秒**。上游若改成秒，值仍轉得成 float、除以 1000 之後
+    #     也還是合法浮點數 → 切帳號時刻靜默變成 1970 年，而壞列數是 0、完全沒有跡象。
+    cfg_u1 = cfg_a.parent / "cfgU1"
+    cfg_u2 = cfg_a.parent / "cfgU2"
+    for c, t in ((cfg_u1, base), (cfg_u2, base + 600)):     # 秒，不是毫秒
+        c.mkdir(parents=True, exist_ok=True)
+        (c / "history.jsonl").write_text(json.dumps(
+            {"display": "單位漂移", "timestamp": t, "sessionId": "unit-sid"}) + "\n",
+            encoding="utf-8")
+    h_unit = {}
+    assert v.load_account_switches([cfg_u1, cfg_u2], h_unit) == {}, \
+        "時間量級整個錯掉時不得產出切帳號時刻（那會是 1970 年的假資料）"
+    # ①-c **部分**複製（不是整份）：兩份 history 曾經相同、之後其中一邊被裁切或輪替，
+    #     同一個 sid 的列就會乾淨地分成「舊的只在 A、新的只在 B」——與真正切帳號完全同形。
+    #     判準要拉到 sessionId 層級：只要有任何一列撞在兩個帳號上，整個 sid 都不可歸屬。
+    cfg_p1 = cfg_a.parent / "cfgP1"
+    cfg_p2 = cfg_a.parent / "cfgP2"
+    shared = {"display": "共有的一列", "timestamp": base * 1000, "sessionId": "part-sid"}
+    only_a = {"display": "只在A", "timestamp": (base + 100) * 1000, "sessionId": "part-sid"}
+    only_b = {"display": "只在B", "timestamp": (base + 700) * 1000, "sessionId": "part-sid"}
+    for c, extra in ((cfg_p1, only_a), (cfg_p2, only_b)):
+        c.mkdir(parents=True, exist_ok=True)
+        (c / "history.jsonl").write_text(
+            json.dumps(shared) + "\n" + json.dumps(extra) + "\n", encoding="utf-8")
+    assert v.load_account_switches([cfg_p1, cfg_p2]) == {}, \
+        "有任何一列撞在兩個帳號上＝這兩份 history 之間有複製關係，整個 sid 都不可歸屬"
+    assert h_unit["bad_rows"] == 2, \
+        f"量級不合理的列要計為壞列，才看得出「讀到了但認不得」，實得 {h_unit}"
     # ② 帳號身分是**實體路徑**、不是目錄名：不同位置的 config 很容易同名（都叫 .claude），
     #    用目錄名當身分會把兩個帳號併成一個，它們之間的切換就永遠偵測不到。
     same_name = cfg_a.parent / "boxX" / ".claude", cfg_a.parent / "boxY" / ".claude"
@@ -2084,10 +2455,412 @@ def test_account_switch_cause(tmp_path=None):
     assert 'data-waste="1"' in html, "row 應帶 data-waste 供篩選"
     assert 'id="fw"' in html, "應有『只看有人因浪費的』勾選框"
     assert "浪費</th>" in html, "應有浪費欄位表頭"
+    # 金額估不出來（人因步是未知型號）時，🔥 的說明也要帶 `?`：浮欄、表頭、MD、②-b 四處
+    # 都走 cost_label，這裡若直接寫 $0 會被讀成「沒多花錢」——五處對四處的不一致最難發現。
+    part_row = dict(row, waste_usd=0.0, waste_partial=True)
+    part_html = v.render_index_html([part_row])
+    tip = part_html[part_html.index("chip waste"):][:400]
+    assert v.cost_label(0.0, True) in tip.split("估算多花")[1][:8], (
+        f"金額估不出來時 tooltip 也要帶 ?，實得：{tip.split('估算多花')[1][:40]}")
+    # 同一筆金額，浮欄／MD／tooltip 三處必須是**同一種寫法**：`cost_label(0, True)` 是 `?`，
+    # 而 `fmt_money(0)+"+?"` 是 `$0+?`——數字相同、標籤不同，出現在同一列上下文最難察覺。
+    assert "$0+?" not in part_html, f"浪費欄要與 tooltip 同口徑（不得出現 $0+?）"
+    part_md = v.render_index_md([dict(part_row, out_md="x.md")])
+    assert "$0+?" not in part_md and "人因浪費 ?" in part_md, (
+        f"MD 也要同口徑，實得：{[l for l in part_md.splitlines() if '人因浪費' in l]}")
+
+    # (v36-fam4 #1) **報告那兩處也要同口徑**。上一批只修了索引三處、只釘了索引側的斷言，
+    #   而 KPI 磚的副標題就寫著「與索引『浪費』欄同口徑」——報告寫 $0+?、索引寫 ? 時那句是假的。
+    base = 1780000000
+    st = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
+          [base + 4000, 0, 100000, 100000, 0, 100000, 0, 0, 0]]   # gap > TTL → expiry（人因）
+    d_unk = v.build_cache_report([{"source_kind": v.SOURCE_CLAUDE, "account": "", "kind": "chat",
+                                   "cache_steps": st, "cache_models": ["模型不在價目表"],
+                                   "cache_events": [], "start_ts": float(base)}])
+    assert d_unk["kpi"]["avoid_n"] == 1 and d_unk["kpi"]["avoid_partial"], (
+        f"前置條件：要有人因冷啟且金額估不出來，實得 {d_unk['kpi']}")
+    rep_html, rep_md = v.render_cache_report_html(d_unk), v.render_cache_report_md(d_unk)
+    for name, text in (("HTML KPI 磚", rep_html), ("MD ②", rep_md)):
+        assert "$0+?" not in text, (
+            f"{name} 的人因浪費不得寫成 $0+?（會被讀成「沒多花錢」）；索引那側給的是 "
+            f"{v.cost_label(0.0, True)!r}")
+    assert "人因浪費 **?**" in rep_md, f"MD 應與索引同口徑，實得：" + repr(
+        [l for l in rep_md.splitlines() if "人因浪費" in l])
+
     # 沒有任何浪費時不該擺一個永遠篩不出東西的勾選框
     row0 = dict(row, waste_n=0, waste_usd=0.0)
     assert 'id="fw"' not in v.render_index_html([row0]), "全無浪費時不應出現篩選勾選框"
     print("OK: account switch cause test passed")
+
+
+def test_report_partition_and_labels():
+    """② 的各桶要蓋滿每個成因、每個成因要有配色、反事實基準只准差 API 自報那條規則。"""
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    # ① 四個敘述桶必須是 REPORT_CAUSES 的一個**分割**（不重疊、不遺漏）。漏一個鍵的後果是
+    #    「共 N 次冷啟」大於列出來的各桶合計，那幾次在敘述層憑空消失。
+    keys = [k for k, _l, _n in v.REPORT_CAUSES]
+    buckets = (list(v._UNAVOIDABLE_CAUSES) + list(v._API_PREFIX_CAUSES)
+               + list(v._UNKNOWN_CAUSES) + list(v._AVOIDABLE_CAUSES) + ["intra"])
+    assert sorted(buckets) == sorted(keys), (
+        f"② 的各桶必須剛好蓋滿 REPORT_CAUSES：漏了 {sorted(set(keys) - set(buckets))}、"
+        f"多了 {sorted(set(buckets) - set(keys))}")
+    assert len(buckets) == len(set(buckets)), "同一個成因不得同時屬於兩桶（會被重複計）"
+
+    # ② 每個成因鍵都要有配色：圖例色塊與成因分期堆疊圖都直接拿 key 當 class，
+    #    少一條 CSS 就是「占了寬度卻畫不出來」——看起來像圖表破洞。
+    viewer_src = (ROOT / "ai_session_viewer.py").read_text(encoding="utf-8")
+    missing = [k for k in keys if (".cz-" + k + "{") not in viewer_src]
+    assert not missing, f"這些成因沒有 .cz-<key> 配色，圖例會是空白方格：{missing}"
+
+    # ③ 反事實基準（band_excluded）只准反映「API 自報」那一條規則。被切帳號排掉的相鄰步對
+    #    若沒有同步扣掉，就會落進差額裡，而那個差額對外揭露成「因前綴變動移出」。
+    base = 1780000000
+    models = ["claude-opus-4-5"]
+
+    def warm_pair(t0, gap):        # 一對落在應命中帶（1h cohort、2～55 分）且命中的步
+        return [[t0, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
+                [t0 + gap, 95000, 100000, 100000, 0, 100000, 0, 0, 0]]
+
+    def row(steps, events, acc):
+        return {"cache_steps": steps, "cache_models": models, "cache_events": events,
+                "source_kind": v.SOURCE_CLAUDE, "kind": "chat", "account": acc,
+                "start_ts": float(base)}
+
+    clean = row(warm_pair(base, 600), [], "a")
+    killed = row(warm_pair(base, 600), [[base + 10, "acct"]], "b")   # 切換在 TTL 邊界前 → 排除
+    d = v.build_cache_report([clean, killed])
+    assert d["api"]["excluded"] == 0, "這批資料完全沒有 API 自報的前綴變動（前提檢查）"
+    assert d["api"]["band_excluded"] == 0, (
+        f"零個前綴變動步卻報出 {d['api']['band_excluded']} 對「因前綴變動移出」"
+        "——被切帳號排掉的對不可掛在 API 頭上")
+
+    # ③-b 反事實的 **lineage 重置**也要同步。切帳號排掉那一對之後，實際那側 `last_write` 歸零、
+    #     下游的對掉進 unknown cohort 而離開帶內；反事實若沒跟著歸零，那一對只在反事實側被算到，
+    #     差額同樣會被講成「因前綴變動移出」。用「中間那步沒有新寫入」把 lineage 的差別逼出來。
+    no_write = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],          # 有 1h 寫入 → 建 lineage
+                [base + 600, 95000, 100000, 0, 0, 0, 0, 0, 0],              # 沒有寫入 → 不刷新 lineage
+                [base + 1200, 95000, 100000, 0, 0, 0, 0, 0, 0]]
+    d_lin = v.build_cache_report([row(no_write, [[base + 10, "acct"]], "c")])
+    assert d_lin["api"]["excluded"] == 0, "前提檢查：這批沒有任何 API 自報的前綴變動"
+    assert d_lin["api"]["band_excluded"] == 0, (
+        f"切帳號排掉那一對之後，反事實的 lineage 也要跟著重置，"
+        f"否則下游的對會只在反事實側被算到；實得 {d_lin['api']['band_excluded']}")
+
+    # ④ 時間軸排序不可比到成因欄：同時刻、同冷熱、成因一個是字串一個是 None 會丟 TypeError，
+    #    整個建置中止。同一帳號下才會相遇，所以兩個 row 要放同一個 account。
+    #    ⚠ 成因為 None 要**可達**才測得到：第一個可分析步若是原始第 0 步會被標成 first。
+    #    前面墊一個 ctx 低於 REPORT_MIN_CTX 的步把它濾掉，剩下那步就既不是 first、也不是任何
+    #    一對的後項 → cause_by_t 沒有它。
+    cold_first = [[base + 4900, 0, 499, 499, 0, 499, 0, 0, 0],               # ctx < 500 → 被濾掉
+                  [base + 5000, 0, 100000, 100000, 0, 100000, 0, 0, 0]]      # 冷、且無從歸因
+    with_cause = [[base + 5000, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
+                  [base + 5000, 0, 100000, 100000, 0, 100000, 0, 0, 0]]      # 冷、有成因
+    d_sort = v.build_cache_report([row(cold_first, [], "same"), row(with_cause, [], "same")])
+    assert d_sort["has_data"], "前提檢查：這兩個 row 要真的被分析到"
+
+    # ⑤ 事件消費要**一次性**：兩條界線精度不同時，落在步驟整秒上的切換會同時滿足「這一對的
+    #    上界」與「下一對的下界」，一次切換被記成兩次人因浪費、金額翻倍。
+    three = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
+             [base + 60, 0, 100000, 100000, 0, 100000, 0, 0, 0],
+             [base + 120, 0, 100000, 100000, 0, 100000, 0, 0, 0]]
+    c_once = v.classify_cache_causes(three, models, [[base + 60.6, "acct"]])
+    assert list(c_once.values()).count("acct") == 1, (
+        f"一次切換只能算一次，實得 {c_once}")
+    d_once = v.build_cache_report([row(three, [[base + 60.6, "acct"]], "once")])
+    assert d_once["causes_total"]["acct"] == 1 and d_once["kpi"]["avoid_n"] == 1, (
+        f"報告端同規則（兩處是刻意的雙胞胎），實得 {dict(d_once['causes_total'])}")
+
+    # ⑥ 逐步成因的鍵不可用裸 epoch：同一秒的兩步會互相覆蓋，③ 重暖作息的「可避免／非閒置」
+    #    著色就跟著錯。用步驟索引當鍵才不會撞。
+    brk = v.REPORT_BREAK_SEC + 60
+    tools_code = v.API_MISS_CODES.index("tools_changed")
+    same_sec = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],          # 暖，起點
+                [base + brk, 0, 100000, 100000, 0, 100000, 0, 0, 0],        # 冷 → expiry（可避免）
+                [base + brk, 0, 100000, 100000, 0, 100000, 0, tools_code, 9]]  # 同秒、冷 → tools
+    d_key = v.build_cache_report([row(same_sec, [], "key")])
+    avoid_n_clock = sum(c["a"] for c in d_key["clock_wd"]) + sum(c["a"] for c in d_key["clock_we"])
+    unavoid_clock = sum(c["u"] for c in d_key["clock_wd"]) + sum(c["u"] for c in d_key["clock_we"])
+    assert (avoid_n_clock, unavoid_clock) == (1, 0), (
+        f"重暖那一步的成因是 expiry（可避免），不得被同秒的另一步覆蓋成 tools，"
+        f"實得 可避免={avoid_n_clock} 非閒置={unavoid_clock}")
+
+    print("OK: report partition & labels test passed")
+
+
+def test_acct_precision_and_server_cause():
+    """切帳號標記的次秒精度、TTL 存活樣本的排除判準、伺服器側成因不落人因桶。"""
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+    base = 1780000000
+    models = ["claude-opus-4-5"]
+
+    def steps_of(gap, read=0, miss_code=0, miss_tok=0):
+        # [epoch, cache_read, 脈絡, 寫入總量, 寫入5分, 寫入1h, 模型idx, 自報成因碼, 重算tokens]
+        return [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
+                [base + gap, read, 100000, 100000, 0, 100000, 0, miss_code, miss_tok]]
+
+    def row_of(steps, events):
+        return {"cache_steps": steps, "cache_models": models, "cache_events": events,
+                "source_kind": v.SOURCE_CLAUDE, "kind": "chat", "account": "a",
+                "start_ts": float(base)}
+
+    # ① 切帳號標記要**保留次秒精度**。步驟時刻是整秒，而消費事件的規則是「不晚於前一步就跳過」
+    #    → 截成整秒的話，「與前一步同秒、實際上更晚」的切換會整組被丟掉、該步的成因跟著掉。
+    class _FakeSession:
+        source_kind = v.SOURCE_CLAUDE
+        session_id = "sub-sec-sid"
+        events = []
+
+    _st, _md, evs, _mids = v.collect_cache_steps(_FakeSession(), {"sub-sec-sid": [base + 0.6]})
+    assert evs and evs[0][1] == "acct", f"切帳號事件應被帶進來，實得 {evs}"
+    assert evs[0][0] != int(evs[0][0]), (
+        f"切帳號事件不得被截成整秒（history 的原生精度是毫秒），實得 {evs[0][0]!r}")
+
+    near = steps_of(60)                       # gap 60 < REPORT_INTRA_SEC → 沒有帳號資料時是 intra
+    c_sub = v.classify_cache_causes(near, models, [[base + 0.6, "acct"]])
+    assert "acct" in c_sub.values(), (
+        f"與前一步同秒、但更晚的切換仍要算進這一步，實得 {c_sub}")
+    c_trunc = v.classify_cache_causes(near, models, [[float(base), "acct"]])
+    assert "intra" in c_trunc.values(), (
+        f"對照組：切換不晚於前一步時本來就該跳過，實得 {c_trunc}")
+
+    # ② TTL 存活樣本的排除判準＝**切換落在 TTL 邊界的哪一側**，不是「有沒有發生切換」。
+    #    邊界之前 → 快取還活著就被整段丟掉，量不到存活；邊界之後 → 快取已自然過期，樣本有效。
+    far = steps_of(4000)                      # gap 4000 ≥ REPORT_TTL_SAFE_SEC
+    def bins_n(events):
+        d = v.build_cache_report([row_of(far, events)])
+        return sum(b["n"] for b in d["cohort_bins"]["1h"])
+
+    assert bins_n([]) == 1, "沒有帳號邊界的一對本來就該進存活樣本（對照組）"
+    assert bins_n([[base + v.REPORT_TTL_SAFE_SEC + 100, "acct"]]) == 1, (
+        "切換晚於 TTL 邊界＝快取在切換前就自然過期了，這一對是有效樣本，不該被排掉")
+    assert bins_n([[base + 10, "acct"]]) == 0, (
+        "切換早於 TTL 邊界＝可能在快取還活著時就丟掉前綴，這一對不能拿來量存活")
+
+    # ③ 伺服器自報 unavailable 是**同一步的直接證據**，不得再往下推論成人因桶：
+    #    否則同一次呼叫會在 API 區被寫成伺服器不可用、在索引與 KPI 又被算成使用者造成的浪費。
+    code = v.API_MISS_CODES.index("unavailable")
+    srv = steps_of(600, miss_code=code, miss_tok=5000)
+    ev_acct = [[base + 600, "acct"]]
+    c_srv = v.classify_cache_causes(srv, models, ev_acct)
+    assert "unavail" in c_srv.values(), f"自報 unavailable 應有自己的成因桶，實得 {c_srv}"
+    assert "acct" not in c_srv.values(), f"伺服器側成因不得同時落進人因桶，實得 {c_srv}"
+    d_srv = v.build_cache_report([row_of(srv, ev_acct)])
+    assert d_srv["causes_total"]["unavail"] == 1 and d_srv["causes_total"]["acct"] == 0, (
+        f"報告端必須與 classify 同規則，實得 {dict(d_srv['causes_total'])}")
+    assert d_srv["kpi"]["avoid_n"] == 0, (
+        f"伺服器不可用不算人因浪費，實得 avoid_n={d_srv['kpi']['avoid_n']}")
+
+    # ⑤ (v36-fam3 F6) 同時有結構性邊界的那一對，不得再算成「因伺服器自報而排除」——
+    #    `if srv_cause:` 排在 `if boundary:` 之前，所以那種對會先落進 srv 分支。
+    #    判準要與 `api_excluded` 一致（「自報是唯一排除理由」才計數），否則兩個對外揭露的
+    #    數字口徑不同、讀者無從對帳。本機重疊 0 對，所以只有這條測試守得住。
+    d_srv_only = v.build_cache_report([row_of(srv, [])])
+    assert d_srv_only["api"]["srv_excluded"] == 1, (
+        f"只有伺服器自報時要計數（對照組），實得 {d_srv_only['api']['srv_excluded']}")
+    d_srv_bd = v.build_cache_report([row_of(srv, [[base + 300, "limit"]])])
+    assert d_srv_bd["api"]["srv_excluded"] == 0, (
+        f"同時有邊界的對已被 boundary 擋掉，不得再算成「因自報而排除」，"
+        f"實得 {d_srv_bd['api']['srv_excluded']}")
+    assert d_srv_bd["causes_total"]["switch"] == 1, (
+        f"對照：那一對的成因仍該是結構性邊界，實得 "
+        f"{ {k: n for k, n in d_srv_bd['causes_total'].items() if n} }")
+
+    # ④ (v36-fam3 F1) **三步以上**才量得到 lineage。上面 ③ 的 srv fixture 全是兩步，量不到
+    #    「下一個冷啟用哪個 cohort」——而報告端與徽章端當時正是在這一格分岔：報告端遇到 srv 會重置
+    #    lineage、classify 端不會（重置條件漏了 srv_cause）。同一步於是一邊算 expiry（人因、記錢）、
+    #    一邊算 evict（非人因、不記錢），同一頁上兩個地方對同一步講相反的話。
+    #    兩邊現已共用 `_resets_lineage`，這條測試就是釘住它的那根釘子。
+    #    ⚠ srv 那一步**必須沒有新寫入**：有寫入的話迴圈頂端會立刻把 lineage 立回來，分岔看不出來
+    #    （本機語料 153 個 srv 步全都有寫入，所以實跑觸發 0 次——這是可達性低、不是不存在）。
+    srv3 = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],        # 1h 寫入 → cohort = 1h
+            [base + 600, 0, 100000, 0, 0, 0, 0, code, 5000],          # srv 自報 unavailable、**零寫入**
+            [base + 1600, 0, 100000, 100000, 0, 100000, 0, 0, 0]]     # 冷啟：cohort 應已掉成 unknown
+    from collections import Counter
+    c3 = v.classify_cache_causes(srv3, models, [])
+    d3 = v.build_cache_report([row_of(srv3, [])])
+    # gap = 1000 秒：unknown cohort 的界線是 5 分 → expiry；沿用舊 1h cohort（界線 55 分）→ evict。
+    assert c3[base + 1600] == "expiry", (
+        f"srv 那步沒寫入 → 舊 1h lineage 必須失效，否則下一個冷啟被誤判成 evict，實得 {c3}")
+    assert Counter(c3.values()) == Counter({k: n for k, n in d3["causes_total"].items() if n}), (
+        f"三步 lineage 上逐步徽章與報告不得漂移：{dict(c3)} vs "
+        f"{ {k: n for k, n in d3['causes_total'].items() if n} }")
+    # 記帳也要跟著對：expiry 是人因桶，報告端必須數到 1 次（分岔時這裡會是 0）。
+    assert d3["kpi"]["avoid_n"] == 1, (
+        f"expiry 是人因浪費，報告端應記 1 次，實得 avoid_n={d3['kpi']['avoid_n']}")
+
+    class _S:
+        pass
+
+    s = _S()
+    s.cache_steps, s.cache_models, s.cache_events = srv, models, ev_acct
+    n_srv, usd_srv, _p = v.session_waste(s)
+    assert n_srv == 0 and usd_srv == 0, (
+        f"索引與報告必須同口徑：伺服器不可用那步不得計入浪費，實得 n={n_srv} usd={usd_srv}")
+
+    # 對照組：拿掉自報碼，同一步就回到 acct，而且兩邊都算得出那筆人因浪費
+    plain = steps_of(600)
+    d_plain = v.build_cache_report([row_of(plain, ev_acct)])
+    assert d_plain["causes_total"]["acct"] == 1 and d_plain["kpi"]["avoid_n"] == 1, (
+        f"對照組：沒有自報碼時仍該判 acct 並計入人因，實得 {dict(d_plain['causes_total'])}")
+    s.cache_steps = plain
+    n_plain, _u, _p = v.session_waste(s)
+    assert n_plain == 1, f"對照組：索引端同樣要算得到，實得 {n_plain}"
+
+    # 伺服器側自報不可用的相鄰步對要**整對移出**存活／帶內樣本：那一次沒中是伺服器的事，
+    # 不是快取沒撐住，留著會污染 TTL 的量測，也會讓 KPI 磚與 ② 成因表對「提早失效」給兩個數字。
+    warm_srv = steps_of(600, read=95000, miss_code=code, miss_tok=5000)
+    d_warm = v.build_cache_report([row_of(warm_srv, [])])
+    assert sum(b["n"] for b in d_warm["cohort_bins"]["1h"]) == 0, (
+        "自報 unavailable 的相鄰步對要整對移出存活樣本（命中的也要移，只挑未命中移會灌高存活率）")
+    assert d_warm["api"]["srv_excluded"] == 1, (
+        f"移出幾對要數得出來，報告才揭露得了，實得 {d_warm['api']}")
+    assert d_warm["api"]["band_excluded"] == 0, (
+        "伺服器側排除在反事實裡也成立 → 不可落進差額、被講成「因前綴變動移出」")
+
+    # KPI 磚的「提早失效」與 ② 成因表的「提早失效」——**兩者不是同一個母體**，別把巧合當不變量。
+    #   磚是 `comply_n - comply_hit`：只數 **1h cohort 且落在應命中帶**的冷啟。
+    #   ② 的 `evict` 不分 cohort、也不看帶。所以磚**恆為 ② 的子集**，相等只在
+    #   「樣本剛好全是 1h 帶內」時成立。
+    # ⚠ (v36-fam4 #7) 這裡原本直接斷言相等，而 fixture 兩對都是 1h cohort → 必然相等、
+    #   抓不到任何東西（本機語料兩邊也剛好都是 14，實跑同樣蓋不到）。改成斷言真正成立的
+    #   關係，並補一組非 1h 的 evict 證明這條測試現在分得出來。
+    mixed = [row_of(steps_of(600, miss_code=code, miss_tok=5000), []),   # 伺服器不可用（冷）
+             row_of(steps_of(600), [])]                                  # 真的提早失效（冷）
+    d_mix = v.build_cache_report(mixed)
+    kpi_evict = d_mix["kpi"]["comply_n"] - d_mix["kpi"]["comply_hit"]
+    assert kpi_evict == d_mix["causes_total"]["evict"] == 1, (
+        f"全部樣本都是 1h 帶內時兩個數字要一致（伺服器那對已整對移出，不得留在磚裡）："
+        f"KPI {kpi_evict} vs ② {d_mix['causes_total']['evict']}")
+    # 非 1h cohort 的 evict：前一步沒有寫入 → cohort unknown（界線 5 分），gap 200 秒落在
+    # [REPORT_INTRA_SEC, 300) → 成因是 evict，但磚只收 1h 帶內 → 磚必須是 0。
+    unk = [[base, 0, 100000, 0, 0, 0, 0, 0, 0],                      # 零寫入 → lineage unknown
+           [base + 200, 0, 100000, 100000, 0, 100000, 0, 0, 0]]      # 冷啟、gap 200
+    d_unk = v.build_cache_report([row_of(unk, [])])
+    kpi_unk = d_unk["kpi"]["comply_n"] - d_unk["kpi"]["comply_hit"]
+    assert d_unk["causes_total"]["evict"] == 1, (
+        f"前置條件：這一對的成因要是 evict，實得 "
+        f"{ {k: n for k, n in d_unk['causes_total'].items() if n} }")
+    assert kpi_unk == 0, (
+        f"非 1h cohort 的 evict 進不了 KPI 磚（磚只數帶內 1h）——兩個數字本來就不該相等，"
+        f"實得 KPI {kpi_unk}")
+    assert kpi_unk <= d_unk["causes_total"]["evict"], "磚恆為 ② 的子集（真正成立的那個關係）"
+
+    # ⚠ 排除**只影響統計，不影響標示**：那一步的成因與並列標籤仍要在，讓人看得出
+    #   「就算伺服器沒掛，這一步的快取也還是會失效」。
+    far_srv = steps_of(4000, miss_code=code, miss_tok=5000)      # 間隔超過 TTL ＋ 伺服器不可用
+    d_far = v.build_cache_report([row_of(far_srv, [])])
+    assert d_far["causes_total"]["unavail"] == 1, "移出樣本不得把那次冷啟從成因統計裡一起抹掉"
+    assert d_far["masked_human"]["causes"] == {"expiry": 1}, (
+        f"同一步仍成立的閒置過期要照樣標出來，實得 {d_far['masked_human']}")
+    m_far = {}
+    v.classify_cache_causes(far_srv, models, [], m_far)
+    assert v._cold_cause_label("unavail", list(m_far.values())[0]) == "閒置過期＋伺服器不可用", (
+        "逐步徽章要並列兩個條件")
+
+    # ⚠ 移出樣本一定要在報告上說明（會讓存活率看起來變好，理由只有寫出來讀者才判斷得了）
+    for as_html in (True, False):
+        note = v._srv_excluded_note(d_warm, html=as_html)
+        assert "伺服器不可用" in note and "1 對" in note, f"揭露要講清楚移出幾對（html={as_html}）"
+        assert "逐步徽章" in note, "也要講明那些冷啟仍會出現在徽章上，否則讀者以為被整個抹掉了"
+    assert v._srv_excluded_note(v.build_cache_report([row_of(steps_of(600), [])])) == "", (
+        "沒有移出任何一對時不該憑空生出一段揭露")
+
+    # 順序：伺服器側自報排在結構性邊界之後、間隔推論之前
+    c_bnd = v.classify_cache_causes(srv, models, [[base + 600, "limit"]])
+    assert "switch" in c_bnd.values(), f"結構性邊界仍優先於伺服器側自報，實得 {c_bnd}"
+
+    # ④ 實據勝出時，同一步仍成立的人因條件**不可以消失**：記帳只算一次（成因欄是實據那個、
+    #    不進人因 KPI），但畫面上兩個都要標。少了這一半，「那一步其實也換了帳號」就被藏掉了。
+    masked = {}
+    v.classify_cache_causes(srv, models, ev_acct, masked)
+    assert masked and list(masked.values())[0] == ["acct"], (
+        f"被實據蓋過的切帳號要記下來，實得 {masked}")
+    label = dict((k, lab) for k, lab, _ in v.REPORT_CAUSES)["acct"]
+    srv_label = dict((k, lab) for k, lab, _ in v.REPORT_CAUSES)["unavail"]
+    # 並列成一個標籤（人因在前、記帳的那個在後），不是各自散在別處
+    assert v._cold_cause_label("unavail", ["acct"]) == label + "＋" + srv_label, (
+        f"兩個條件要並列成一個標籤，實得 {v._cold_cause_label('unavail', ['acct'])}")
+    assert v._cold_cause_label("unavail") == srv_label, "沒有同時成立的條件時就是原本那一個"
+
+    d_mask = v.build_cache_report([row_of(srv, ev_acct)])
+    mh = d_mask["masked_human"]
+    assert mh["steps"] == 1 and mh["causes"] == {"acct": 1}, (
+        f"報告端要與 classify 同口徑地數出來，實得 {mh}")
+    assert d_mask["kpi"]["avoid_n"] == 0, "數出來歸數出來，人因 KPI 仍不得把它算進去"
+    for as_html in (True, False):
+        note = v._masked_human_note(d_mask, html=as_html)
+        assert label in note and "不含它們" in note, (
+            f"兩種報告都要揭露這件事（html={as_html}），實得：{note}")
+    assert v._masked_human_note(v.build_cache_report([row_of(plain, ev_acct)])) == "", (
+        "沒有被蓋過的情形時不應憑空生出一段揭露")
+
+    # 結構性邊界（撞 limit 換帳號／換模型／壓縮）同樣是直接證據、同樣會蓋過人因條件。
+    # 少了這個入口，同一件事就從那裡溜過去：不算人因（對），但畫面上也看不到（不對）。
+    far_lim = steps_of(4000)
+    m_bnd = {}
+    c_bnd2 = v.classify_cache_causes(far_lim, models, [[base + 4000, "limit"]], m_bnd)
+    assert "switch" in c_bnd2.values(), f"前提檢查：limit 邊界應判 switch，實得 {c_bnd2}"
+    assert m_bnd and list(m_bnd.values())[0] == ["expiry"], (
+        f"邊界勝出時，同一步仍成立的閒置過期也要記下來，實得 {m_bnd}")
+    d_bnd = v.build_cache_report([row_of(far_lim, [[base + 4000, "limit"]])])
+    assert d_bnd["masked_human"]["causes"] == {"expiry": 1}, (
+        f"報告端同口徑，實得 {d_bnd['masked_human']}")
+
+    # 逐步徽章：說明文字要同時出現「伺服器不可用」與「自行切帳號」
+    u = {"cache_read": 0, "total_in": 100000, "input": 100000, "cache_create": 0,
+         "output": 100, "win": 200000}
+    tip = v.render_step_meters(2, u, "unavail", 600, base + 600, ["acct"])
+    assert label + "＋" + srv_label in tip, f"冷啟徽章要標並列標籤，實得：{tip}"
+    for c in ("unavail", "acct"):
+        assert v._COLD_CAUSE_NOTE[c] in tip, f"兩個條件的解釋都要在說明裡（{c}），實得：{tip}"
+    assert f"記在「{srv_label}」" in tip, f"說明要講清楚錢記在哪一邊，實得：{tip}"
+    assert label not in v.render_step_meters(2, u, "unavail", 600, base + 600), (
+        "對照組：沒有被蓋過的人因條件時不得憑空標上去")
+
+    # ⑤ **未知的**自報成因也是同一步的直接證據：不映射的話那一步會繼續往下推論，最後落進
+    #    人因桶——等於把「我們還看不懂的東西」算到使用者頭上。與 unavailable 是同一類。
+    unk = steps_of(600, miss_code=v.API_MISS_UNKNOWN_CODE, miss_tok=5000)
+    c_unk = v.classify_cache_causes(unk, models, ev_acct)
+    assert "unknown" in c_unk.values(), f"未知自報碼要有自己的成因桶，實得 {c_unk}"
+    assert "acct" not in c_unk.values(), f"未知自報碼不得被推論成人因，實得 {c_unk}"
+    d_unk = v.build_cache_report([row_of(unk, ev_acct)])
+    assert d_unk["kpi"]["avoid_n"] == 0, (
+        f"未知自報碼不得計入人因浪費，實得 avoid_n={d_unk['kpi']['avoid_n']}")
+
+    # ⑥ **撞 limit 被迫換帳號**不得被標成「自行切帳號」——`acct` 在本檔是專有名詞，
+    #    意思就是「沒撞 limit 就換」。標錯方向與「算到使用者頭上」同等嚴重。
+    m_forced = {}
+    c_forced = v.classify_cache_causes(steps_of(600), models,
+                                       [[base + 600, "limit"], [base + 600, "acct"]], m_forced)
+    assert "switch" in c_forced.values(), f"前提檢查：limit 邊界應判 switch，實得 {c_forced}"
+    assert not any("acct" in a for a in m_forced.values()), (
+        f"同一區間有 limit 時，那次換帳號是被迫的，不得標成自行切帳號，實得 {m_forced}")
+
+    # ⑦ 切換落在**當前這一步的同一秒**時要算進這一對，不可被推到下一對去
+    m_same = {}
+    c_same = v.classify_cache_causes(near, models, [[base + 60.6, "acct"]], m_same)
+    assert "acct" in c_same.values(), (
+        f"與當前步同秒的切換要算進這一對（步驟時刻是整秒，上界要同精度比），實得 {c_same}")
+    d_same = v.build_cache_report([row_of(near, [[base + 60.6, "acct"]])])
+    assert d_same["causes_total"]["acct"] == 1, (
+        f"報告端同規則（兩處是刻意的雙胞胎），實得 {dict(d_same['causes_total'])}")
+
+    # ⑧ 首步的直接證據不得被 `first` 蓋掉：成因表寫「session 第一句」、API 自報表寫
+    #    「伺服器不可用」，同一步兩種說法。
+    first_srv = [[base, 0, 100000, 100000, 0, 100000, 0, code, 5000]]
+    c_first = v.classify_cache_causes(first_srv, models, [])
+    assert "unavail" in c_first.values(), (
+        f"首步也要讓已知的直接證據優先，first 只是沒有證據時的 fallback，實得 {c_first}")
+    d_first = v.build_cache_report([row_of(first_srv, [])])
+    assert d_first["causes_total"]["unavail"] == 1 and d_first["causes_total"]["first"] == 0, (
+        f"報告端同規則（兩處是刻意的雙胞胎），實得 {dict(d_first['causes_total'])}")
+
+    print("OK: acct precision & server cause test passed")
 
 
 def test_acct_separator_and_step_time(tmp_path=None):
@@ -2559,6 +3332,489 @@ def test_acct_separator_and_step_time(tmp_path=None):
     assert v.acct_sep_label(BAD) == "換了登入帳號", "取不出時刻就只留標籤，不留半截"
     print("OK: acct separator and step time test passed")
 
+
+
+def test_scope_notes_without_cold():
+    """(v36-fam5 #6) 零冷啟時三段揭露仍要出現在 ②——它們講的是偵測範圍與樣本排除，與有沒有冷啟無關。
+
+    舊寫法把三段包在 `if total_cold:` 裡，於是「一律揭露，不看數字是不是 0」那句註解在
+    零冷啟那一支是假的：最需要保留懷疑的那一格反而什麼都不說。實測本機有 289 個
+    「有 cache_steps、零冷啟成因」的 session，只用它們建報告時 `srv_excluded` 仍有 75 對
+    要揭露卻一句都不出。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    base = 1780000000
+    unavail = v.API_MISS_CODES.index("unavailable")
+
+    def hit(t, code=0):
+        # cache_read/脈絡 = 90% → 遠高於冷啟門檻，這一步不是冷啟；自報成因走 st[7]。
+        return [t, 90000, 100000, 100000, 0, 100000, 0, code, 0]
+
+    row = {"cache_steps": [hit(base), hit(base + 600, unavail)],
+           "cache_models": ["claude-opus-4-5"], "cache_events": [],
+           "source_kind": v.SOURCE_CLAUDE, "kind": "chat", "account": "a",
+           "start_ts": float(base)}
+    d = v.build_cache_report([row])
+
+    # 前提：這個 fixture 必須真的零冷啟，否則走的是另一支、測不到本條。
+    assert sum(d["causes_total"].values()) == 0, "fixture 應為零冷啟"
+    assert d["api"]["srv_excluded"] == 1, "unavailable 的那一對應被記進 srv_excluded"
+
+    for tag, text, is_html in (("HTML", v.render_cache_report_html(d), True),
+                               ("MD", v.render_cache_report_md(d), False)):
+        assert "期間內沒有冷啟" in text, f"{tag}：應走零冷啟那一支"
+        # 比對整段揭露本文（不是關鍵字）：改了措辭而忘了兩支都出時，這裡才會紅。
+        scope = v._acct_scope_note(d, html=is_html)
+        srv = v._srv_excluded_note(d, html=is_html)
+        assert scope and scope in text, f"{tag}：零冷啟時仍要揭露切帳號偵測範圍"
+        assert srv and srv in text, f"{tag}：零冷啟時仍要揭露因伺服器不可用移出的對數"
+
+    print("OK: scope notes without cold test passed")
+
+
+
+def test_prompt_loss_backstop(tmp_path=None):
+    """(v36-fam5 #3) prompt 事件與 `task_started` 一起漂掉時，仍要有一條哨兵出聲。
+
+    上面那條「回合開了卻零則 prompt」雖然改看結果，卻仍要先有 `event_msg:task_started`
+    才數得出窗；上游若在同一版把兩者一起改名／拿掉，`turn_open` 永遠是 False，
+    連同五個形狀哨兵**六個一起歸零**——正是它們要擋的樣態。
+    ⚠ 這條**不可以**改用 `s.events` 裡 type=="user" 的則數：工具結果也是以 user 存的。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp.mkdir(parents=True, exist_ok=True)
+
+    def line(sec, typ, payload):
+        return json.dumps({"timestamp": f"2026-06-09T04:{sec // 60:02d}:{sec % 60:02d}.000Z",
+                           "type": typ, "payload": payload}, ensure_ascii=False)
+
+    def body(prompt_type, with_started):
+        out = [line(0, "session_meta", {"id": "019f0009-0000-7000-8000-00000000000f",
+                                        "cwd": "/x/Backstop", "cli_version": "0.147.0"}),
+               line(1, "turn_context", {"cwd": "/x/Backstop", "model": "gpt-5.6"})]
+        if with_started:
+            out.append(line(2, "event_msg", {"type": "task_started", "turn_id": "t-1"}))
+        out.append(line(3, "event_msg", {"type": prompt_type, "message": "使用者問句BACKSTOPQ。"}))
+        # 工具結果也是以 user 存進 s.events —— 有它在，用 s.events 數 prompt 的寫法會漏報
+        out += [line(4, "response_item", {"type": "function_call", "name": "sh",
+                                          "call_id": "c1", "arguments": "{}"}),
+                line(5, "response_item", {"type": "function_call_output", "call_id": "c1",
+                                          "output": "工具結果TOOLOUT。"}),
+                line(6, "response_item", {"type": "message", "role": "assistant",
+                                          "content": [{"type": "output_text",
+                                                       "text": "助理回答BACKSTOPA。"}]})]
+        return "\n".join(out)
+
+    def run(prompt_type, with_started, name):
+        f = tmp / f"rollout-2026-06-09T04-00-00-{name}.jsonl"
+        f.write_text(body(prompt_type, with_started), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            s = v.load_codex_session(f)
+        return s, buf.getvalue()
+
+    # ① 正常資料不得出聲（誤報會讓所有警告很快沒人讀）
+    ok, err = run("user_message", True, "ok")
+    assert not err.strip(), f"正常資料不該有警告，實得：{err!r}"
+
+    # ② prompt 改名但留著 task_started → 舊那條（回合窗）接得住
+    _, err_win = run("Prompt", True, "win")
+    assert "回合開始了卻沒收到任何使用者 prompt" in err_win, f"回合窗哨兵應出聲：{err_win!r}"
+
+    # ③ prompt 改名且沒有 task_started → 只剩底線哨兵接得住（改動前這裡完全無聲）
+    drift, err_bs = run("Prompt", False, "bs")
+    assert "整場零則使用者 prompt" in err_bs, (
+        f"prompt 與 task_started 一起漂掉時仍要出聲，實得：{err_bs!r}")
+
+    # ④ 底線哨兵不可以靠 s.events 的 user 則數：工具結果就是以 user 存的，
+    #    這個 fixture 裡 prompt 全丟了但 s.events 仍有 user 事件。
+    assert any(e.get("type") == "user" for e in drift.events), (
+        "fixture 應含以 user 存的工具結果，否則測不到「不可用 s.events 數 prompt」那一半")
+
+    # ⑤ 同一個根因不得出兩行警告
+    assert err_win.count("!") == 1, f"同一根因只該出一行警告，實得：{err_win!r}"
+
+    print("OK: prompt loss backstop test passed")
+
+
+
+def test_response_item_type_drift(tmp_path=None):
+    """(v36-fam5 #2) `response_item` 的型別改名／content 元素改名，都要出聲。
+
+    容器那條哨兵只在 payload **不是 dict** 時計數；歷史上真正發生過的漂移（0.147）卻是
+    **型別改名**，容器好端端的。改名之後助理訊息／reasoning／工具呼叫整批解析不出來，
+    頁面變成「N 則提問、零則回答」，而 `n_empty_turns` 那條被 `n_ai_turns` 擋住
+    （助理事件正好是 0）→ 六個哨兵全靜。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp.mkdir(parents=True, exist_ok=True)
+
+    def line(sec, typ, payload):
+        return json.dumps({"timestamp": f"2026-06-10T05:{sec // 60:02d}:{sec % 60:02d}.000Z",
+                           "type": typ, "payload": payload}, ensure_ascii=False)
+
+    def body(msg_type, elem_type):
+        return "\n".join([
+            line(0, "session_meta", {"id": "019f000a-0000-7000-8000-000000000010",
+                                     "cwd": "/x/Drift", "cli_version": "0.147.0"}),
+            line(1, "turn_context", {"cwd": "/x/Drift", "model": "gpt-5.6"}),
+            line(2, "event_msg", {"type": "task_started", "turn_id": "t-1"}),
+            line(3, "event_msg", {"type": "user_message", "message": "使用者問句DRIFTQ。"}),
+            line(4, "response_item", {"type": msg_type, "role": "assistant",
+                                      "content": [{"type": elem_type, "text": "助理回答DRIFTA。"}]}),
+        ])
+
+    def run(msg_type, elem_type, name):
+        f = tmp / f"rollout-2026-06-10T05-00-00-{name}.jsonl"
+        f.write_text(body(msg_type, elem_type), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            s = v.load_codex_session(f)
+        n_ai = sum(1 for e in s.events if e.get("type") == "assistant")
+        return n_ai, buf.getvalue()
+
+    # ① 正常資料：收得到助理內容，且不得出聲
+    n_ai, err = run("message", "output_text", "ok")
+    assert n_ai == 1, f"正常資料應收到 1 則助理內容，實得 {n_ai}"
+    assert not err.strip(), f"正常資料不該有警告，實得：{err!r}"
+
+    # ② payload.type 改名 → 助理內容整批消失，必須出聲
+    n_ai, err = run("Message", "output_text", "typedrift")
+    assert n_ai == 0, "前提：改名後助理內容應該解析不出來（否則測的不是這件事）"
+    assert "payload.type 不認得" in err, f"型別改名時要出聲，實得：{err!r}"
+
+    # ③ content 元素型別改名 → 型別白名單接不到，只剩這一條看得見
+    n_ai, err = run("message", "text_out", "elemdrift")
+    assert n_ai == 0, "前提：元素改名後應該抽不出文字"
+    assert "抽不出文字" in err, f"content 元素改名時要出聲，實得：{err!r}"
+
+    # ④ 白名單要蓋住現有語料裡出現過、但本工具刻意不呈現的型別，否則哨兵會對真實資料狂叫。
+    for known in ("web_search_call", "tool_search_call", "tool_search_output", "agent_message"):
+        assert known in v._CODEX_HANDLED_RESPONSE_ITEMS, (
+            f"{known} 在真實語料裡出現過，不列進白名單會變成誤報來源")
+
+    print("OK: response_item type drift test passed")
+
+
+
+def test_forced_switch_parallel_label():
+    """(v36-fam5 #1) 撞過 limit 之後才換的帳號：並列標示，但**記帳不變**。
+
+    `boundary` 的「被迫/自願」只看同一對相鄰步之間的事件，429 與切換中間夾了任何一次呼叫，
+    那次被迫切換就落成 `acct`（人因、記錢、紅色徽章）。全語料實測 10 個 acct 標籤裡有 3 個
+    是這種（間隔 5005／4942／11584 秒、$9.05 ＝ 人因浪費的 3.03%）。
+    Will 2026-08-21 裁決：並列顯示 ＋ 報告揭露，**不動成因也不動金額**。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    base = 1780000000
+    models = ["claude-opus-4-5"]
+
+    def cold(t):
+        # cache_read/脈絡 = 0 → 冷啟
+        return [t, 0, 100000, 100000, 0, 100000, 0, 0, 0]
+
+    def row(events):
+        return {"cache_steps": [cold(base), cold(base + 60), cold(base + 120)],
+                "cache_models": models, "cache_events": events,
+                "source_kind": v.SOURCE_CLAUDE, "kind": "chat", "account": "a",
+                "start_ts": float(base)}
+
+    # 429 在第一對、切換在第二對 → 兩者被一次呼叫隔開
+    sep = [[base + 30, "limit"], [base + 90.5, "acct"]]
+    masked = {}
+    causes = v.classify_cache_causes(row(sep)["cache_steps"], models, sep, masked)
+    key = v._cause_key(base + 120, 0)
+    assert causes.get(key) == "acct", f"前提：隔開之後這一步仍被判成 acct，實得 {causes.get(key)!r}"
+    assert masked.get(key) == ["limit_earlier"], (
+        f"同場稍早撞過 limit 要並列標出，實得 {masked.get(key)!r}")
+
+    # 記帳不得改變：成因仍是 acct，金額照算
+    d = v.build_cache_report([row(sep)])
+    assert d["causes_total"]["acct"] == 1, "成因不得因為並列而改變"
+    # 這個 fixture 的成因是 first / switch / acct，`_HUMAN_CAUSES` 只認 expiry+acct → 1。
+    assert d["kpi"]["avoid_n"] == 1, "人因次數不得因為並列而改變（switch 不是人因）"
+    assert d["kpi"]["avoid_usd"] > 0, "並列不得把金額洗掉——記帳仍要照 acct 算"
+    assert d["api"]["acct_limit_earlier"] == 1, "報告要數得出這種步，才揭露得了"
+    assert "稍早出現過 429/401" in v._acct_scope_note(d, html=False), (
+        "統計頁要說明這個誤報方向——它是會記到錢的那一種")
+
+    # 對照組：429 與切換落在同一對之間 → 本來就判得出被迫，不得多標
+    same = [[base + 70, "limit"], [base + 90.5, "acct"]]
+    masked2 = {}
+    causes2 = v.classify_cache_causes(row(same)["cache_steps"], models, same, masked2)
+    assert causes2.get(key) == "switch", f"同一對內有 limit 應判成 switch，實得 {causes2.get(key)!r}"
+    assert "limit_earlier" not in (masked2.get(key) or []), "同一對內就判得出來的不該再並列"
+
+    # tooltip 不得自相矛盾：修正語要排在成因說明**之後**（v36-fam4 #2 那個坑）
+    title = v._cold_cause_title("acct", ["limit_earlier"], "這一步的成因")
+    assert title.index("沒撞 limit」只對這一對") > title.index("這場中途換了帳號（沒撞 limit）"), (
+        "補述要排在成因說明之後才是修正，排在前面就是兩句話互相否定")
+    assert "**" not in title, "tooltip 是純文字 title 屬性，不可留 markdown 星號"
+
+    # 顯示層專用鍵不得混進成因母體，否則成因表會多一列永遠是 0 的假成因
+    assert "limit_earlier" not in v._COLD_CAUSE_LABEL, "並列條件不是成因，不可進 REPORT_CAUSES"
+
+    print("OK: forced switch parallel label test passed")
+
+
+
+def test_limits_section_accumulator():
+    """(v36-fam6 #1，Blocker) 撞牆時刻是**跨 session 累加**的，不可被逐 row 的區域變數蓋掉。
+
+    v36-fam5 #1 在逐 row 迴圈內新建了一個同名的 `limit_ts`，把迴圈外那個累加器整個覆寫，
+    於是 `limits_n` 只剩最後一個 row 的殘留、而且混進了 auth。實資料上 100 → 0，
+    而 `if d["limits_n"]:` 是報告 ④「什麼時候撞到 limit」整段的開關
+    → **那一章連同時段表一起靜默消失**，測試全綠、沒有任何提示。
+
+    這條測試釘三件事：跨 row 累加、折疊規則、以及「最後一個 row 沒有 429 也不能歸零」。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    base = 1780000000
+
+    def row(events, t0):
+        # 兩步、命中，成因不是本條的重點；只要 row 進得了 Claude 那條路徑即可
+        return {"cache_steps": [[t0, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
+                                [t0 + 600, 90000, 100000, 100000, 0, 100000, 0, 0, 0]],
+                "cache_models": ["claude-opus-4-5"], "cache_events": events,
+                "source_kind": v.SOURCE_CLAUDE, "kind": "chat", "account": "a",
+                "start_ts": float(t0)}
+
+    a = row([[base + 60, "limit"]], base)                       # 1 次
+    b = row([[base + 86400 + 60, "limit"]], base + 86400)       # 1 次（另一場）
+    c = row([[base + 172800 + 60, "auth"]], base + 172800)      # auth 不算撞牆
+    d_ = row([[base + 259200 + 60, "limit"],
+              [base + 259200 + 120, "limit"]], base + 259200)   # 10 分內折疊 → 1 次
+
+    # ① 跨 row 累加：三個 row 各一次 429（c 是 auth，不算）
+    assert v.build_cache_report([a, b, c])["limits_n"] == 2, "429 要跨 session 累加，且 auth 不算"
+
+    # ② 最後一個 row 沒有 429 時，前面幾個 row 的不可以跟著消失
+    #    （逐 row 覆寫的寫法在這裡會回 0——這正是 v36-fam5 #1 的症狀）
+    assert v.build_cache_report([a, b, c])["limits_n"] == 2, "最後一個 row 無 429 不得讓累計歸零"
+
+    # ③ 同一場 10 分鐘內折疊為一次，且單一 row 不得被重複計
+    assert v.build_cache_report([a])["limits_n"] == 1, "單一 row 的一次 429 只能算一次"
+    assert v.build_cache_report([d_])["limits_n"] == 1, "同場 10 分內的兩次 429 要折疊成一次"
+
+    # ④ 時段分布要跟著有值，否則 ④ 段的表是空的
+    rep = v.build_cache_report([a, b, d_])
+    assert rep["limits_n"] == 3
+    assert sum(rep["limit_hours"]) == rep["limits_n"], "時段直方圖的總數要等於撞牆次數"
+    assert rep["limits_wd"] + rep["limits_we"] == rep["limits_n"], "平日＋假日要等於總數"
+
+    print("OK: limits section accumulator test passed")
+
+
+
+def test_message_role_and_content_drift(tmp_path=None):
+    """(v36-fam6 #2) `role` 改名／缺欄、`content` 欄改名——與型別改名同症狀，但既有哨兵接不到。
+
+    助理訊息是靠 `role == "assistant"` 認出來的，role 一改名就被 `continue` 直接吞掉；
+    而 `n_empty_assistant_items` 的守門要求 content 是**非空 list**，content 欄改名後
+    取到 None、守門不成立，那一格也不出聲。兩種都是「N 則提問、零則回答」＋ stderr 全靜。
+    實測 516 份 rollout：role 只有 developer/user/assistant、content 恆為非空 list → 零誤報。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp.mkdir(parents=True, exist_ok=True)
+
+    def line(sec, typ, payload):
+        return json.dumps({"timestamp": f"2026-06-11T06:{sec // 60:02d}:{sec % 60:02d}.000Z",
+                           "type": typ, "payload": payload}, ensure_ascii=False)
+
+    def run(msg_payload, name):
+        f = tmp / f"rollout-2026-06-11T06-00-00-{name}.jsonl"
+        f.write_text("\n".join([
+            line(0, "session_meta", {"id": "019f000b-0000-7000-8000-000000000011",
+                                     "cwd": "/x/RoleDrift", "cli_version": "0.147.0"}),
+            line(1, "turn_context", {"cwd": "/x/RoleDrift", "model": "gpt-5.6"}),
+            line(2, "event_msg", {"type": "task_started", "turn_id": "t-1"}),
+            line(3, "event_msg", {"type": "user_message", "message": "使用者問句ROLEQ。"}),
+            line(4, "response_item", msg_payload),
+        ]), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            s = v.load_codex_session(f)
+        return sum(1 for e in s.events if e.get("type") == "assistant"), buf.getvalue()
+
+    good = {"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "助理回答ROLEA。"}]}
+
+    # ① 正常資料：收得到、不出聲
+    n_ai, err = run(dict(good), "ok")
+    assert n_ai == 1 and not err.strip(), f"正常資料不該有警告：{err!r}"
+
+    # ② role 改名 → 助理內容整批消失，必須出聲
+    bad_role = dict(good, role="model")
+    n_ai, err = run(bad_role, "role")
+    assert n_ai == 0, "前提：role 改名後助理內容應消失"
+    assert "role 不認得" in err, f"role 改名要出聲：{err!r}"
+
+    # ③ role 缺欄（不是改名，是整個沒有）→ 同樣要出聲
+    no_role = {k: xv for k, xv in good.items() if k != "role"}
+    n_ai, err = run(no_role, "norole")
+    assert n_ai == 0 and "role 不認得" in err, f"role 缺欄要出聲：{err!r}"
+
+    # ④ content 欄改名 → 型別白名單與 role 白名單都接不到，只剩這一條
+    bad_content = {"type": "message", "role": "assistant",
+                   "body": [{"type": "output_text", "text": "助理回答ROLEA。"}]}
+    n_ai, err = run(bad_content, "content")
+    assert n_ai == 0, "前提：content 欄改名後應抽不出內容"
+    assert "content 不是非空清單" in err, f"content 欄改名要出聲：{err!r}"
+
+    # ⑤ 已知 role 三種都不得誤報（developer/user 是真實語料裡就有的）
+    for r in ("user", "developer"):
+        _n, err = run(dict(good, role=r), "role_" + r)
+        assert "role 不認得" not in err, f"{r} 是真實語料裡就有的 role，不得誤報：{err!r}"
+
+    print("OK: message role & content drift test passed")
+
+
+
+def test_json_string_content(tmp_path=None):
+    """(v36-fam6 #3) content 被序列化成 JSON 字串時，不可把整包原文當成 prompt 收下。
+
+    與 v36-fam3 F3 修掉的「`str()` 的 repr 被當 prompt」同一類，只是漂移點再往內一層，
+    F3 的修法沒涵蓋到，而且新舊兩種格式**都**中。這個形態不是憑空假設——
+    `_codex_container_user_like` 本來就特地涵蓋「被序列化成 JSON 字串的 dict」。
+
+    ⚠ 反方向同樣要釘住：使用者**真的把一段 JSON 貼進來當問題**時，不可以被解析掉——
+    那是比漏報更糟的竄改。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp.mkdir(parents=True, exist_ok=True)
+    blocks = [{"type": "text", "text": "真正的問句JSONQ"}, {"type": "image", "url": "x"}]
+
+    def line(sec, typ, payload):
+        return json.dumps({"timestamp": f"2026-06-12T08:00:{sec:02d}.000Z",
+                           "type": typ, "payload": payload}, ensure_ascii=False)
+
+    def run(user_event, name):
+        f = tmp / f"rollout-2026-06-12T08-00-00-{name}.jsonl"
+        f.write_text("\n".join([
+            line(0, "session_meta", {"id": "019f000c-0000-7000-8000-000000000012",
+                                     "cwd": "/x/Json", "cli_version": "0.147.0"}),
+            line(1, "turn_context", {"cwd": "/x/Json", "model": "gpt-5.6"}),
+            line(2, "event_msg", {"type": "task_started", "turn_id": "t-1"}),
+            user_event,
+            line(5, "response_item", {"type": "message", "role": "assistant",
+                                      "content": [{"type": "output_text", "text": "回答JSONA。"}]}),
+        ]), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            s = v.load_codex_session(f)
+        texts = []
+        for e in s.events:
+            if e.get("type") != "user":
+                continue
+            c = (e.get("message") or {}).get("content")
+            if isinstance(c, str):
+                texts.append(c)
+            else:
+                texts += [b.get("text", "") for b in (c or []) if isinstance(b, dict)]
+        return texts, buf.getvalue()
+
+    # ① 新格式：item.content 是 JSON 字串 → 要還原成真正的問句，並出聲
+    t, err = run(line(3, "event_msg", {"type": "item_completed", "item": {
+        "type": "UserMessage", "id": "i1",
+        "content": json.dumps(blocks, ensure_ascii=False)}}), "new")
+    assert any("真正的問句JSONQ" in x for x in t), f"應還原成真正的問句，實得 {t!r}"
+    assert not any(x.strip().startswith("[{") for x in t), f"不可把整包 JSON 原文當 prompt：{t!r}"
+    assert "序列化成 JSON 字串" in err, f"還原了也要出聲（上游換了形狀）：{err!r}"
+
+    # ② 舊格式：message 是 JSON 字串 → 兩側對稱
+    t, err = run(line(3, "event_msg", {"type": "user_message",
+                                       "message": json.dumps(blocks, ensure_ascii=False)}), "legacy")
+    assert any("真正的問句JSONQ" in x for x in t), f"舊格式也要還原，實得 {t!r}"
+    assert "序列化成 JSON 字串" in err, f"舊格式也要出聲：{err!r}"
+
+    # ③ ⚠ 反方向：使用者真的貼 JSON 陣列當問題 → 原文一個字都不能動
+    raw = "[1, 2, 3]"
+    t, err = run(line(3, "event_msg", {"type": "user_message", "message": raw}), "userjson")
+    assert t == [raw], f"使用者真的貼的 JSON 不可被解析掉（那是竄改），實得 {t!r}"
+    assert "序列化成 JSON 字串" not in err, f"這不是漂移，不該出聲：{err!r}"
+
+    # ④ 一般字串不受影響
+    t, err = run(line(3, "event_msg", {"type": "user_message", "message": "一般問句PLAIN"}), "plain")
+    assert t == ["一般問句PLAIN"] and not err.strip(), f"一般字串不得受影響：{t!r} {err!r}"
+
+    print("OK: json string content test passed")
+
+
+
+def test_history_partial_blank_sentinel(tmp_path=None):
+    """(v36-fam6 #5) **部分** history 認不得時也要出聲，不能只在全部都認不得時才說。
+
+    切帳號是靠**跨帳號比對**成立的：少掉一邊，這條路徑就實質失效，而回傳值與
+    「真的沒切過」完全同形。舊條件是 `h["files"] and not by_sid`（全部都認不得），
+    只要還有一份讀得出來就一聲不吭。
+    順帶釘住 `files` 只算**開得起來**的那幾份（舊寫法在 open 之前就 +1，開檔失敗時
+    `files` 與 `read_errors` 同時加一，揭露句的「讀到 N 份」高估涵蓋率）。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+
+    def cfg(name, rows):
+        c = tmp / name
+        c.mkdir(parents=True, exist_ok=True)
+        (c / "history.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        return c
+
+    good = [{"sessionId": f"s{i}", "timestamp": 1780000000000 + i * 1000} for i in range(5)]
+    drift = [{"sid": f"s{i}", "ts": 1780000000000 + i * 1000} for i in range(5)]   # 欄位改名
+
+    # ① 一份好的 ＋ 兩份漂掉 → 舊條件不成立（by_sid 非空），新哨兵必須出聲
+    h = {}
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        v.load_account_switches([cfg("a", good), cfg("b", drift), cfg("c", drift)], h)
+    assert h["files_blank"] == 2, f"應數出 2 份有列卻認不得，實得 {h.get('files_blank')!r}"
+    assert "份有列、卻一列都認不得" in buf.getvalue(), f"部分漂掉要出聲：{buf.getvalue()!r}"
+
+    # ② 全部都好 → 不得誤報
+    h2 = {}
+    buf2 = io.StringIO()
+    with contextlib.redirect_stderr(buf2):
+        v.load_account_switches([cfg("d", good), cfg("e", good)], h2)
+    assert h2["files_blank"] == 0 and not buf2.getvalue().strip(), (
+        f"正常資料不得出聲：{buf2.getvalue()!r}")
+
+    # ③ `files` 只算開得起來的：不存在的 config 目錄不得讓 files 加一
+    h3 = {}
+    with contextlib.redirect_stderr(io.StringIO()):
+        v.load_account_switches([cfg("f", good), tmp / "does-not-exist"], h3)
+    assert h3["files"] == 1, f"files 只該算真的讀到的那幾份，實得 {h3.get('files')!r}"
+
+    print("OK: history partial blank sentinel test passed")
+
+
 if __name__ == "__main__":
     test_smoke()
     test_search()
@@ -2578,4 +3834,14 @@ if __name__ == "__main__":
     test_codex_ai_label()
     test_codex_item_completed_user()
     test_account_switch_cause()
+    test_report_partition_and_labels()
+    test_acct_precision_and_server_cause()
     test_acct_separator_and_step_time()
+    test_scope_notes_without_cold()
+    test_prompt_loss_backstop()
+    test_response_item_type_drift()
+    test_forced_switch_parallel_label()
+    test_limits_section_accumulator()
+    test_message_role_and_content_drift()
+    test_json_string_content()
+    test_history_partial_blank_sentinel()

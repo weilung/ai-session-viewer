@@ -20,3 +20,10 @@ Thumbs.db
 
 # 待人工確認後才套用的草稿，不提交
 *.pending
+
+# 書籤匯出檔（含使用者備註與 120 字對話摘要）——第 2 期才會產生，先擋著
+/asv-bookmarks-*.json
+/*bookmarks*.json
+# ⚠ 錨定在 repo 根：未錨定的 `*bookmarks*.json` 會連 tests/fixtures/bookmarks.json
+#    這種未來的測試素材一起靜默排除掉。匯出檔的實際落點是使用者的下載資料夾，
+#    這裡要擋的是「順手拖進 repo 根」那一格。

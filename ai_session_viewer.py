@@ -56,7 +56,19 @@ MANIFEST_NAME = ".build-manifest.json"
 #    （v36-fam3 F2 單步徽章、v36-fam4 #2 tooltip、v36-fam5 #1 並列標示）全部沒生效。
 # 39 → 40（2026-08-22）：把上述三批補上。**動到 render_turn_html／render_turn_md／
 #    _cold_cause_label／_cold_cause_title 的改動，都要記得動這裡。**
-RENDERER_VERSION = 40
+# 40 → 41（2026-08-22）：耐久回合錨點（`durable_anchor`）＋每輪標頭的 # 直達連結。
+# 41 → 42（2026-08-22）：補 hashchange 進入點、橫幅改 fixed、tiebreak 改用來源檔行序。
+#    ⚠ **前兩者是頁面 JS/CSS、第三者會改變 id 值**——三個都是呈現層。差點又漏掉這一格：
+#    改完 JS 和 CSS 很容易覺得「沒動 render_turn_html 就不算呈現層」，那是錯的。
+# 42 → 43（2026-08-22）：撞號後綴 `-<n>` → `-tb<n>`（錨點文法每段自帶前綴）、
+#    isK 不准後面黏垃圾、退化改以 `bmTurnId()` 當底線、`.alink` 隱藏時關掉命中測試。
+#    ⚠ **後綴格式改了＝既有的 id 值改了**，所以這也是呈現層。
+# 43 → 44（2026-08-22）：橫幅移到視窗底部＋關閉鈕、命中撤橫幅、未命中清 .hl。
+#    ⚠ 全是頁面 JS/CSS ＝ 呈現層。
+# 44 → 45（2026-08-22）：撞號 tiebreak 的排序鍵改成 (來源檔, 行序)，整場可比。
+#    ⚠ 這會改變撞號組裡誰拿無後綴錨點 ＝ id 值可能改變 ＝ 呈現層。
+# 45 → 46（2026-08-22）：關閉鈕加大到 28×28、橫幅在小視窗收緊、bmWhen 驗日期範圍。
+RENDERER_VERSION = 46
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -820,7 +832,14 @@ def load_session(path: Path, proj_munged: str, account: str = "", source_kind: s
                         agent_desc = m.get("description") or ""
                 except Exception:
                     pass
+            # 來源檔識別：`_i` 是**逐檔**行序（`enumerate(fh)` 每個檔從 0 重新起算），
+            # 單獨拿它跨檔比較沒有意義。撞號 tiebreak 需要一個**整場可比**的鍵，
+            # 所以再帶一個檔案識別；主檔的事件沒有這個欄位＝空字串，排在所有子代理檔之前。
+            # ⚠ 分隔符正規化成 `/`：Windows 的 `relative_to` 給反斜線，不正規化的話
+            #   同一份語料在不同平台會排出不同順序。
+            srcf = str(sf.relative_to(side_dir)).replace("\\", "/")
             for ev in evs:
+                ev["_srcf"] = srcf
                 ev["_parent_tool_use"] = parent_tid
                 ev["_agent_type"] = agent_type
                 ev["_agent_desc"] = agent_desc
@@ -1803,6 +1822,8 @@ def group_turns(events, per_step=True, step_by_usage=False):
                     cur = None
                 turns.append({"role": "user", "blocks": blocks,
                               "dt": e.get("_dt"), "side": bool(e.get("isSidechain")),
+                              "src_i": e.get("_i"),      # 來源檔行序
+                              "src_f": e.get("_srcf") or "",   # 來源檔識別（主檔為空字串）
                               "compact": bool(e.get("isCompactSummary")),
                               "compact_meta": e.get("_compact_meta") or {}})
             # 否則（純 tool_result / 空白）略過，不打斷 assistant 回合
@@ -1826,6 +1847,8 @@ def group_turns(events, per_step=True, step_by_usage=False):
                     turns.append(cur)
                 cur = {"role": "assistant", "blocks": [],
                        "dt": e.get("_dt"), "side": bool(e.get("isSidechain")),
+                       "src_i": e.get("_i"),      # 來源檔行序
+                       "src_f": e.get("_srcf") or "",   # 來源檔識別（主檔為空字串）
                        "u": _new_turn_usage(), "n_steps": 0, "_step_ids": set()}
             msg = e.get("message") or {}
             # 每個新的 message.id ＝ 回合內的一個步驟（一次 API 呼叫）；同一 id 拆成的多筆事件
@@ -1856,6 +1879,94 @@ def group_turns(events, per_step=True, step_by_usage=False):
     if cur:
         turns.append(cur)
     return turns
+
+
+def _tiebreak_key(g):
+    """撞號組內的決定性排序鍵＝**來源檔行序**。**這不是身分**，只是讓「誰拿到無後綴的錨點」
+    有一個與呈現結構無關的依據。
+
+    ⚠⚠ 前一版用 `(bool(side), role, 首個 block 前 200 字)`，三個問題全被 `durable-anchor-r2`
+    抓到，**而且它的註解宣稱修掉了其中一個、實際上沒有**：
+
+    1. `bool(side)` 是第一個鍵，而 `False < True` ⇒ **主回合永遠排在子代理之前**，
+       與 `s.main_groups + s.side_groups` 的 list 位置完全同序——它宣稱修掉的「主搶子」原封不動。
+    2. `blocks[0]` 對 assistant 回合**永遠是 `_step` marker**（`group_turns` 在
+       `cur["blocks"].extend(blocks)` **之前**就把它 append 進去了），所以鍵是常數
+       `(False,'assistant','_step')`，「內容導出」在最常見的情況下等於沒有。
+    3. 用文字當鍵讓**錨點指派依賴訊息內文**——任何改變首個 block 取法的變更（正規化、
+       block 過濾、清洗規則）都會換人拿無後綴錨點。而本檔拒絕內容雜湊的理由正是
+       「要一整套正規化規則」。自己踩了自己拒絕的那條。
+
+    `src_i` 來自事件的 `_i`（兩邊 loader 覆蓋率實測皆 100%，Claude 36368 回合／Codex 1323
+    回合都沒有缺）。⚠ **兩邊的語意不同**：Claude 是 `load_events` 的**逐檔行序**；
+    Codex 是 `load_codex_session` 重新 `enumerate(raw)` 的**解析成功序**。兩者都對 append 穩定。
+
+    **鍵是 `(來源檔識別, 逐檔行序)`。** 只有行序不夠：`enumerate(fh)` 每個檔從 0 重新起算，
+    而一場 session 的事件來自**多個檔**（主檔 ＋ `<sid>/**/*.jsonl` 子代理轉錄，見
+    `load_session`）。單拿行序比會打平，而 `list.sort` 是穩定排序 ⇒ 退回
+    `s.main_groups + s.side_groups` 的位置 ⇒ 主搶子。⚠ **這個錯我犯過三次**
+    （`durable-anchor-y1` #2 → `r2` #3 → `r4` #1），每次都是註解宣稱了保證卻沒人在守。
+    現在守它的是 `tests/test_smoke.py::test_anchor_tiebreak_main_vs_side`。
+
+    **它保證什麼**：主檔的事件（`src_f` 為空字串）排在所有子代理檔之前。
+    這是刻意的方向——子代理轉錄檔是被主對話的 Task 呼叫起來的，**它在主回合之後才落地**。
+    所以「主回合原本獨佔某毫秒、使用者存了書籤 → 子代理檔之後才出現」這個真實情境下，
+    既有書籤**不會**被搶走。
+
+    **它不保證什麼**（＝`SCOPE-BOOKMARK-TIEBREAK-INSERT` 的殘餘）：
+    反方向不行（子代理先、主回合後出現時主回合仍會搶）；同一檔內插入行序更前的新輪會搶；
+    新的子代理檔若檔名排序在既有那個之前也會搶。**要完全免疫只有讓每個錨點都帶內容雜湊**，
+    那會把「撞號組只有 4 個」換成「正規化一改、全部書籤同時失效」。
+
+    ⚠ 兩邊 loader 的 `_i` 語意不同：Claude 是 `load_events` 的**逐檔行序**；
+    Codex 是 `load_codex_session` 重新 `enumerate(raw)` 的**解析成功序**（`durable-anchor-r4` #7）。
+    兩者都對 append 穩定，覆蓋率實測皆 100%（Claude 36368 回合／Codex 1323 回合都沒缺）。
+    取不到時退回 `-1`（排在最前），至少是決定性的。
+
+    ⚠ 它仍**解不掉插入不穩定**：原本獨佔某毫秒的回合拿無後綴錨點，之後若有新輪撞進同一毫秒
+    且行序更前，就會換人。要完全免疫只有「每個錨點一律帶內容雜湊後綴」，那等於把
+    「9166 分之 1」換成「正規化一改、全部書籤同時失效」。
+    **範圍限制 SCOPE-BOOKMARK-TIEBREAK-INSERT**：詳見 planning/scope-limits.md。
+    """
+    i = g.get("src_i")
+    return (str(g.get("src_f") or ""), i if isinstance(i, int) else -1)
+
+
+def durable_anchor(dt):
+    """回合的**耐久錨點**（書籤用）：`k<YYYYMMDD>T<HHMMSS><mmm>Z`，UTC。沒有時間就回空字串。
+
+    **為什麼是時間戳，不是內容雜湊**：`dt` 本來就掛在每一輪上（`group_turns` 建 turn 時就存了），
+    全語料實測 9047 輪**缺漏 0**、**撞號 1**。內容雜湊要一整套正規化規則＋格式版本號＋改規則時
+    的遷移，為那 0.01% 的差別不划算。⚠ 真正的理由不是機率而是**序號會位移**：
+    `t{n}` 是 `enumerate` 出來的，任何讓分組多一輪的解析器修正都會把其後全部往後推——
+    四週實測 Codex 側 6 輪這樣漂掉（其中一場從 1 輪變 37 輪），而時間戳側 0。
+    量測隨時可重跑：`python scripts/probe_turn_identity.py drift <舊commit>`。
+
+    **為什麼保留毫秒**：只截到整秒，撞號會從 1 變 31。
+
+    **為什麼是 UTC**：檔名用的是 `s.start.astimezone()`（本地時間），機器時區一變整批就變
+    ——錨點不能再犯同一個錯。使用者要看的本地時間由 `#` 連結的 `title` 提供：
+    **網址給機器，UI 給人。**
+
+    ⚠ 開頭一律是 `k`：HTML `id` 與 URL fragment 都不該以數字開頭。
+    ⚠ **不要為了可讀性加冒號**：`getElementById` 沒事，但 `querySelector('#k2026:08')` 會炸。
+    """
+    if dt is None:
+        return ""
+    try:
+        _tz = dt.tzinfo
+    except AttributeError:      # 傳進來的不是 datetime（date／str／int）：不該讓整頁建置炸掉
+        return ""
+    if _tz is None or _tz.utcoffset(dt) is None:
+        # ⚠ naive datetime 走 `astimezone()` 會**默默假設本機時區**——那正是本函式存在要避開的
+        # 失效模式（換台機器就換一批錨點）。本 codebase 的 `dt` 全部來自 `parse_ts`（已正規化成
+        # aware），實測 9166 輪 naive 0 個；但**寧可沒有錨點，也不要給一個會隨機器漂的**。
+        return ""
+    try:
+        u = dt.astimezone(timezone.utc)
+    except Exception:      # 極端時刻在部分平台會丟 OSError，顯示層不該因此整頁建置失敗
+        return ""
+    return f"k{u:%Y%m%dT%H%M%S}{u.microsecond // 1000:03d}Z"
 
 
 def analyze(s, acct_switches=None):
@@ -1903,6 +2014,38 @@ def analyze(s, acct_switches=None):
         g["anchor"] = f"t{i}"
     for i, g in enumerate(s.side_groups, 1):
         g["anchor"] = f"s{i}"
+    # **耐久錨點**（書籤用）：見 `durable_anchor` 的說明。與 `t{n}`／`s{n}` **並存**——
+    # 後者是全文搜尋既有的基礎設施（`--search` 的跳轉、MD 的 `{#tN}`），**不可拿掉**。
+    # 命名空間是**整頁**（主對話＋子代理合起來）：HTML `id` 只需在單頁唯一，而一頁＝一場 session。
+    _by_ts = {}
+    for g in s.main_groups + s.side_groups:
+        # 沒有時間的回合不給耐久錨點（實測本機語料 0 個，但 `dt` 可以是 None）。
+        # ⚠ **不要退回 `t{n}`**：那會讓一個看起來一樣的連結帶著完全不同的耐久性質出去。
+        g["kanchor"] = ""
+        _ka = durable_anchor(g.get("dt"))
+        if _ka:
+            _by_ts.setdefault(_ka, []).append(g)
+    for _ka, _grp in _by_ts.items():
+        # ⚠ **撞號組「內」用來源檔行序排，不看 list 位置。** 用位置的話，
+        # `s.main_groups + s.side_groups` 這個「主回合全排在子代理之前」的人為順序，
+        # 會讓一個**新出現的主回合**直接搶走某個子代理回合原本的無後綴錨點
+        # （`durable-anchor-y1` #2 實測過）。行序至少與訊息內文脫鉤。
+        # ⚠⚠ **但它「沒有」解掉主/子互搶**——`_i` 是逐檔行號，主檔與子代理檔不可比，
+        # 打平時穩定排序會退回 list 位置。這句話我在這裡寫錯過三次
+        # （y1 #2 → r2 #3 → r4 #1），**現在是誠實版，不要再往上加保證**。
+        # 未修，見 SCOPE-BOOKMARK-TIEBREAK-INSERT〈第四輪〉。
+        # ⚠⚠ **但這解不掉「插入新輪可能換人拿無後綴錨點」**——那取決於撞號組的成員，
+        # 不是排序法。**範圍限制 SCOPE-BOOKMARK-TIEBREAK-INSERT**，詳見 planning/scope-limits.md。
+        if len(_grp) > 1:
+            _grp.sort(key=_tiebreak_key)
+        for _i, g in enumerate(_grp, 1):
+            # 第一個不加後綴：後綴只在真的撞號時出現，沒撞號的錨點就是乾淨的時間戳。
+            # ⚠ 後綴用 **`-tb<n>`** 而不是裸數字：錨點文法是
+            # `k<時戳>[-tb<n>][-s<步時戳>][-b<區塊序>]`，**每一段都要自帶前綴**才分得開哪一段
+            # 是什麼。裸數字會讓退化規則只能靠「最後一段是不是數字」猜——而第 4 期一旦讓
+            # 子定位符自己帶 tiebreak（`k…-s…-2`），那種錨點就**永遠退化不了**
+            # （`durable-anchor-r2` #9）。
+            g["kanchor"] = _ka if _i == 1 else f"{_ka}-tb{_i}"
     # 子代理數量：優先用不重複的 agentId（外部檔），否則退回分組數
     agent_ids = {e.get("agentId") for e in side if e.get("agentId")}
     s.n_subagents = len(agent_ids) if agent_ids else len(s.subagent_map)
@@ -3129,7 +3272,13 @@ def render_subagent_block(tid, smap, smeta, tmap, used_ids, rendered, ai="Claude
 
 def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=None, rendered_sub=None, ai="Claude"):
     role = group["role"]
-    aid = f' id="{group["anchor"]}"' if group.get("anchor") else ""
+    # ⚠⚠ **耐久錨點掛在這個元素本身，`t{n}` 退成標頭裡的零尺寸 `<span class="tanchor">`。**
+    # 理由是 `openSub()` 只對 `.turn`／`.compact-sep` **本身**展開內部折疊區塊、也只在它身上
+    # 加 `.hl` 外框——而**那圈外框是「跳成功了」的唯一視覺訊號**。把錨點掛在標頭那個
+    # `opacity:0` 的連結上，成功與失敗會長得一模一樣，整個設計的理由就沒了。
+    # `#t{n}` 的行為不受影響：JS 會把 `tanchor` 往上提到所屬的 `.turn`（見 `openSub`）。
+    aid = f' id="{group["kanchor"]}"' if group.get("kanchor") else ""
+    tspan = f'<span class="tanchor" id="{group["anchor"]}"></span>' if group.get("anchor") else ""
     if group.get("compact"):
         # /compact 壓縮點：標示分隔線（手動/自動＋壓縮量），摘要收進摺疊（此摘要即下次送模型 context 的起點）
         summ = "".join(md_to_html(b.get("text") or "")
@@ -3143,7 +3292,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         when = local_str(group.get("dt"), "%H:%M:%S")
         if when:
             bits.append(when)
-        return (f'<div class="compact-sep"{aid}><span>✂ {esc(" · ".join(bits))}'
+        return (f'<div class="compact-sep"{aid}>{tspan}<span>✂ {esc(" · ".join(bits))}'
                 ' — 先前對話已壓縮為摘要，以下即下次送模型 context 的起點</span></div>'
                 '<details class="think compact-sum"><summary>📋 壓縮摘要</summary>'
                 f'<div class="tbody">{summ}</div></details>')
@@ -3188,9 +3337,18 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
     when = local_str(dt, "%H:%M:%S")
     when_full = (day_label(dt) + " " + when) if dt else ""   # 游標停留顯示完整日期
     meters = render_turn_meters(group)
+    # 直達連結：滑過該輪才顯形（GitHub 那種）。指向**耐久錨點**，因為使用者會把它
+    # 存進瀏覽器的「我的最愛」——那是一串純網址、存在他的瀏覽器裡，**我們事後碰不到**。
+    # `title` 給**本地時間**：錨點本身是 UTC，兩者可能差到跨天，不標會被讀錯。
+    # `onclick` 比照子代理目錄走 `openSub`，否則「點頁內連結」與「用網址列進來」行為不一致。
+    alink = (f'<a class="alink" href="#{group["kanchor"]}"'
+             f' title="這一輪的直達連結 · {esc_attr(when_full)}"'
+             f' onclick="return openSub(\'{group["kanchor"]}\')">#</a>'
+             if group.get("kanchor") else "")
     return (f'<div class="turn {role}{side_cls}"{aid}>'
-            f'<div class="head"><span class="who">{icon} {who}</span>{side_badge}'
-            f'{meters}<span class="when" title="{esc_attr(when_full)}">{esc(when)}</span></div>'
+            f'<div class="head">{tspan}<span class="who">{icon} {who}</span>{side_badge}'
+            f'{meters}<span class="when" title="{esc_attr(when_full)}">{esc(when)}</span>'
+            f'{alink}</div>'
             f'<div class="body">{"".join(parts)}</div></div>')
 
 
@@ -3419,7 +3577,59 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
 </div>
 <script>
 function toggleAll(o){{document.querySelectorAll('details.tool,details.think,details.sidechain-wrap').forEach(function(d){{d.open=o;}});}}
-function openSub(id){{var el=document.getElementById(id);if(!el)return true;
+function isK(id){{                          /* 嚴格認 k<8碼日期>T<9碼時分秒毫秒>Z，後面可再接子定位符 */
+ if(id.length<20||id.charAt(0)!=='k'||id.charAt(9)!=='T'||id.charAt(19)!=='Z')return false;
+ if(id.length>20&&id.charAt(20)!=='-')return false;   /* 不准直接黏東西上去（k…Zjunk） */
+ for(var i=1;i<19;i++){{if(i===9)continue;var c=id.charAt(i);if(c<'0'||c>'9')return false;}}
+ return true;}}
+function bmTurnId(id){{                     /* 錨點文法 k<ts>[-tb<n>][-s<ts>][-b<n>] 的「回合」那一層 */
+ var p=id.split('-'),tb=false;
+ if(p.length>1&&p[1].slice(0,2)==='tb'&&p[1].length>2){{        /* tb 後面一定要有數字 */
+  tb=true;for(var i=2;i<p[1].length;i++){{var c=p[1].charAt(i);if(c<'0'||c>'9'){{tb=false;break;}}}}}}
+ return p.slice(0,tb?2:1).join('-');}}
+function bmWhen(id){{                       /* 可讀式錨點的用處：失效時讀得出是哪一刻 */
+ if(!isK(id))return id;                     /* 形狀不對就原樣印，不要拼出 '2026-01-01 :: UTC' */
+ var mo=+id.substr(5,2),d=+id.substr(7,2),h=+id.substr(10,2),mi=+id.substr(12,2),se=+id.substr(14,2);
+ /* ⚠ isK 只驗「是不是數字」，`k99999999T999999999Z` 照樣通過。範圍不合理就原樣印，
+    不要自信地講一個不存在的時刻（`durable-anchor-r4` #8）。 */
+ if(mo<1||mo>12||d<1||d>31||h>23||mi>59||se>59)return id;
+ return id.substr(1,4)+'-'+id.substr(5,2)+'-'+id.substr(7,2)+' '
+       +id.substr(10,2)+':'+id.substr(12,2)+':'+id.substr(14,2)+' UTC';}}
+function bmClear(){{                        /* ⚠⚠ 命中時一定要撤掉上一次的橫幅 */
+ var d=document.getElementById('bm-banner');
+ if(d&&d.parentElement)d.parentElement.removeChild(d);}}
+function bmBanner(msg){{                    /* ⚠ 重用同一個節點：兩次未命中不該疊兩條 */
+ var d=document.getElementById('bm-banner');
+ if(!d){{d=document.createElement('div');d.className='bm-miss';d.id='bm-banner';
+        document.body.insertBefore(d,document.body.firstChild);}}
+ d.textContent=msg;
+ var x=document.createElement('button');x.className='bm-x';x.textContent='\u2715';
+ x.title='關閉';x.onclick=bmClear;d.appendChild(x);
+ return d;}}
+function bmMiss(id){{
+ if(!isK(id))return;                       /* 只對耐久錨點出聲；別的 hash 找不到是既有行為 */
+ bmBanner('\u26a0 這個書籤指向的回合在這份輸出裡找不到（'+bmWhen(id)+'）。'
+  +'可能這份轉錄檔被重新解析過，或這個連結屬於另一場 session。');}}
+function openSub(id){{var el=document.getElementById(id);
+ /* 逐段退化：第 4 期的區塊層級錨點（k…-s…-b3）丟進只認得回合的頁面時，一段一段往回退到
+    「找得到那一輪」為止，而不是死掉。
+    ⚠⚠ **只退子定位符（s…/b…），絕不退純數字的 tiebreak 後綴。** `-2` 是「同一毫秒的第二輪」，
+    把它退掉會跳到**同毫秒的另一輪**、加上代表成功的 .hl 外框、還改寫網址列——那正是這整個
+    設計要消滅的「安靜指錯」。⚠ 也只對耐久錨點做：sub-orphans 那種 id 也帶 -。 */
+ var deg=false,bt=isK(id)?bmTurnId(id):id;
+ /* 一段一段退到**回合那一層**為止，不再靠「最後一段是不是數字」猜。
+    `k…-tb2` 本身就是回合層 ⇒ 一步都不退（退了就會跳到同毫秒的另一輪＝安靜指錯）；
+    `k…-s…-tb2` 的 tb 屬於子定位符 ⇒ 連它一起退。 */
+ while(!el&&isK(id)&&id!==bt){{
+  id=id.slice(0,id.lastIndexOf('-'));el=document.getElementById(id);deg=true;}}
+ if(!el){{
+  /* ⚠ 未命中也要清掉上一次留下的 .hl：不清的話畫面會同時有「某一輪被框起來」＋
+     「找不到」橫幅，讀者讀不出到底跳了沒（`durable-anchor-r3` #1）。 */
+  document.querySelectorAll('.hl').forEach(function(x){{x.classList.remove('hl');}});
+  bmMiss(id);return true;}}
+ /* t{{n}} 掛在標頭的零尺寸 span 上 → 往上提到所屬回合，讓 #t7 與 #k…Z 行為完全一致
+    （展開折疊區塊、加 .hl 外框都只對 .turn/.compact-sep 本身生效）。 */
+ if(el.classList.contains('tanchor')){{var tp=el.closest('.turn,.compact-sep');if(tp)el=tp;}}
  document.querySelectorAll('.hl').forEach(function(x){{x.classList.remove('hl');}});
  var p=el;while(p){{if(p.tagName==='DETAILS')p.open=true;p=p.parentElement;}}
  if(el.classList.contains('turn')){{[].slice.call(el.querySelectorAll('details')).forEach(function(d){{
@@ -3430,8 +3640,25 @@ function openSub(id){{var el=document.getElementById(id);if(!el)return true;
  else if(el.classList.contains('compact-sep')){{var n=el.nextElementSibling;
   if(n&&n.tagName==='DETAILS')n.open=true;}}
  el.classList.add('hl');
- el.scrollIntoView({{behavior:'smooth',block:'start'}});history.replaceState(null,'',  '#'+id);return false;}}
-if(location.hash.length>1){{setTimeout(function(){{openSub(location.hash.slice(1));}},0);}}
+ el.scrollIntoView({{behavior:'smooth',block:'start'}});
+ /* ⚠ 退化命中 ≠ 精確命中：出一條軟提示，而且**不改寫網址列**——改了就把原連結蓋掉，
+    使用者連「我本來存的是更細的位置」都看不出來。 */
+ if(deg){{bmBanner('\u2139 原連結指向這一輪裡更細的位置，那個位置在這份輸出裡找不到，'
+  +'已改為跳到該回合（'+bmWhen(id)+'）。');}}
+ /* ⚠⚠ 精確命中要**主動撤掉**橫幅。沒撤的話一次 miss 之後，**每一次成功跳轉都長得像失敗**
+    ——橫幅是 fixed、捲不掉，會一直說「找不到」直到重新載入（`durable-anchor-r3` #1）。 */
+ else{{bmClear();history.replaceState(null,'',  '#'+id);}}
+ return false;}}
+function bmGo(){{if(location.hash.length>1)openSub(location.hash.slice(1));}}
+setTimeout(bmGo,0);
+/* ⚠⚠ **hashchange 一定要掛。** 只在 load 時跑一次的話，「點瀏覽器我的最愛、而那一頁
+   已經開在同一個分頁裡」是**同文件 fragment 導覽、不會重新載入** → openSub 一次都不會
+   被呼叫 → 沒有 .hl、沒有橫幅，「找不到」又變回徹底靜默。而那正是本功能的主要使用情境。
+   （頁內連結走 onclick→openSub 並回 false，不觸發導覽；replaceState 也不觸發，不會重複跑。） */
+/* ⚠ **已知限制**（`durable-anchor-r4` #6）：`hashchange` 只在 hash **有變**時觸發，
+   所以「網址列已經是 #k…、再點一次同一個我的最愛」完全靜默。頁內連結不受影響
+   （走 onclick→openSub）。這是瀏覽器行為，靜態頁擋不到；不做假的修補。 */
+addEventListener('hashchange',bmGo);
 var MET=['cache','miss','cost','in','cw','cr','ctx','out','gap','dur','eff'],
     DEF={{cache:1,miss:1,cost:1,in:0,cw:0,cr:0,ctx:0,out:0,gap:1,dur:0,eff:0}};
 function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
@@ -3556,6 +3783,15 @@ def render_turn_md(group, tmap, ai="Claude"):
     meters = turn_meters_md(group)
     # {#tN}/{#sN}＝對應 HTML 該則的錨點 id：--search 用它定位，手動 rg 到後也可接在 .html# 後跳到該則
     mark = f" {{#{group['anchor']}}}" if group.get("anchor") else ""
+    # 耐久錨點也寫進 MD，維持「兩種輸出讀同一份錨點」這條既有性質：rg 到之後可以直接
+    # 接在 .html# 後面跳，而且那個連結不會因為之後改解析器而指到別輪。
+    # ⚠ **已知限制**：這樣一行上會有兩個 `{#…}`，而 Pandoc 的 header-attribute 語法只吃
+    # **結尾那一個**——用 pandoc 算繪這份 MD 時，被當成 id 的會是耐久錨點，`{#tN}` 會變成
+    # 標題裡的可見文字。本工具自己的 `_TURN_HEAD_RE` 吃得下兩者（實測 `--search` 仍正常），
+    # 而 `--search` 結果頁的連結仍走 `t{n}`，所以 MD 裡的耐久錨點目前只是給人 `rg` 用。
+    # 順序不可對調：`{#tN}` 必須在前，`_TURN_HEAD_RE` 靠它切回合（`durable-anchor-r2` #13）。
+    if group.get("kanchor"):
+        mark += f" {{#{group['kanchor']}}}"
     return f"\n### {side}{icon} · {when}{meters}{mark}\n\n" + "\n\n".join(parts) + "\n"
 
 
@@ -6018,6 +6254,40 @@ font-family:ui-monospace,Consolas,monospace}
 /* 全文搜尋（--search）結果頁 + 錨點跳轉高亮 */
 mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1px}
 .hl{outline:2px solid var(--accent);outline-offset:2px}
+/* 每輪標頭的 # 直達連結：滑過該輪才顯形。⚠ 錨點本身不掛在這裡（掛在 .turn 上），
+   理由見 render_turn_html 的註解——.hl 外框是「跳成功了」的唯一訊號。 */
+/* ⚠ 隱藏時要一併關掉命中測試：`opacity:0` 不會讓元素退出點擊，否則每個回合標頭右緣
+   都多一塊看不見卻按得到的區域。⚠ 這個連結**會**佔掉 23px（`.when` 是 margin-left:auto
+   靠右，新元件進同一列本來就會推它）——那是刻意加的 UI，不是版面缺陷。 */
+.alink{margin-left:8px;color:var(--muted);text-decoration:none;font-weight:600;
+       opacity:0;pointer-events:none;transition:opacity .12s}
+.turn:hover .alink,.alink:focus{opacity:.65;pointer-events:auto}
+.alink:hover{opacity:1;color:var(--accent)}
+/* ⚠ 沒有 hover 的裝置上，靠 `.turn:hover` 顯形等於這個功能的主要入口永遠看不到。 */
+@media (hover:none){.alink{opacity:.55;pointer-events:auto;margin-left:6px;padding:2px 8px}}
+.tanchor{position:absolute;width:0;height:0;overflow:hidden}  /* ⚠ 必須 absolute：`display:inline-block` 時它仍是 `.turn .head` 的 flex item，會吃掉一份 `gap:8px`；而 `.compact-sep span{padding:0 12px}` 是**後代選擇器**、連它也 match，加上 `box-sizing:border-box`，`width:0` 縮不掉那 24px。實測每個回合標頭偏移 8px、每條 compact 分隔線偏移 24px。 */
+/* 書籤指向的回合找不到時的橫幅。⚠ 沒有它的話「找不到」是徹底靜默的
+   （openSub 的第一行就 return），使用者分不出「沒跳」和「本來就在頁首」。 */
+/* ⚠⚠ **一定要 fixed。** 之前是文件流裡的一塊、插在 body 最前面，而 `scrollIntoView`
+   已經把使用者帶到頁面深處——實測橫幅落在視窗上方 1928px 處，精確命中與退化命中在使用者
+   視窗裡**逐像素相同**。fixed 之後它永遠在視窗內，也不再造成版面位移（out of flow）。
+   ⚠⚠ **但一定要放在「底部」，不能放頂端。** 第一版放 `top:12px`，而
+   `scrollIntoView({block:'start'})` 會把目標輪貼到視窗頂端（y=0）——實測橫幅佔 12–79px，
+   **蓋住的正好是那一輪的標頭**：`.hl` 外框上緣、時間戳、`#` 直達連結全在底下。
+   「.hl 是跳成功的唯一訊號」而它被自己的提示遮掉，等於白做（`durable-anchor-r3` #2）。 */
+.bm-miss{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:60;
+         max-width:min(900px,calc(100vw - 24px));padding:10px 14px;
+         border:1px solid var(--err);border-radius:8px;background:var(--panel);
+         box-shadow:0 4px 16px rgba(0,0,0,.28);font-size:14px;line-height:1.6;
+         max-height:34vh;overflow-y:auto}
+/* ⚠ 關閉鈕要有可按的大小：`padding:2px 4px` 量出來只有 20×19px，低於任何合理的觸控下限
+   （`durable-anchor-r4` #5，由 scripts/probe_anchor_layout.py 守著）。 */
+.bm-x{margin-left:10px;border:0;background:transparent;color:inherit;cursor:pointer;
+      font-size:16px;line-height:1;opacity:.6;padding:0;
+      min-width:28px;min-height:28px;vertical-align:middle}
+.bm-x:hover{opacity:1}
+/* ⚠ 小視窗下文字會折成很多行——實測 500×400 時橫幅吃掉 44% 視窗高。收緊間距與字級。 */
+@media (max-width:640px){.bm-miss{padding:8px 10px;font-size:13px;line-height:1.5;max-height:30vh}}
 details.sgroup{border:1px solid var(--border);border-radius:10px;margin:12px 0;background:var(--panel)}
 details.sgroup>summary{padding:8px 12px;font-size:14px}
 .stitle{font-weight:600}
@@ -6383,7 +6653,11 @@ MAX_HIT_CARDS = 800        # 整頁命中上限（防極熱門詞把頁面撐爆
 # 只認我們自己產生的回合標頭（render_turn_md），把 .md 切回一則一則；
 # 訊息內文若恰好偽裝出同款行會誤切——後果只是該筆跳錯位置，屬已知簡化。
 # 回合標頭：AI 那方是「🤖 <名>」（Claude／Codex…），故 who 放寬成 🤖 後接非空白名（見 ai_name/render_turn_md）。
-_TURN_HEAD_RE = re.compile(r"^### (?P<side>↳ )?(?P<who>👤 You|🤖 \S+) ·(?P<rest>.*)\{#(?P<a>[ts]\d+)\}\s*$")
+# ⚠ 耐久錨點 `{#k…Z}` 接在 `{#tN}` **後面**，所以這條一定要吃得下它，否則整份 .md 切不出
+#   任何回合、搜尋結果頁一則都不會有（`test_search` 的「命中詞高亮」就是在守這一格）。
+#   它是 optional：既有的 .md 是舊 renderer 產的、沒有那一段，重建之前兩種都要認得。
+_TURN_HEAD_RE = re.compile(r"^### (?P<side>↳ )?(?P<who>👤 You|🤖 \S+) ·(?P<rest>.*)\{#(?P<a>[ts]\d+)\}"
+                           r"(?: \{#(?P<k>k[0-9A-Za-z-]+)\})?\s*$")
 _TIME_RE = re.compile(r"\d\d:\d\d:\d\d")
 
 # 查詢語法：空白=AND；獨立大寫 OR=前後任一；"片語"/'片語' 逐字（引號要在詞邊界，

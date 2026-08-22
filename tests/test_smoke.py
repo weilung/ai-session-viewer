@@ -24,6 +24,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "ai_session_viewer.py"
 
+
+def _page_dup_ids(html):
+    """整頁重複的 HTML `id`（**最高不變量**：重複的話 getElementById 會靜默取第一個）。
+
+    ⚠ **只掃標籤開頭上的 `id=`，不能對整份 HTML 做純文字 `findall`**
+    （`durable-anchor-r4` #3 順帶項）：渲染器把訊息內文的 `<`/`>` 跳脫成 `&lt;`/`&gt;`，
+    但**雙引號原封不動**，於是使用者訊息裡的 `id="x"` 會以字面留在 HTML 裡。實測：
+    一則內文含兩個 `id="FAKEDUP"` 的訊息，純文字掃描判定重複，
+    瀏覽器 `querySelectorAll('[id=FAKEDUP]')` 卻是 0 個——**假陽性**。
+    `[^<>]*?` 保證只在同一個標籤開頭之內配對。
+
+    守它的是 `test_durable_anchor` 的素材：那則 assistant 訊息刻意帶兩個
+    `id="IDSCANFAKE"`，**換回純文字掃描這條就會紅**。
+    """
+    ids = re.findall(r'<[a-zA-Z][^<>]*?\sid="([^"]*)"', html)
+    return sorted({i for i in ids if ids.count(i) > 1})
+
+
 SID = "00000000-0000-4000-8000-000000000001"
 # 1x1 透明 PNG
 PNG = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
@@ -3815,6 +3833,351 @@ def test_history_partial_blank_sentinel(tmp_path=None):
     print("OK: history partial blank sentinel test passed")
 
 
+def test_durable_anchor(tmp_path=None):
+    """耐久回合錨點：格式、UTC、撞號 tiebreak、沒有時間的回合，以及 t{n} 不受影響。
+
+    ⚠⚠ **為什麼要用合成輸入**：撞號在真實語料只有 1/9047、`dt is None` 是 0。
+    **「掃了全部語料 0 誤報」不能當成「這條程式碼跑得起來」的證據**——零誤報的路徑
+    正是沒被執行的路徑。這裡把兩條路各強制走一次。
+    """
+    sys.path.insert(0, str(ROOT))   # 全檔 17 個測試裡唯一漏掉的一個（durable-anchor-r4 #3 順帶項）
+    import ai_session_viewer as v
+    from datetime import datetime, timedelta, timezone as _tz
+
+    # --- 1. 格式與 UTC 換算 -------------------------------------------------
+    dt = datetime(2026, 8, 1, 2, 52, 33, 123456, tzinfo=_tz.utc)
+    assert v.durable_anchor(dt) == "k20260801T025233123Z", v.durable_anchor(dt)
+    # 同一時刻換個時區表示，錨點必須一模一樣（否則換時區＝書籤全滅）
+    dt_local = dt.astimezone(_tz(timedelta(hours=8)))
+    assert v.durable_anchor(dt_local) == v.durable_anchor(dt), "同一時刻不同時區應產生同一錨點"
+    # 毫秒不可截掉：只差 1 毫秒也要是不同的錨點（截到整秒會讓撞號從 1 變 31）
+    assert v.durable_anchor(dt) != v.durable_anchor(dt + timedelta(milliseconds=1))
+    assert v.durable_anchor(None) == "", "沒有時間就沒有耐久錨點"
+    # ⚠ naive datetime（沒有 tzinfo）必須被擋掉，不可以走 astimezone()——那會默默假設
+    # **本機時區**，於是換一台機器就換一批錨點，正是這個函式存在要避開的失效模式。
+    # 本 codebase 的 dt 全部來自 parse_ts（已正規化成 aware），實測 9166 輪 naive 0 個，
+    # 但擋一行比日後靜默漂掉便宜。寧可沒有錨點，也不要給一個會隨機器漂的。
+    assert v.durable_anchor(datetime(2026, 8, 1, 2, 52, 33, 123456)) == "",         "naive datetime 必須被拒絕，不可以套用本機時區"
+    # ⚠ 這裡不再另外驗「開頭是 k、不含冒號」——那個變數上面幾行才被字面值釘死成
+    # "k20260801T025233123Z"，再驗一次是**不可能紅**的恆真斷言（durable-anchor-r3 #5）。
+
+    # --- 2. 撞號 tiebreak 與 dt is None（合成 session，強制走那兩條路）-------
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-0000000000da"
+    same = "2026-07-23T15:14:11.497Z"          # 兩則 user 回合共用同一毫秒
+    evs = [
+        {"type": "user", "uuid": "d1", "parentUuid": None, "timestamp": same,
+         "cwd": "/x/Proj", "gitBranch": "main", "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": "撞號第一則DUPFIRST。"}},
+        {"type": "user", "uuid": "d2", "parentUuid": "d1", "timestamp": same,
+         "sessionId": sid,
+         "message": {"role": "user", "content": "撞號第二則DUPSECOND。"}},
+        {"type": "assistant", "uuid": "d3", "parentUuid": "d2",
+         "timestamp": "2026-07-23T15:14:20.250Z", "sessionId": sid,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "md3",
+                     "usage": {"input_tokens": 100, "output_tokens": 20},
+                     "content": [{"type": "text", "text":
+                         # ⚠ 這兩個假 id 是 `_page_dup_ids` 的守衛，**不要「順手清掉」**：
+                         # 內文的 `<`/`>` 會被跳脫、雙引號不會，所以純文字掃描會把它們
+                         # 算成重複的頁面 id（durable-anchor-r4 #3 順帶項）。
+                         '正常回覆NORMALTURN。<div id="IDSCANFAKE">x</div>'
+                         '<span id="IDSCANFAKE">y</span>'}]}},
+        # ⚠ 沒有 timestamp：`parse_ts(None)` → `_dt` 是 None → 該回合沒有耐久錨點
+        {"type": "user", "uuid": "d4", "parentUuid": "d3", "sessionId": sid,
+         "message": {"role": "user", "content": "沒有時間的一則NOTIME。"}},
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={proj.parent}",
+         "--no-codex", "--out", str(out), "--format", "both"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+    md = [p for p in (out / "sessions").rglob("*.md")][0].read_text(encoding="utf-8")
+
+    base = "k20260723T151411497Z"
+    # 撞號：**第一個不加後綴**，第二個才是 -2。
+    assert f'id="{base}"' in html, f"撞號的第一則應拿到無後綴的 {base}"
+    assert f'id="{base}-tb2"' in html, "撞號的第二則應拿到 -tb2 後綴"
+
+    # ⚠⚠ **要斷言「誰」拿到哪一個，不能只斷言「有 base、有 -2」。**
+    # 後者對任何指派順序都成立——durable-anchor-r2 #6 實測示範過：把排序整條刪掉、
+    # 或改成 reverse=True，舊版的三條斷言**全綠**。
+    # 現在的 tiebreak 是來源檔行序（`src_i`），所以先出現在 JSONL 裡的那一則拿無後綴。
+    def _turn_id_of(mark):
+        """含 `mark` 的那個 .turn **開標籤上**的 id（沒有 id 屬性就回 ""）。
+
+        ⚠ 只看開標籤，不能看整段：標頭裡有個 `<span class="tanchor" id="tN">`，
+        看整段會把它的 id 當成回合的 id——那樣「沒有耐久錨點的回合不該有 id」
+        這條就永遠驗不出來（第一版就是這樣，被自己的新斷言抓到）。
+        ⚠ 也不能用 mark 的第一次出現：session 標題取自第一則使用者訊息，
+        所以 mark 常常先出現在 `<title>` 裡，那之前沒有任何 .turn。
+        """
+        pos = -1
+        while True:
+            pos = html.find(mark, pos + 1)
+            if pos < 0:
+                raise AssertionError(f"{mark} 沒有出現在任何 .turn 區塊裡")
+            j = html.rfind('<div class="turn', 0, pos)
+            if j < 0:
+                continue
+            tag = html[j:html.index(">", j)]
+            m = re.search(r'\sid="([^"]*)"', tag)
+            return m.group(1) if m else ""
+
+    assert _turn_id_of("DUPFIRST") == base, \
+        f"來源檔行序在前的那一則要拿無後綴錨點，實得 {_turn_id_of('DUPFIRST')!r}"
+    assert _turn_id_of("DUPSECOND") == f"{base}-tb2", \
+        f"行序在後的那一則要拿 -tb2，實得 {_turn_id_of('DUPSECOND')!r}"
+
+    # 耐久錨點必須掛在 .turn 本身（不是掛在標頭那個 opacity:0 的連結上）：
+    # openSub 只對 .turn 展開內部折疊、也只在它身上加 .hl 外框，而那圈外框是
+    # 「跳成功了」的唯一視覺訊號。掛錯地方，成功與失敗會長得一模一樣。
+    assert re.search(r'<div class="turn user"[^>]*\sid="%s"' % re.escape(base), html), \
+        "耐久錨點必須是 .turn 的 id"
+    # t{n} 退成零尺寸 span，但**必須still在**：全文搜尋與 MD 的 {#tN} 都靠它
+    assert '<span class="tanchor" id="t1">' in html, "t{n} 應保留成 tanchor span"
+    assert '<span class="tanchor" id="t3">' in html, "t{n} 應逐輪都在"
+
+    # 沒有時間的那一則：不給耐久錨點，也不給 # 連結（⚠ 不要退回 t{n} 充數）
+    assert "NOTIME" in html, "沒有時間的回合仍應正常呈現"
+    # ⚠ 舊版寫 `not startswith("k")`，擋不住「退回 t{n}」這個明文禁止的作法
+    # ——把 kanchor 設成 anchor 的突變下，那條照樣綠（durable-anchor-r3 #5）。
+    # 要驗的是：**那個 .turn 根本沒有 id 屬性**。
+    assert _turn_id_of("NOTIME") == "", \
+        f"沒有時間的回合的 .turn 不該有 id（更不可以退回 t{{n}}），實得 {_turn_id_of('NOTIME')!r}"
+
+    # ⚠ **最高不變量：同一頁的 id 必須唯一。** 重複的話 getElementById 會靜默取第一個。
+    # 在這條加進來之前，這個不變量在整個 tests/ 裡是**零自動化守衛**（durable-anchor-r3 #5）。
+    dup = _page_dup_ids(html)
+    assert not dup, f"同一頁出現重複的 id：{dup}"
+
+    # # 直達連結：指向耐久錨點、title 帶本地時間、走 openSub
+    assert f'href="#{base}"' in html, "# 連結應指向耐久錨點"
+    assert 'class="alink"' in html and "這一輪的直達連結" in html, "# 連結與 title 應存在"
+
+    # ⚠ 下面這幾條**只是煙霧檢查**（那幾段 JS 有沒有被整段刪掉），
+    # **不是行為測試**：對產生出來的 JS 做字串比對，只有改名字會紅、改行為不會紅
+    # （durable-anchor-r2 #8）。真正驗行為的是 `node scripts/probe_anchor_js.js <某頁>.html`
+    # ——那支用假 DOM 實際跑這些函式，涵蓋退化、橫幅、上提、同分頁導覽與關閉鈕共 13 組。
+    # ⚠ `tests/` 會投影到公開 dist repo，所以不在這裡引入 node 依賴。
+    for _frag, _why in (("function bmMiss(", "找不到錨點時的橫幅"),
+                        ("bm-miss", "橫幅樣式"),
+                        ("addEventListener('hashchange'", "同分頁導覽的進入點"),
+                        ("classList.contains('tanchor')", "tanchor 上提")):
+        assert _frag in html, f"{_why}那段 JS/CSS 不見了（行為請用 scripts/probe_anchor_js.js 驗）"
+
+    # MD 側：兩個錨點並存，且 {#tN} 在**同一行的前面**（_TURN_HEAD_RE 靠它切回合）
+    # ⚠ 舊版寫 `md.index("{#t1}") < md.index("{#k…}")`，那驗的是**行序不是行內序**
+    # （durable-anchor-r2 #8）：兩個標記分屬不同行時照樣成立，就算 render_turn_md 改成
+    # 先印 k 錨點（那會直接打死 _TURN_HEAD_RE）也不會紅。要驗就驗同一行上的相對位置。
+    assert "{#t1}" in md and f"{{#{base}}}" in md, "MD 應同時帶兩個錨點"
+    both = [ln for ln in md.splitlines() if "{#t" in ln and f"{{#{base}}}" in ln]
+    assert both, f"應有一行同時帶 {{#tN}} 與 {{#{base}}}"
+    for ln in both:
+        assert ln.index("{#t") < ln.index(f"{{#{base}}}"), \
+            f"同一行上 {{#tN}} 必須在耐久錨點之前（_TURN_HEAD_RE 靠它）：{ln!r}"
+
+    # 全文搜尋沒有被新錨點打壞（這一格擋過一次真的回歸）
+    r2 = subprocess.run(
+        [sys.executable, str(SCRIPT), "--search", "NORMALTURN", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r2.returncode == 0, f"搜尋非零退出\nSTDOUT:{r2.stdout}\nSTDERR:{r2.stderr}"
+    spages = sorted((out / "search").glob("*.html"))
+    assert spages, "搜尋應產生結果頁"
+    spage = spages[-1].read_text(encoding="utf-8")
+    assert "<mark>" in spage, "加了耐久錨點之後，搜尋結果頁仍要切得出回合並高亮"
+    print("OK: durable anchor test passed")
+
+
+def test_anchor_tiebreak_main_vs_side(tmp_path=None):
+    """主回合與**子代理回合**撞同一毫秒時，誰拿到無後綴的耐久錨點。
+
+    ⚠⚠ **這條保證在這個 repo 被寫錯過三次**（`durable-anchor-y1` #2 →
+    `r2` #3 → `r4` #1），三次都是因為註解宣稱了某個保證、卻沒有任何測試在守它。
+    這條測試存在的意義就是：**下次再寫錯，它會紅。**
+
+    為什麼是「主回合該贏」：子代理的轉錄檔是 `<sid>/**/*.jsonl`，它在主回合**之後**才落地
+    （子代理是被主對話的 Task 呼叫起來的）。所以真實會發生的情境是
+    「主回合原本獨佔某毫秒、拿了無後綴錨點、使用者存成書籤 → 子代理檔之後才出現」。
+    ⚠ 若讓子代理排在前面，那個既有書籤就會**安靜地指到子代理那一輪**
+    （有 `.hl`、會改寫網址列、不出橫幅）＝「跳到了，但跳到錯的地方」。
+
+    ⚠ **反方向不保證**（子代理先、主回合後出現）——那是已登記的殘餘風險
+    `SCOPE-BOOKMARK-TIEBREAK-INSERT`，不是這條測試的守備範圍。
+    """
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-0000000000tb"
+    hit = "2026-08-05T03:00:00.500Z"          # 主回合與子代理回合共用這一毫秒
+
+    # 主檔：前面墊幾則，讓那個主回合的行序**大於 0**（子代理檔的行序從 0 起算）
+    main_evs = [
+        {"type": "user", "uuid": "m1", "parentUuid": None, "timestamp": "2026-08-05T02:00:00.000Z",
+         "cwd": "/x/Proj", "gitBranch": "main", "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": "墊第一則。"}},
+        {"type": "assistant", "uuid": "m2", "parentUuid": "m1", "timestamp": "2026-08-05T02:00:05.000Z",
+         "sessionId": sid, "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "mm2",
+                                       "usage": {"input_tokens": 50, "output_tokens": 10},
+                                       "content": [{"type": "text", "text": "墊第二則。"}]}},
+        {"type": "user", "uuid": "m3", "parentUuid": "m2", "timestamp": "2026-08-05T02:00:10.000Z",
+         "sessionId": sid, "message": {"role": "user", "content": "墊第三則。"}},
+        {"type": "user", "uuid": "m4", "parentUuid": "m3", "timestamp": hit,
+         "sessionId": sid, "message": {"role": "user", "content": "主回合MAINCOLLIDE。"}},
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in main_evs), encoding="utf-8")
+
+    # 子代理轉錄：<sid>/**/*.jsonl，**第 0 行**就撞同一毫秒
+    side_dir = proj / sid
+    side_dir.mkdir(parents=True, exist_ok=True)
+    side_evs = [
+        {"type": "user", "uuid": "s1", "parentUuid": None, "timestamp": hit,
+         "sessionId": sid, "message": {"role": "user", "content": "子代理SIDECOLLIDE。"}},
+        {"type": "assistant", "uuid": "s2", "parentUuid": "s1", "timestamp": "2026-08-05T03:00:02.000Z",
+         "sessionId": sid, "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "ms2",
+                                       "usage": {"input_tokens": 30, "output_tokens": 5},
+                                       "content": [{"type": "text", "text": "子代理回覆。"}]}},
+    ]
+    (side_dir / "agent1.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in side_evs), encoding="utf-8")
+
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={proj.parent}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+
+    def _turn_tag_id(mark):
+        pos = -1
+        while True:
+            pos = html.find(mark, pos + 1)
+            if pos < 0:
+                raise AssertionError(f"{mark} 沒有出現在任何 .turn 區塊裡")
+            j = html.rfind('<div class="turn', 0, pos)
+            if j < 0:
+                continue
+            m = re.search(r'\sid="([^"]*)"', html[j:html.index(">", j)])
+            return m.group(1) if m else ""
+
+    base = "k20260805T030000500Z"
+    got_main = _turn_tag_id("MAINCOLLIDE")
+    got_side = _turn_tag_id("SIDECOLLIDE")
+    # 前置：兩者真的撞在同一毫秒（fixture 沒寫壞）
+    assert got_main.startswith(base) and got_side.startswith(base), \
+        f"fixture 沒撞號：main={got_main!r} side={got_side!r}"
+    assert got_main == base, \
+        (f"主回合要拿無後綴的 {base}，實得 {got_main!r}——"
+         "子代理檔之後才落地時，這會讓既有書籤安靜指到子代理那一輪")
+    assert got_side == f"{base}-tb2", f"子代理回合要拿 -tb2，實得 {got_side!r}"
+
+    # 同一頁 id 唯一（撞號處理不可產生重複）
+    dup = _page_dup_ids(html)
+    assert not dup, f"同一頁出現重複的 id：{dup}"
+    print("OK: anchor tiebreak (main vs side) test passed")
+
+
+def test_anchor_tiebreak_sort_is_load_bearing(tmp_path=None):
+    """撞號組的**排序本身**是否承重：把它拿掉、或把鍵廢成常數，這條必須紅。
+
+    ⚠⚠ **為什麼要有第二條 tiebreak 測試**（`durable-anchor-r4` #3）：
+    前兩條（`test_durable_anchor` 的撞號段、`test_anchor_tiebreak_main_vs_side`）用的素材，
+    **list 位置順序剛好等於 `(src_f, src_i)` 順序**——前者是連續兩則主對話 user 事件，
+    後者是「主檔 vs 子代理檔」而 `s.main_groups + s.side_groups` 本來就主在前。
+    於是「有排序」與「完全不排序」輸出一樣，實測下列突變**全綠**：
+    刪掉 `_grp.sort(...)`／`_tiebreak_key` 恆回 `0`／恆回 `-1`／換回上一版被否決的
+    `(bool(side), role)`。兩條測試都只對**反序**敏感，對**沒有排序**不敏感。
+
+    **這條的素材刻意讓兩者相反**：兩個子代理轉錄檔撞同一毫秒，
+    `by_parent` 的插入序（＝各自**最早**事件的時間序）與**檔名序**相反——
+    `z_agent.jsonl` 開場早所以 list 位置在前，但 `a_agent.jsonl` 檔名排前所以排序後該由它拿
+    無後綴錨點。**不排序就會換人**，上述五個突變因此全部會紅（實測，2026-08-22）。
+
+    ⚠ 這裡不重複驗「主 vs 子」那條保證，那是
+    `test_anchor_tiebreak_main_vs_side` 的守備範圍；本條只驗**排序有沒有在做事**。
+    """
+    sys.path.insert(0, str(ROOT))
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-0000000000sf"
+    hit = "2026-08-05T03:00:00.500Z"          # 兩個子代理回合共用這一毫秒
+
+    # 主檔只墊一則（session 要有個標題與起訖時間）
+    (proj / f"{sid}.jsonl").write_text(json.dumps(
+        {"type": "user", "uuid": "m1", "parentUuid": None,
+         "timestamp": "2026-08-05T01:00:00.000Z", "cwd": "/x/Proj", "gitBranch": "main",
+         "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": "主檔墊一則MAINPAD。"}},
+        ensure_ascii=False), encoding="utf-8")
+
+    side_dir = proj / sid
+    side_dir.mkdir(parents=True, exist_ok=True)
+
+    def _agent(fname, tool_use_id, first_ts, mark):
+        """一個子代理轉錄檔：開場一則（時間決定 `by_parent` 插入序）＋撞號一則。
+
+        ⚠ `.meta.json` 的 `toolUseId` 不可省：沒有它兩個檔會併進同一個 `by_parent` 桶
+        （key 都是 `""`），side 事件本來就依時間排過，撞號時穩定排序退回**檔案載入序**
+        ＝檔名序，於是又變成「不排序也對」，這條測試就白寫了。
+        """
+        evs = [
+            {"type": "user", "uuid": fname + "u0", "parentUuid": None, "timestamp": first_ts,
+             "sessionId": sid, "message": {"role": "user", "content": f"{mark}開場。"}},
+            {"type": "user", "uuid": fname + "u1", "parentUuid": fname + "u0", "timestamp": hit,
+             "sessionId": sid, "message": {"role": "user", "content": f"{mark}撞號。"}},
+        ]
+        (side_dir / f"{fname}.jsonl").write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+        (side_dir / f"{fname}.meta.json").write_text(
+            json.dumps({"toolUseId": tool_use_id, "agentType": "x", "description": mark}),
+            encoding="utf-8")
+
+    # ⚠ 這兩行的**時間**與**檔名**刻意相反，別「順手」調成一致——調了這條就失去鑑別力。
+    _agent("a_agent", "tid_a", "2026-08-05T02:30:00.000Z", "AAGENT")   # 檔名前、開場晚
+    _agent("z_agent", "tid_z", "2026-08-05T02:00:00.000Z", "ZAGENT")   # 檔名後、開場早
+
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={proj.parent}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+
+    def _turn_tag_id(mark):
+        pos = -1
+        while True:
+            pos = html.find(mark, pos + 1)
+            if pos < 0:
+                raise AssertionError(f"{mark} 沒有出現在任何 .turn 區塊裡")
+            j = html.rfind('<div class="turn', 0, pos)
+            if j < 0:
+                continue
+            m = re.search(r'\sid="([^"]*)"', html[j:html.index(">", j)])
+            return m.group(1) if m else ""
+
+    base = "k20260805T030000500Z"
+    got_a = _turn_tag_id("AAGENT撞號")
+    got_z = _turn_tag_id("ZAGENT撞號")
+    # 前置：fixture 真的撞號（改壞了要在這裡就講清楚，不要讓下面兩條的訊息誤導人）
+    assert got_a.startswith(base) and got_z.startswith(base),         f"fixture 沒撞號：a={got_a!r} z={got_z!r}"
+    # ⚠ list 位置是 z 在前（開場早）。排序若沒在做事，拿到無後綴的就會是 z。
+    assert got_a == base,         (f"檔名序在前的 a_agent 要拿無後綴的 {base}，實得 {got_a!r}——"
+         "撞號組的排序沒在做事（被刪掉／鍵成了常數），錨點退回 list 位置")
+    assert got_z == f"{base}-tb2", f"檔名序在後的 z_agent 要拿 -tb2，實得 {got_z!r}"
+    dup = _page_dup_ids(html)
+    assert not dup, f"同一頁出現重複的 id：{dup}"
+    print("OK: anchor tiebreak sort-is-load-bearing test passed")
+
+
 if __name__ == "__main__":
     test_smoke()
     test_search()
@@ -3845,3 +4208,6 @@ if __name__ == "__main__":
     test_message_role_and_content_drift()
     test_json_string_content()
     test_history_partial_blank_sentinel()
+    test_durable_anchor()
+    test_anchor_tiebreak_main_vs_side()
+    test_anchor_tiebreak_sort_is_load_bearing()

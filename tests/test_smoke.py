@@ -19,10 +19,70 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "ai_session_viewer.py"
+
+
+def new_tmp(tmp_path=None):
+    """這一支測試要用的暫存目錄。給了 `tmp_path` 就用它，否則自己開一個。
+
+    ⚠⚠ **為什麼不直接 `tempfile.mkdtemp()`**：在**沙箱化的 code review 環境**下
+    （codex `workspace-write`），`mkdtemp()` 建出來的目錄**連根目錄都寫不進去**，
+    更別說在裡面再建一層——而這個測試套件每一支都要建 `projects/<專案>/`。
+    ⇒ 整套測試**一行斷言都跑不到**就 `PermissionError` 死掉，於是 reviewer
+    **靜默降級成純讀碼、卻照樣寫出漂亮的 verdict**。這個 repo 為此賠過兩輪額度。
+
+    ⭐ **2026-08-23 實測把成因釘死了**（`bookmarks-p4-codex` 的能力回報）：
+    | 位置 | 建目錄 | 寫檔 |
+    |---|---|---|
+    | `mkdtemp()` 的根 | — | **✗ 存取被拒** |
+    | `mkdtemp()` 底下再一層 | **✗** | ✗ |
+    | runner 預建的 `%TMP%\\work\\` 底下（`Path.mkdir`）| **✓** | **✓**（連巢狀都可以）|
+
+    ⚠⚠ **2026-08-23 晚間訂正（`bookmarks-p4fix-codex` Medium）：上面那張表是對的，
+    但從它推出來的結論錯了。** 當時的結論是「事前就存在的目錄可以用」，於是本函式改成
+    `mkdtemp(dir=<那個目錄>)`——**換了地點，沒換機制**。跨模型輪照樣整套死在
+    `WinError 5`，只是改死在 `work\\tmpXXXX\\projects`。
+
+    真正的規則是：**不可以是 `mkdtemp()` 建的目錄，不管它建在哪。**
+    `mkdtemp()` 會鎖權限（Windows 上是受限的 DACL），沙箱的受限 token 進不去它建的那一層；
+    表格第三列之所以成功，是因為那一列用的是 `Path.mkdir()`，不是 `mkdtemp()`。
+
+    所以：設 `ASV_TEST_TMP` 指到一個**已經存在且可寫**的目錄，本函式就用 `Path.mkdir()`
+    在它底下開一個唯一子目錄。沙箱環境下的 charter 只要加一行：
+
+        $env:ASV_TEST_TMP = "$env:TMP\\work"
+
+    ⚠ 沒設就照舊走 `mkdtemp()`——本機開發完全不受影響。
+
+    ⚠⚠ **這件事在本機無法被否證**（沒有沙箱，兩條路都寫得進去），所以
+    `test_tmp_base_env` 是用「**把 `mkdtemp` 換成會爆的東西，看它還活不活得下去**」
+    在守，而不是用「建得出來嗎」在守。後者當時是綠的，而結論是錯的。
+    """
+    if tmp_path:
+        return Path(tmp_path)
+    base = os.environ.get("ASV_TEST_TMP")
+    if base:
+        b = Path(base)
+        # ⚠ 只在**它已經存在**時才用：不存在就代表使用者指錯了，
+        # 這時候自己 mkdir 出來的目錄在沙箱下照樣寫不進去（那正是要避開的情況），
+        # 而且會把「路徑打錯」變成一個更難查的權限錯誤。
+        if b.is_dir():
+            # ⚠ **不可以用 `mkdtemp(dir=b)`**——理由見上方訂正。
+            # `exist_ok=False` 是刻意的：撞號要當場看得見，不要靜靜共用同一個目錄
+            # （兩支測試共用暫存目錄的症狀會表現成「另一支的產物污染我的斷言」）。
+            for _ in range(8):
+                cand = b / ("asv-" + uuid.uuid4().hex[:16])
+                try:
+                    cand.mkdir(parents=False, exist_ok=False)
+                    return cand
+                except FileExistsError:
+                    continue
+            raise RuntimeError("在 ASV_TEST_TMP 底下連續 8 次都撞號：" + str(b))
+    return Path(tempfile.mkdtemp())
 
 
 def _session_pages(out):
@@ -129,7 +189,7 @@ def _build_fixture(base: Path) -> Path:
 
 
 def test_smoke(tmp_path=None):
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     projects = _build_fixture(tmp)
     out = tmp / "out"
     r = subprocess.run(
@@ -175,7 +235,7 @@ def test_smoke(tmp_path=None):
 
 def test_search(tmp_path=None):
     # --search：搜既有輸出，結果頁含高亮與跳轉錨點；多詞 = 同一則內 AND
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     projects = _build_fixture(tmp)
     out = tmp / "out"
     r = subprocess.run(
@@ -336,7 +396,7 @@ SUB_EVENTS = [
 
 
 def test_subagent_inline(tmp_path=None):
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     sub = proj / SID2 / "subagents"
     sub.mkdir(parents=True, exist_ok=True)
@@ -393,7 +453,7 @@ def test_subagent_inline(tmp_path=None):
 
 def test_day_divider(tmp_path=None):
     # 跨兩天的對話：應出現換日分隔線（含星期），且只在換日時出現
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-000000000003"
@@ -427,7 +487,7 @@ def test_day_divider(tmp_path=None):
 
 def test_compact_marker(tmp_path=None):
     # 含 /compact 摘要的 session：應插入壓縮分隔線，摘要收進摺疊（不直接攤在版面）
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-000000000004"
@@ -472,7 +532,7 @@ def test_compact_marker(tmp_path=None):
 def test_cache_report(tmp_path=None):
     # 快取分析報告 v2：TTL 細分計價（1h=2×）、成因分解（first/switch/expiry/evict）、
     # 429 邊界自動偵測（切帳號不污染 TTL 統計）、TTL 遵約率、SVG 圖表與 md twin。
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-000000000005"
@@ -595,7 +655,7 @@ def test_cache_report(tmp_path=None):
 def test_codex_step_badges(tmp_path=None):
     # Codex 逐步快取徽章：token_count 掛在該次呼叫的第一筆事件＝步驟起點；
     # 冷啟步驟有紅標與 ❄最低；重播的 token_count 去重；孤兒 token_count（無任何事件前）安全丟棄。
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     sess_dir = tmp / "sessions" / "2026" / "06" / "05"
     sess_dir.mkdir(parents=True, exist_ok=True)
     csid = "019f0000-0000-7000-8000-000000000001"
@@ -665,7 +725,7 @@ def test_codex_step_badges(tmp_path=None):
 def test_session_kind_tags(tmp_path=None):
     # session 型態自動分類：review（首句 # Review）／exec（codex_exec 無頭）／一般；
     # 索引有型態下拉與標題徽章、row 帶 data-kind、md twin 有型態標記、session 頁有 chip。
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     sess_dir = tmp / "sessions" / "2026" / "06" / "06"
     sess_dir.mkdir(parents=True, exist_ok=True)
 
@@ -734,7 +794,7 @@ def test_session_kind_tags(tmp_path=None):
 def test_codex_survival_report(tmp_path=None):
     # Codex 快取存活統計獨立頁：相鄰呼叫 gap→命中，依型態分層；與 Claude 報告互相獨立
     #（無 Claude 資料時 cache-report 不產生、cache-codex 照樣產生）。
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     sess_dir = tmp / "sessions" / "2026" / "06" / "07"
     sess_dir.mkdir(parents=True, exist_ok=True)
 
@@ -925,7 +985,7 @@ def test_classify_cache_causes():
 def test_cold_cause_badges(tmp_path=None):
     # Claude 逐步冷啟徽章依成因著色：結構性（首呼叫）→ 中性灰 coldx；真失效（提早逐出）→ 醒目紅 cold。
     # 另驗 token 細分徽章（新輸入/快取寫入/快取讀取）與其勾選開關、預設隱藏 class。
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     csid = "00000000-0000-4000-8000-0000000000c1"
     proj = tmp / "projects" / "cold-proj"
     proj.mkdir(parents=True, exist_ok=True)
@@ -1137,7 +1197,7 @@ def test_api_miss_reason(tmp_path=None):
     assert "②-b" in md and "工具定義變動" in md, "MD 報告應有同一小節"
 
     # ── 端對端：session 頁徽章 ──
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     msid = "00000000-0000-4000-8000-0000000000m1".replace("m", "a")
     proj = tmp / "projects" / "miss-proj"
     proj.mkdir(parents=True, exist_ok=True)
@@ -1620,7 +1680,7 @@ def test_codex_ai_label(tmp_path=None):
     m = v._TURN_HEAD_RE.match("### 🤖 Codex · 12:00:00  ·  ⚡50% {#t2}")
     assert m and m.group("who") == "🤖 Codex", "搜尋正則應能切出 Codex 回合標頭"
 
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     sess_dir = tmp / "sessions" / "2026" / "06" / "07"
     sess_dir.mkdir(parents=True, exist_ok=True)
     csid = "019f0000-0000-7000-8000-0000000000a1"
@@ -1663,7 +1723,7 @@ def test_codex_item_completed_user(tmp_path=None):
     # Codex 0.147 互動模式（codex-tui）不再發 event_msg:user_message，改發
     # item_completed(item.type == "UserMessage")；exec 路徑仍發舊格式。兩種都要收得到
     # 使用者 prompt 與標題，且某版兩種都發時只能收一次（不得重複呈現）。
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     sess_dir = tmp / "sessions" / "2026" / "06" / "08"
     sess_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2280,7 +2340,7 @@ def test_account_switch_cause(tmp_path=None):
     import ai_session_viewer as v
 
     sid = "019f0100-0000-7000-8000-000000000abc"
-    cfg_a = Path(tmp_path or tempfile.mkdtemp()) / "cfgA"
+    cfg_a = new_tmp(tmp_path) / "cfgA"
     cfg_b = cfg_a.parent / "cfgB"
     for c in (cfg_a, cfg_b):
         c.mkdir(parents=True, exist_ok=True)
@@ -2923,7 +2983,7 @@ def test_acct_separator_and_step_time(tmp_path=None):
     import ai_session_viewer as v
     from datetime import datetime, timedelta, timezone
 
-    root = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    root = new_tmp(tmp_path)
 
     def ep(iso):
         # 保留小數：切換時刻的次秒精度是被測行為之一
@@ -3445,7 +3505,7 @@ def test_prompt_loss_backstop(tmp_path=None):
     sys.path.insert(0, str(ROOT))
     v = importlib.import_module("ai_session_viewer")
 
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     tmp.mkdir(parents=True, exist_ok=True)
 
     def line(sec, typ, payload):
@@ -3514,7 +3574,7 @@ def test_response_item_type_drift(tmp_path=None):
     sys.path.insert(0, str(ROOT))
     v = importlib.import_module("ai_session_viewer")
 
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     tmp.mkdir(parents=True, exist_ok=True)
 
     def line(sec, typ, payload):
@@ -3692,7 +3752,7 @@ def test_message_role_and_content_drift(tmp_path=None):
     sys.path.insert(0, str(ROOT))
     v = importlib.import_module("ai_session_viewer")
 
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     tmp.mkdir(parents=True, exist_ok=True)
 
     def line(sec, typ, payload):
@@ -3762,7 +3822,7 @@ def test_json_string_content(tmp_path=None):
     sys.path.insert(0, str(ROOT))
     v = importlib.import_module("ai_session_viewer")
 
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     tmp.mkdir(parents=True, exist_ok=True)
     blocks = [{"type": "text", "text": "真正的問句JSONQ"}, {"type": "image", "url": "x"}]
 
@@ -3836,7 +3896,7 @@ def test_history_partial_blank_sentinel(tmp_path=None):
     sys.path.insert(0, str(ROOT))
     v = importlib.import_module("ai_session_viewer")
 
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
 
     def cfg(name, rows):
         c = tmp / name
@@ -3901,7 +3961,7 @@ def test_durable_anchor(tmp_path=None):
     # "k20260801T025233123Z"，再驗一次是**不可能紅**的恆真斷言（durable-anchor-r3 #5）。
 
     # --- 2. 撞號 tiebreak 與 dt is None（合成 session，強制走那兩條路）-------
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-0000000000da"
@@ -4049,7 +4109,7 @@ def test_anchor_tiebreak_main_vs_side(tmp_path=None):
     ⚠ **反方向不保證**（子代理先、主回合後出現）——那是已登記的殘餘風險
     `SCOPE-BOOKMARK-TIEBREAK-INSERT`，不是這條測試的守備範圍。
     """
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-0000000000tb"
@@ -4143,7 +4203,7 @@ def test_anchor_tiebreak_sort_is_load_bearing(tmp_path=None):
     `test_anchor_tiebreak_main_vs_side` 的守備範圍；本條只驗**排序有沒有在做事**。
     """
     sys.path.insert(0, str(ROOT))
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-0000000000sf"
@@ -4235,7 +4295,7 @@ def test_bookmark_ui(tmp_path=None):
     （第一版就是這樣寫的）。`extract_rename()` **不剝標籤**，那才是真正沒有上游防護的路徑。
     """
     sys.path.insert(0, str(ROOT))
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-0000000000bk"
@@ -4353,6 +4413,416 @@ def test_bookmark_ui(tmp_path=None):
     assert not dup, f"同一頁出現重複的 id：{dup}"
     print("OK: bookmark UI (phase 2) shape test passed")
 
+def test_bookmark_block_anchors(tmp_path=None):
+    """書籤第 4 期：**區塊層級錨點**的文法、序號作用域，以及每個可標記區塊的 ☆。
+
+    錨點文法（`bookmarks-proposal.md`〈現在該預留什麼〉定死的那一條）：
+
+        k<回合時戳>[-tb<n>]              ← 回合（第 0＋1 期，已出貨）
+        k<回合時戳>[-tb<n>]-s<步epoch>-b<n>  ← 屬於某一步的區塊，n **以步為作用域**
+        k<回合時戳>[-tb<n>]-b<n>            ← 落在第一個 `_step` 之前的區塊，n 以回合為作用域
+
+    ⚠⚠ **為什麼 n 要以「步」為作用域，而不是整輪**：全語料實測（`probe_turn_identity.py
+    blocks`）一輪的可標記區塊數 Claude p99=101／max=286、Codex p99=129／max=412，
+    **12.6%／34.4% 的回合超過 20 個區塊**——用輪內序號的話，「爆炸半徑關在一輪之內」
+    這個理由就名存實亡（一輪就是整段對話）。同一份實測另外量到：`_step.t` 缺漏
+    **0/67876**、同輪內步時戳撞號 **0** ⇒ 用步時戳當作用域是免費的。
+    改用步作用域後，一步底下的區塊數 p90 只有 2〜4。
+
+    ⚠ **`_step` 沒有時戳時，那一步的區塊一律不給錨點**（實測 0 筆，但那條路要能走）。
+    理由與 `durable_anchor()` 拒絕 naive datetime 同一條：**寧可沒有錨點，也不要給一個
+    會撞號的**——若退回輪內序號，就會和「第一個 `_step` 之前」那些區塊撞在同一個
+    `-b<n>` 命名空間裡，然後安靜指錯。
+    """
+    sys.path.insert(0, str(ROOT))
+    tmp = new_tmp(tmp_path)
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-0000000000b4"
+    # 一則 user（沒有 `_step` ⇒ 走輪內序號那條路）＋ 一個含**兩步**的 assistant 回合。
+    # ⚠ 兩步必須是不同的 `message.id`：`group_turns(per_step=True)` 是按 id 起新的一步。
+    evs = [
+        {"type": "user", "uuid": "p1", "parentUuid": None,
+         "timestamp": "2026-08-09T04:05:06.700Z", "cwd": "/x/Proj", "gitBranch": "main",
+         "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": "使用者這一則P4USER。"}},
+        # 第一步：文字 ＋ 工具呼叫（兩個可標記區塊）
+        {"type": "assistant", "uuid": "p2", "parentUuid": "p1",
+         "timestamp": "2026-08-09T04:05:10.000Z", "sessionId": sid,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "mstepA",
+                     "usage": {"input_tokens": 100, "output_tokens": 20},
+                     "content": [{"type": "text", "text": "第一步的說明P4TXTA。"},
+                                 {"type": "tool_use", "id": "tu_a", "name": "Bash",
+                                  "input": {"command": "echo P4TOOLA"}}]}},
+        # 第二步：又一段文字 ＋ 又一個工具呼叫
+        {"type": "assistant", "uuid": "p3", "parentUuid": "p2",
+         "timestamp": "2026-08-09T04:05:40.000Z", "sessionId": sid,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "mstepB",
+                     "usage": {"input_tokens": 120, "output_tokens": 25},
+                     "content": [{"type": "text", "text": "第二步的說明P4TXTB。"},
+                                 {"type": "tool_use", "id": "tu_b", "name": "Read",
+                                  "input": {"file_path": "/x/P4TOOLB.py"}}]}},
+        # ⚠ 沒有 timestamp ⇒ 整輪沒有耐久錨點 ⇒ **裡面的區塊也不該有 id 或 ☆**
+        {"type": "user", "uuid": "p4", "parentUuid": "p3", "sessionId": sid,
+         "message": {"role": "user", "content": "沒有時間的一則P4NOTIME。"}},
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={proj.parent}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    page = [p for p in _session_pages(out)][0]
+    html = page.read_text(encoding="utf-8")
+
+    # ⚠⚠ **不可以用第一次或最後一次出現。** session 標題取自第一則使用者訊息，於是
+    # 「P4USER」會出現三次：`<title>`／`<h1>`（在所有 `.turn` **之前**）、對話本體，
+    # 以及頁尾 `<script>` 裡的 `BK_TITLE`（在所有 `.turn` **之後**）。
+    # 第一版用 `rindex` 撈到的是頁尾那一個，於是往前找到的是**整頁最後一個** `.blk`
+    # ——斷言照跑，只是驗錯了對象（測試自己先示範了一次「安靜指錯」）。
+    _body = html.index('<div class="turn')
+
+    def _blk_of(mark):
+        """含 `mark` 的那個 `.blk` 包裝元素的**開標籤**（找不到就回 ""）。
+
+        ⚠ 只回開標籤：包裝裡面還有巢狀內容（子代理、工具結果），看整段會把裡層的
+        id 誤認成這一塊的 id。
+        """
+        pos = html.index(mark, _body)
+        j = html.rfind('<div class="blk"', 0, pos)
+        if j < 0:
+            return ""
+        return html[j:html.index(">", j) + 1]
+
+    # --- 1. 步作用域：每一步的第一個區塊都是 -b1，不是接著上一步往下數 -------
+    a_txt, a_tool = _blk_of("P4TXTA"), _blk_of("P4TOOLA")
+    b_txt, b_tool = _blk_of("P4TXTB"), _blk_of("P4TOOLB")
+    for name, tag in (("P4TXTA", a_txt), ("P4TOOLA", a_tool),
+                      ("P4TXTB", b_txt), ("P4TOOLB", b_tool)):
+        assert tag, f"{name} 沒有被 .blk 包起來"
+        assert ' id="k' in tag, f"{name} 的 .blk 沒有耐久錨點：{tag}"
+
+    ids = {}
+    for name, tag in (("P4TXTA", a_txt), ("P4TOOLA", a_tool),
+                      ("P4TXTB", b_txt), ("P4TOOLB", b_tool)):
+        m = re.search(r' id="([^"]+)"', tag)
+        assert m, f"{name} 抓不到 id：{tag}"
+        ids[name] = m.group(1)
+
+    # 文法：兩步的區塊都要帶 `-s<epoch>-b<n>`
+    for name in ("P4TXTA", "P4TOOLA", "P4TXTB", "P4TOOLB"):
+        assert re.match(r"^k\d{8}T\d{9}Z-s\d+-b\d+$", ids[name]), \
+            f"{name} 的錨點文法不對：{ids[name]}"
+
+    # ⚠⚠ **這一格才是「步作用域」的承重斷言。** 只驗「有 -s 有 -b」的話，
+    # 把序號改成整輪連號（b1..b4）照樣全綠——那正是這一期要換掉的行為。
+    assert ids["P4TXTA"].endswith("-b1"), f"第一步的第一個區塊應是 -b1：{ids['P4TXTA']}"
+    assert ids["P4TOOLA"].endswith("-b2"), f"第一步的第二個區塊應是 -b2：{ids['P4TOOLA']}"
+    assert ids["P4TXTB"].endswith("-b1"), \
+        f"⚠ 第二步的第一個區塊必須重新從 -b1 起算（序號作用域＝步，不是整輪）：{ids['P4TXTB']}"
+    assert ids["P4TOOLB"].endswith("-b2"), f"第二步的第二個區塊應是 -b2：{ids['P4TOOLB']}"
+
+    # 兩步的 `-s<epoch>` 必須不同，否則作用域根本沒分開（四個 id 會撞成兩對）
+    sa = ids["P4TXTA"].split("-s")[1].split("-b")[0]
+    sb = ids["P4TXTB"].split("-s")[1].split("-b")[0]
+    assert sa != sb, f"兩步的步時戳相同（{sa}），序號作用域沒有真的分開"
+    assert len(set(ids.values())) == 4, f"四個區塊的錨點不是互異的：{ids}"
+
+    # --- 2. 回合作用域：user 回合沒有 `_step`，走 `-b<n>`（不帶 -s）---------
+    u = _blk_of("P4USER")
+    assert u, "使用者那一則的文字區塊沒有被 .blk 包起來"
+    mu = re.search(r' id="([^"]+)"', u)
+    assert mu, f"使用者區塊抓不到 id：{u}"
+    assert re.match(r"^k\d{8}T\d{9}Z-b\d+$", mu.group(1)), \
+        f"沒有步的回合，其區塊應走輪內序號（不帶 -s）：{mu.group(1)}"
+
+    # --- 3. 每個可標記區塊都要有自己的 ☆（Will 2026-08-23 裁決：文字段落也要）--
+    def _blk_full(mark):
+        pos = html.index(mark, _body)
+        j = html.rfind('<div class="blk"', 0, pos)
+        assert j >= 0, f"{mark} 不在任何 .blk 裡"
+        return html[j:pos]
+
+    for mark in ("P4TXTA", "P4TOOLA", "P4TXTB", "P4TOOLB", "P4USER"):
+        seg = _blk_full(mark)
+        assert 'class="bmk blk-ctl"' in seg, f"{mark} 這一塊少了加書籤鈕"
+        assert 'class="alink blk-ctl"' in seg, f"{mark} 這一塊少了 # 直達連結"
+
+    # --- 4. 沒有耐久錨點的回合，區塊也不給（給了也存不回來）-----------------
+    pos = html.rindex("P4NOTIME")
+    j = html.rfind('<div class="turn', 0, pos)
+    assert j >= 0, "P4NOTIME 不在任何 .turn 裡"
+    seg = html[j:pos]
+    assert '<div class="blk"' not in seg, \
+        "沒有耐久錨點的回合不該有 .blk 包裝（那一塊的書籤存不回來）"
+    assert 'class="bmk' not in seg, "沒有耐久錨點的回合不該有任何加書籤鈕"
+
+    # --- 5. 步本身也要有錨點（退化階梯的中間那一階）------------------------
+    # 區塊找不到 → 退到 `k…-s<epoch>` → 再退到 `k…`。沒有中間這階的話，
+    # 一個 286 個區塊的回合裡，任何一次區塊漂移都會直接彈回整輪的最上面。
+    # ⚠ 要驗**完整的那一個 id**。第一版寫成 `'id="k' in html and f'-s{ep}"' in html`，
+    # 前半對任何頁面都成立、後半也被區塊自己的 `-s…-b1` 滿足 ⇒ 就算完全不掛步錨點也全綠。
+    for name in ("P4TXTA", "P4TXTB"):
+        step_id = ids[name].split("-b")[0]          # k…-s<epoch>
+        assert f'<div class="step-sep" id="{step_id}">' in html, \
+            f"步 {step_id} 的分隔列沒有掛上錨點（退化階梯少了中間一階）"
+    assert html.count('<div class="step-sep" id="k') == 2, \
+        "兩步就該有兩個掛了錨點的步驟列"
+
+    # --- 6. 整頁 id 不可重複（區塊 id 一多，撞號就從理論變實務）------------
+    dup = _page_dup_ids(html)
+    assert not dup, f"頁面上有重複的 id：{sorted(dup)[:8]}"
+
+    # --- 7. `block_anchor()` 的四條契約（**直接對純函式下斷言**）------------
+    # ⚠⚠ **為什麼不走整條管線**：第三條（步有、時戳沒有）在真實與合成語料上都造不出來
+    # ——沒有 timestamp 的 assistant 事件會排到整個檔案的最前面，因而**自成一輪**、
+    # 那一輪連 kanchor 都沒有，走的是「整輪沒錨點」那條既有的路（§4 已經在守）。
+    # 第一版就是這樣寫的，結果 M2／M9 兩個突變**全部漏掉**：斷言看起來很像在守這件事，
+    # 其實素材根本到不了那個狀態。
+    # ⚠ 這裡**不是**把它降級成「沒有素材所以不驗」（教訓 34）——契約照驗，
+    # 只是驗在唯一到得了那個狀態的地方：函式本身。
+    import ai_session_viewer as v4
+    assert v4.block_anchor("kX", None, 3, False) == "kX-b3", \
+        "第一個 `_step` 之前的區塊：序號以回合為作用域，不帶 -s"
+    assert v4.block_anchor("kX", 1786248310, 2, True) == "kX-s1786248310-b2", \
+        "步裡的區塊：帶 -s<epoch>，序號以步為作用域"
+    assert v4.block_anchor("kX", None, 2, True) == "", \
+        ("步裡的區塊但那一步沒有時戳 ⇒ **什麼都不給**。退回 `kX-b2` 會和"
+         "「第一個 `_step` 之前」那些區塊撞進同一個 -b<n> 命名空間，然後安靜指錯")
+    assert v4.block_anchor("", 1786248310, 1, True) == "", \
+        "整輪沒有耐久錨點時，區塊也不給（給了也存不回來）"
+    # 第五條（`bookmarks-p4fix-codex` Medium）：**負的步 epoch 一律不給錨點**。
+    # ⚠⚠ 理由不是「1970 年前不會發生」，是**分隔符撞上字母表**：`-` 就是段落分隔符，
+    # 所以 `kX-s-500-b1` 對**每一個**用 `-` 切字串的消費者都是畸形——
+    # `bmGrammarOk()` 判它不合法（於是合法的錨點被宣告未命中），而 `openSub()` 的
+    # `lastIndexOf('-')` 退化階梯也會把它切在錯的地方。
+    # ⇒ 修的是**產出端**，不是驗證端：讓文法接受帶號數字，等於要求下游每一個
+    # 消費者都自己處理負號，那是把一個洞換成三個。
+    # 這和上面第三條是同一條規則：**寧可沒有錨點，也不要給一個會指錯的。**
+    assert v4.block_anchor("kX", -500, 1, True) == "", \
+        "負的步 epoch ⇒ 什麼都不給（`-` 是分隔符，帶號數字會讓每個消費者都切錯）"
+    assert v4.block_anchor("kX", 0, 1, True) == "kX-s0-b1", \
+        "⚠ 對照組：0 是合法的（別把「負的不給」寫成「非正的不給」）"
+
+    # --- 7b. ⚠⚠ **第二個產出端**：步驟列的 id 也不可以吐出帶號的 `-s`（p4fix-r2 Low）---
+    # 上面那幾條只對 `block_anchor()` 這個純函式下斷言，而 `-s<ep>` 有**兩個**產出端：
+    # 區塊錨點與**步驟列的 id**。第一版只修了前者 ⇒ 同一個 group 裡區塊錨點正確消失，
+    # 步驟列卻照樣輸出 `k…-s-900`——那正是 `bmGrammarOk()` 會拒絕的形狀。
+    # ⚠ **這一格必須走 renderer**，不可以再對純函式下斷言：純函式那一層永遠看不到
+    # 第二個產出端，而「同一條規則寫在兩個地方」正是這個 repo 反覆吃虧的形狀。
+    neg_group = {
+        "kanchor": "k19691231T235959100Z",
+        "role": "assistant",
+        "n_steps": 2,
+        "blocks": [
+            {"type": "_step", "tms": -900, "t": -1, "idx": 1},
+            {"type": "text", "text": "第一步的文字"},
+            {"type": "_step", "tms": -500, "t": -1, "idx": 2},
+            {"type": "text", "text": "第二步的文字"},
+        ],
+    }
+    neg_html = v4.render_turn_html(neg_group, {}, set())
+    signed = re.findall(r'id="(k[^"]*-s-[^"]*)"', neg_html)
+    assert not signed, \
+        f"步驟列吐出了帶號的 -s（bmGrammarOk 會拒絕這種字串，等於安靜壞掉）：{signed[:4]}"
+    # ⚠ 對照組：正的照樣要給，否則「整個不給」也會讓上面那格變綠
+    pos_group = dict(neg_group, kanchor="k20260801T000000000Z", blocks=[
+        {"type": "_step", "tms": 1786248310000, "t": 1786248310, "idx": 1},
+        {"type": "text", "text": "第一步的文字"},
+        {"type": "_step", "tms": 1786248311000, "t": 1786248311, "idx": 2},
+        {"type": "text", "text": "第二步的文字"},
+    ])
+    pos_html = v4.render_turn_html(pos_group, {}, set())
+    assert re.search(r'id="k20260801T000000000Z-s1786248310000"', pos_html), \
+        "⚠ 對照組：正的步 epoch 仍必須畫出步驟列的錨點（別把「負的不給」做成「都不給」）"
+
+    # --- 8. 顯形範圍必須縮到 .blk（否則滑過一輪會亮起上百組按鈕）-----------
+    # ⚠⚠ **這一格只守「規則寫對了」，不守「滑鼠滑過去真的只亮一組」。**
+    # headless 造不出 `:hover`，所以真正的視覺行為靠人眼；但少了 `:not(.blk-ctl)`
+    # 這個機制就一定壞，所以它值得一格會紅的。
+    for sel in ('.turn:hover .alink:not(.blk-ctl)', '.turn:hover .bmk:not(.blk-ctl)'):
+        assert sel in html, \
+            f"少了 `{sel}`：滑過一輪會把該輪每一個區塊的按鈕一起點亮（實測 p99 有 101 個）"
+    assert '.blk:hover>.blk-ctls>.blk-ctl' in html, \
+        "少了 .blk 自己的顯形規則，區塊的按鈕會永遠看不見"
+
+
+def test_bookmark_block_anchor_same_second(tmp_path=None):
+    """區塊錨點的步時戳**必須有毫秒**，而且同毫秒時整步不給錨點。
+
+    ⚠⚠ **為什麼會有這一支**（`bookmarks-p4-fam` High）：第一版的 `-s<步epoch>` 只有**秒**
+    （`_epoch()` 是 `math.floor`），而回合錨點保留毫秒、真撞號時還會加 `-tb<n>`。
+    同一輪裡兩次 API 呼叫落在同一秒 ⇒
+      ① 兩個 `<div class="step-sep">` 共用一個 id（最高不變量：同頁 id 必須唯一）
+      ② 兩步底下的區塊拿到**完全相同**的 `-s<ep>-b<n>`
+      ③ `getElementById` 取第一個 ⇒ 在第二塊按 ☆ 存下來的是**第一塊**的摘要；
+         跳回去時 `openSub()` 回 `false`（＝精確命中）、`.hl` 框在第一塊、
+         **沒有橫幅、還改寫網址列** ＝ 這整套設計要消滅的「安靜指錯」。
+
+    ⚠⚠ **根因是把量測讀錯**：全語料量到「同輪內步時戳撞號 0/67876」就當成保證——
+    那是「還沒發生過」，不是「不會發生」。`durable_anchor()` 的註解隔壁就寫著
+    「只截到整秒，撞號會從 1 變 31」，同一份道理沒有套到步這一層。
+
+    ⚠ **毫秒也不是保證**（回合層實測 9047 輪撞 1 次），所以第二節那條底線也要有人守：
+    同一輪內 `tms` 重複的那些步，**整步的區塊一律不給錨點**——走 `block_anchor()`
+    已經有的「什麼都不給」那條路。**寧可沒有錨點，也不要給一個會指錯的。**
+    """
+    sys.path.insert(0, str(ROOT))
+    tmp = new_tmp(tmp_path)
+
+    def _build(sid, ts_a, ts_b, sub):
+        proj = tmp / sub / "demo-proj"
+        proj.mkdir(parents=True, exist_ok=True)
+        evs = [
+            {"type": "user", "uuid": "s1", "parentUuid": None,
+             "timestamp": "2026-08-09T04:05:06.700Z", "cwd": "/x/Proj", "gitBranch": "main",
+             "version": "2.1.150", "sessionId": sid,
+             "message": {"role": "user", "content": "問一句SSUSER。"}},
+            {"type": "assistant", "uuid": "s2", "parentUuid": "s1",
+             "timestamp": ts_a, "sessionId": sid,
+             "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "msecA",
+                         "usage": {"input_tokens": 100, "output_tokens": 20},
+                         "content": [{"type": "text", "text": "第一步SSTEXTA。"}]}},
+            {"type": "assistant", "uuid": "s3", "parentUuid": "s2",
+             "timestamp": ts_b, "sessionId": sid,
+             "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "msecB",
+                         "usage": {"input_tokens": 120, "output_tokens": 25},
+                         "content": [{"type": "text", "text": "第二步SSTEXTB。"}]}},
+        ]
+        (proj / f"{sid}.jsonl").write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+        out = tmp / f"out-{sub}"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--claude-source", f"{sub}={proj.parent}",
+             "--no-codex", "--out", str(out)],
+            capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        return [p for p in _session_pages(out)][0].read_text(encoding="utf-8")
+
+    def _anchor_of(html, mark):
+        body = html.index('<div class="turn')
+        pos = html.index(mark, body)
+        j = html.rfind('<div class="blk"', 0, pos)
+        if j < 0 or j < html.rfind('<div class="turn', 0, pos):
+            return ""          # 沒有被包成 .blk ＝ 沒有給錨點
+        m = re.search(r' id="([^"]+)"', html[j:html.index(">", j) + 1])
+        return m.group(1) if m else ""
+
+    # --- 1. 同一秒、不同毫秒 ⇒ 兩步必須拿到**不同**的錨點 -------------------
+    h = _build("00000000-0000-4000-8000-0000000000s1",
+               "2026-08-09T04:05:10.100Z", "2026-08-09T04:05:10.900Z", "sec1")
+    a, b = _anchor_of(h, "SSTEXTA"), _anchor_of(h, "SSTEXTB")
+    assert a and b, f"同一秒的兩步都該有錨點，實得 a={a!r} b={b!r}"
+    assert a != b, \
+        (f"⚠ 同一秒內的兩步拿到同一個錨點（{a}）——步時戳必須帶毫秒。"
+         "在第二塊按 ☆ 會存下第一塊的摘要，而且跳回去時看起來像精確命中")
+    # 前置：兩者真的都是步層錨點（不然上一格可能只是因為別的原因不同）
+    for name, v in (("SSTEXTA", a), ("SSTEXTB", b)):
+        assert re.match(r"^k\d{8}T\d{9}Z-s\d+-b\d+$", v), f"{name} 的文法不對：{v}"
+    # 承重：`-s` 那一段本身必須不同（只有 `-b` 不同的話還是同一步，作用域沒分開）
+    assert a.split("-b")[0] != b.split("-b")[0], \
+        f"兩步的 -s 段相同 ⇒ 步時戳沒有毫秒解析度：{a} vs {b}"
+    dup = _page_dup_ids(h)
+    assert not dup, f"同一秒兩步造成頁面 id 重複：{sorted(dup)[:6]}"
+
+    # --- 2. 完全同毫秒 ⇒ 那兩步的區塊**一律不給錨點**（底線）---------------
+    h2 = _build("00000000-0000-4000-8000-0000000000s2",
+                "2026-08-09T04:05:10.100Z", "2026-08-09T04:05:10.100Z", "sec2")
+    a2, b2 = _anchor_of(h2, "SSTEXTA"), _anchor_of(h2, "SSTEXTB")
+    assert a2 == "" and b2 == "", \
+        ("同毫秒的兩步必須整步不給錨點（寧可沒有，也不要給一個會指錯的），"
+         f"實得 a={a2!r} b={b2!r}")
+    dup2 = _page_dup_ids(h2)
+    assert not dup2, f"同毫秒兩步仍造成頁面 id 重複：{sorted(dup2)[:6]}"
+    # ⚠ 前置：那一輪本身還是有耐久錨點（否則上面兩格會因為「整輪都沒錨點」而恆真）
+    assert re.search(r'<div class="turn assistant" id="k\d{8}T\d{9}Z"', h2), \
+        "這一輪應該仍有回合層的耐久錨點，只是步那一層不給"
+
+
+def test_tmp_base_env(tmp_path=None):
+    """`ASV_TEST_TMP` 要真的把暫存目錄挪到指定的基底底下。
+
+    ⚠⚠ **這一格守的是「跨模型 review 輪能不能跑測試」**，不是產品行為。
+    在 codex 的 `workspace-write` 沙箱下，`tempfile.mkdtemp()` 建出來的目錄
+    **連根目錄都寫不進去**（2026-08-23 實測），而本套件每一支都要建 `projects/<專案>/`
+    ⇒ 整套一行斷言都跑不到就死掉，reviewer 於是**靜默降級成純讀碼**。
+    這個 repo 為此賠過兩輪額度。有了這個環境變數，charter 只要加一行就能讓它真的跑測試。
+
+    ⚠ 所以這一格壞掉的後果是**看不見的**：本機永遠全綠（沒設那個變數），
+    只有在沙箱裡才會退回 `mkdtemp()` 然後整套死掉——而那時候沒有人在看這一格。
+    **這正是它需要被明確守住的理由。**
+    """
+    sys.path.insert(0, str(ROOT))
+    base = new_tmp(tmp_path) / "asv-base"
+    base.mkdir(parents=True, exist_ok=True)
+    old = os.environ.get("ASV_TEST_TMP")
+    try:
+        os.environ["ASV_TEST_TMP"] = str(base)
+        got = new_tmp()
+        assert got.parent == base, \
+            f"設了 ASV_TEST_TMP 卻沒開在它底下：{got}（期望父目錄 {base}）"
+        assert got.is_dir(), f"回傳的路徑不存在：{got}"
+        # 真的寫得進去（沙箱下這一格才是重點——建得出來不等於寫得進去）
+        (got / "projects" / "p").mkdir(parents=True)
+        (got / "projects" / "p" / "x.jsonl").write_text("{}", encoding="utf-8")
+
+        # ⚠⚠ **這一格才是真正守著沙箱那件事的**（`bookmarks-p4fix-codex` Medium）。
+        #
+        # 上面那幾行在**本機**永遠會過，不管 `new_tmp()` 內部走的是 `mkdtemp()` 還是
+        # `mkdir()`——因為本機沒有沙箱，兩條路都寫得進去。於是「已經解掉了」這個結論
+        # 在本機**無法被否證**，而實際上沒解：`new_tmp()` 當時仍是 `mkdtemp(dir=base)`，
+        # 跨模型輪照樣整套死在 `WinError 5`，只是死在 `work\tmpXXXX\projects` 而不是
+        # `mkdtemp()` 的預設位置。**換了地點，沒換機制。**
+        #
+        # 成因：`mkdtemp()` 建目錄時會鎖權限（Windows 上是受限的 DACL），
+        # 沙箱的受限 token 因此進不去它建的那一層。**跟目錄在哪無關。**
+        # ⇒ 唯一能在本機驗到的形狀是「**把 `mkdtemp` 弄成不能用，看它還活不活得下去**」。
+        import tempfile as _tf
+        _real = _tf.mkdtemp
+
+        def _boom(*a, **k):
+            raise AssertionError("設了 ASV_TEST_TMP 就不可以再經過 mkdtemp()")
+
+        os.environ["ASV_TEST_TMP"] = str(base)
+        _tf.mkdtemp = _boom
+        try:
+            sandboxed = new_tmp()
+        finally:
+            _tf.mkdtemp = _real
+        assert sandboxed.parent == base, f"沒開在基底底下：{sandboxed}"
+        # 建得出來不等於寫得進去；沙箱下差別就在這一步，所以這裡要真的再建一層
+        (sandboxed / "projects" / "p").mkdir(parents=True)
+        (sandboxed / "projects" / "p" / "x.jsonl").write_text("{}", encoding="utf-8")
+        # 同一個基底底下要能連開兩個而不撞號（`mkdtemp` 本來免費提供的那一半）
+        _tf.mkdtemp = _boom
+        try:
+            second = new_tmp()
+        finally:
+            _tf.mkdtemp = _real
+        assert second != sandboxed, f"連開兩次拿到同一個目錄：{second}"
+
+        # ⚠ 明確給 `tmp_path` 時，環境變數**不可以**蓋掉它
+        explicit = new_tmp(base / "explicit")
+        assert explicit == base / "explicit", \
+            f"明確給的 tmp_path 被環境變數蓋掉了：{explicit}"
+
+        # ⚠ 指到不存在的目錄要**安靜退回** `mkdtemp()`，不可以炸、也不可以自己 mkdir
+        #   （自己建出來的在沙箱下照樣寫不進去，那會把「路徑打錯」變成更難查的權限錯誤）
+        missing = base / "no-such-dir"
+        os.environ["ASV_TEST_TMP"] = str(missing)
+        fb = new_tmp()
+        assert fb.is_dir(), "退回路徑不存在"
+        assert not str(fb).startswith(str(missing)), \
+            f"指到不存在的基底時不該自己建出來用：{fb}"
+    finally:
+        if old is None:
+            os.environ.pop("ASV_TEST_TMP", None)
+        else:
+            os.environ["ASV_TEST_TMP"] = old
+
+
 def test_bookmark_manage_pages(tmp_path=None):
     """書籤管理頁與設定頁（第 3 期）的**形狀**，以及三頁共用核心的契約。
 
@@ -4372,7 +4842,7 @@ def test_bookmark_manage_pages(tmp_path=None):
        不是比字串。
     """
     sys.path.insert(0, str(ROOT))
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-0000000000m3"
@@ -4540,7 +5010,7 @@ def test_bookmark_link_durability(tmp_path=None):
     """
     sys.path.insert(0, str(ROOT))
     import ai_session_viewer as asv
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     root = tmp / "projects"
     out = tmp / "out"
     ids = {"Alpha": "00000000-0000-4000-8000-0000000aaaa1",
@@ -4656,7 +5126,7 @@ def test_bookmark_codex_title_masked(tmp_path=None):
     後者還管畫面上的 ✎ 標記與索引頁，那部分行為刻意不動。
     """
     sys.path.insert(0, str(ROOT))
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     sroot = tmp / "codex" / "sessions" / "2026" / "08" / "01"
     sroot.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-00000000cdx1"
@@ -4710,7 +5180,7 @@ def test_bookmark_deleted_source_pruned(tmp_path=None):
       這是它保守的那一半，沒有測就等於沒有那個限制。
     """
     sys.path.insert(0, str(ROOT))
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
 
@@ -4798,7 +5268,7 @@ def test_bookmark_account_label_rebuild(tmp_path=None):
       `SCOPE-BOOKMARK-PRUNED-ORPHAN-FILES`）⇒ 不可以用「檔案在不在」當斷言，
       那一格恆真。要看的是 `BX_SESS` 裡的 `u`。
     """
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-0000000000d1"
@@ -4854,7 +5324,7 @@ def test_bookmark_all_sources_deleted(tmp_path=None):
     **什麼都不要動**——那不是「東西被刪了」，是「這次沒有去看」。
     """
     sys.path.insert(0, str(ROOT))
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "demo-proj"
     proj.mkdir(parents=True, exist_ok=True)
     sid = "00000000-0000-4000-8000-0000000000c1"
@@ -4919,7 +5389,7 @@ def test_zero_scan_keeps_out_of_scope_index(tmp_path=None):
       ②B 的來源刪光、用**同一個 B**重建（走零場那條路）之後，A 還在索引裡；
       ③B 不在了（不然「整份原封不動」也會通過）。
     """
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
 
     def _mk(root, sid, mark, ts):
         root.mkdir(parents=True, exist_ok=True)
@@ -4986,7 +5456,7 @@ def test_zero_scan_keeps_cache_report_links(tmp_path=None):
     ⚠ 這一支只守「連結還在」這一件事（教訓 37：一格只守一件事）。
     ⚠ 前置要驗：素材真的產得出報告，否則兩次都是 False 也會通過。
     """
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     projects = _build_fixture(tmp / "srcA")          # 這份假語料會產出快取報告
     proj_b = tmp / "srcB" / "projects" / "pb"
     proj_b.mkdir(parents=True, exist_ok=True)
@@ -5047,7 +5517,7 @@ def test_no_uppercase_unicode_escape_in_js(tmp_path=None):
     ⚠ 掃描器要找的字面不可以出現在它自己掃的內容裡 ⇒ 這裡用 `chr(92)` 組出 pattern，
       而那幾段 JS 的註解也一律寫「大寫 U 的跳脫」、不寫那個字面。
     """
-    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    tmp = new_tmp(tmp_path)
     projects = _build_fixture(tmp)
     out = tmp / "out"
     r = subprocess.run(
@@ -5079,6 +5549,11 @@ def test_no_uppercase_unicode_escape_in_js(tmp_path=None):
 
 
 if __name__ == "__main__":
+    # ⚠⚠ **這一格必須第一個跑**（`bookmarks-p4fix-codex` Medium）：它驗的是
+    # `new_tmp()` 本身，而下面每一支測試都靠 `new_tmp()` 開工。排在後面的話，
+    # helper 壞掉時整套會在**第一支測試**就 `PermissionError` 死掉，
+    # **永遠到不了這一格**——於是「守著它的那格」在最需要它的時候完全沒有聲音。
+    test_tmp_base_env()
     test_smoke()
     test_search()
     test_subagent_inline()
@@ -5112,6 +5587,8 @@ if __name__ == "__main__":
     test_anchor_tiebreak_main_vs_side()
     test_anchor_tiebreak_sort_is_load_bearing()
     test_bookmark_ui()
+    test_bookmark_block_anchors()
+    test_bookmark_block_anchor_same_second()
     test_bookmark_manage_pages()
     test_bookmark_link_durability()
     test_bookmark_codex_title_masked()

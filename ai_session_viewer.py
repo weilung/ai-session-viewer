@@ -75,7 +75,22 @@ MANIFEST_NAME = ".build-manifest.json"
 #    多內嵌一個 `BK_MGR`。⚠ **session 頁的 JS 與 CSS 都變了 ＝ 呈現層**。
 #    ⚠ 管理頁（`out/sessions/bookmarks.html`）與設定頁（`out/sessions/settings.html`）
 #    本身**不受這個版本閘管**——它們和 `index.html` 一樣每次執行都無條件重產。
-RENDERER_VERSION = 51
+# 51 → 52（2026-08-23）：**書籤第 4 期**——區塊層級粒度。每個可標記區塊多一層 `.blk`
+#    包裝＋自己的 `#`／☆，錨點 `k…[-tb<n>][-s<步epoch>]-b<n>`（見 `block_anchor()`）；
+#    多步回合的步驟列掛上 `k…-s<ep>`（退化階梯的中間一階）；`bkSummary()` 改成先剔掉
+#    控制項的文字再取摘要。⚠ **HTML＋CSS＋頁面 JS 三樣都變＝呈現層，一定要升。**
+# 52 → 53（2026-08-23）：**第 4 期的冷眼輪處置**（`bookmarks-p4-fam`）——
+#    ① 區塊錨點的 `-s` 段改用**毫秒**（新增 `_epoch_ms`／`_step.tms`），
+#      並加一道底線：同一輪內 `tms` 撞號的那些步，整步不給錨點。
+#      ⚠ **錨點字串改了**，但第 4 期未出貨，沒有人存過這種書籤。
+#    ② `.blk-ctls` 容器改成透明＋`pointer-events:none`（背景移到按鈕自己身上）。
+#    ⚠ CSS 與錨點值都變了 ＝呈現層，一定要升。
+# 53 → 54（2026-08-23）：**跨模型輪的處置**（`bookmarks-p4-codex`）——
+#    新增 `bmGrammarOk()`：文法不合的子定位符一律走未命中，**不准走退化階梯**
+#    （舊版 `-s`、`-b`、`|`、引號、超長垃圾都會被剝成基底回合並框起來）。
+#    另把區塊錨點的計算抽成 `turn_block_anchors()`，與探針共用。
+#    ⚠ 頁面 JS 變了 ＝呈現層。
+RENDERER_VERSION = 54
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -1734,6 +1749,27 @@ def _epoch(e):
     return math.floor(dt.timestamp()) if dt else None
 
 
+def _epoch_ms(e):
+    """事件所屬的 epoch **毫秒**（int）或 None——只給區塊層級錨點的 `-s` 段用。
+
+    ⚠⚠ **為什麼要另開一欄，而不是把 `_epoch()` 改成毫秒**：`_step` 的 `t` 是顯示用時刻與
+    「距上一步」的來源，而且**同一個整數秒還是成因 join 那條線的語彙**（`_cause_key`）。
+    改它的解析度會同時動到那三處，而區塊錨點只需要「同一輪內能不能分辨兩步」。
+    兩個值各自都對，語意不同，所以分開存。
+
+    ⚠⚠ **為什麼區塊錨點不能用秒**（`bookmarks-p4-fam` High，實測）：同一輪裡兩次 API 呼叫
+    落在同一秒時，兩步底下的區塊會拿到**完全相同**的錨點 ⇒ 頁面 id 重複、
+    `getElementById` 取第一個 ⇒ 在第二塊按 ☆ 存下來的是第一塊的摘要，
+    而跳回去時 `openSub()` 回「精確命中」、`.hl` 框在第一塊、沒有橫幅、還改寫網址列。
+    `durable_anchor()` 的註解隔壁就寫著「只截到整秒，撞號會從 1 變 31」——同一份道理。
+
+    ⚠ **毫秒仍然不是保證**（回合層實測 9047 輪撞 1 次），所以 `render_turn_html` 另有一道
+    底線：同一輪內 `tms` 重複的那些步，整步的區塊一律不給錨點。
+    """
+    dt = e.get("_dt")
+    return math.floor(dt.timestamp() * 1000) if dt else None
+
+
 def _new_turn_usage():
     return {"ids": set(), "input": 0, "cache_create": 0, "cache_read": 0,
             "output": 0, "ctx_max": 0, "ctx_win": None, "cost": 0.0, "unpriced": False,
@@ -1881,12 +1917,14 @@ def group_turns(events, per_step=True, step_by_usage=False):
                     cur["_step_ids"].add(step_key)
                     cur["n_steps"] += 1
                     cur["blocks"].append({"type": "_step", "idx": cur["n_steps"], "mid": mid,
-                                          "u": _step_usage(msg, e), "t": _epoch(e)})
+                                          "u": _step_usage(msg, e), "t": _epoch(e),
+                                          "tms": _epoch_ms(e)})
             elif step_by_usage:
                 su = _step_usage(msg, e)
                 if su:
                     cur["n_steps"] += 1
-                    cur["blocks"].append({"type": "_step", "idx": cur["n_steps"], "u": su, "t": _epoch(e)})
+                    cur["blocks"].append({"type": "_step", "idx": cur["n_steps"], "u": su,
+                                          "t": _epoch(e), "tms": _epoch_ms(e)})
             cur["blocks"].extend(blocks)
             _acc_turn_usage(cur["u"], msg)
             _mid_now = msg.get("id")
@@ -2091,15 +2129,20 @@ def analyze(s, acct_switches=None):
     # 兩者差 1〜30+ 秒 → ①成因 join 對不上（真失效步被畫成中性灰「未歸因」）②「距上一步」量到的
     # 是「上次吐出內容→這次吐出內容」而非呼叫間隔，甚至會跨過 2 分（回合內雜訊/TTL 樣本）的界線。
     call_ep = {}
+    call_ep_ms = {}     # 同一把鍵的毫秒版，只給區塊錨點的 `-s` 段（見 `_epoch_ms`）
     for e in sorted((e for e in s.events if e.get("type") == "assistant"), key=ts_key):
         mid = (e.get("message") or {}).get("id")
         ep = _epoch(e)
         if mid and ep is not None and mid not in call_ep:
             call_ep[mid] = ep
+            call_ep_ms[mid] = _epoch_ms(e)
     for g in s.main_groups + s.side_groups:
         for b in g.get("blocks", []):
             if b.get("type") == "_step" and b.get("mid") in call_ep:
                 b["t"] = call_ep[b["mid"]]
+                # ⚠ 兩欄必須**同時**正規化到同一次呼叫的起點，否則 `t` 指第一筆事件、
+                # `tms` 指另一筆，錨點就會隨「哪一筆事件先有可呈現內容」而漂。
+                b["tms"] = call_ep_ms[b["mid"]]
     # 逐步冷啟成因：掛到「Claude 主對話」各步驟徽章（依 epoch join），供 _cold_display／turn_cold_class
     # 決定紅標（真失效）或中性灰（結構性）。只有 Claude 主對話會被標：每個 _step 都設成成因字串或 ""
     #（＝已分析、非失效成因），故其 cause 永不為 None；Codex 與子代理不跑分析、cause 維持 None＝原本紅標。
@@ -3216,7 +3259,142 @@ def render_turn_meters(group):
     return out
 
 
-def render_step_meters(idx, u, cause=None, gap=None, t=None, masked=None):
+def block_anchor(kanchor, step_ep, n, in_step):
+    """區塊層級錨點（第 4 期）：`k<回合時戳>[-tb<n>][-s<步epoch>]-b<n>`。不給就回 `""`。
+
+    `in_step` 是**「有沒有走進某一步」**，不是 `step_ep is not None`——兩者不同，
+    而混為一談會造出撞號：
+
+    | 情境 | `in_step` | `step_ep` | 給什麼 |
+    |---|---|---|---|
+    | 第一個 `_step` 之前的區塊（user 回合全部如此）| False | None | `-b<n>`，序號**以回合為作用域** |
+    | 步裡的區塊，該步有時戳 | True | int | `-s<epoch>-b<n>`，序號**以步為作用域** |
+    | 步裡的區塊，該步**沒有**時戳 | True | None | **什麼都不給** |
+
+    ⚠⚠ 最後那一列不可以「退回輪內序號」：那會把它丟進第一列同一個 `-b<n>` 命名空間，
+    於是兩個不同的區塊拿到同一個錨點 ⇒ 書籤安靜指到另一塊。與 `durable_anchor()`
+    拒絕 naive datetime 是同一條規則：**寧可沒有錨點，也不要給一個會指錯的**。
+    實測 `_step.t` 缺漏 0/67876（`scripts/probe_turn_identity.py blocks`），所以這一列
+    是防守用的，不是常態——但零誤報的路徑正是沒被執行的路徑，所以測試強制走它一次。
+
+    ⚠ **為什麼序號要縮到「步」**：同一份實測量到一輪的可標記區塊數 Claude p99=101／
+    max=286、Codex p99=129／max=412，**12.6%／34.4% 的回合超過 20 個區塊**——輪內序號的
+    爆炸半徑等於整段對話。縮到步之後，一步底下的區塊數 p90 只有 2〜4。
+    升級的兩個前提也是同一份實測給的：步時戳缺漏 0、同輪內撞號 0。
+
+    ⚠ `-s` 用的是**原始 epoch 整數**，不是回合錨點那種可讀式 UTC。回合錨點要可讀是因為
+    「失效時讀得出是哪一刻」；而區塊錨點失效時 `openSub()` 一定會退到回合，橫幅印的是
+    **回合**的時刻，`-s` 這一段從來不會單獨拿給人看。省下來的是每個區塊 6 個字元。
+
+    ⚠⚠ **負的 `step_ep` 一律不給**（`bookmarks-p4fix-codex` Medium）。理由不是
+    「1970 年前不會發生」——是 **`-` 就是段落分隔符**，所以 `k…-s-500-b1` 對每一個
+    用 `-` 切字串的消費者都是畸形：`bmGrammarOk()` 判它不合法（合法錨點被宣告未命中），
+    `openSub()` 的 `lastIndexOf('-')` 退化階梯也會切在錯的地方。
+    ⇒ 要修的是**產出端**：讓文法接受帶號數字，等於要求下游每個消費者各自處理負號。
+    這與上表最後一列同一條規則：**寧可沒有錨點，也不要給一個會指錯的。**
+    """
+    if not kanchor:
+        return ""
+    if not in_step:
+        return f"{kanchor}-b{n}"
+    sa = step_anchor(kanchor, step_ep)
+    return f"{sa}-b{n}" if sa else ""
+
+
+def step_anchor(kanchor, step_ep):
+    """一次 API 呼叫（「步」）的錨點 `k<回合時戳>[-tb<n>]-s<步epoch毫秒>`。不給就回 `""`。
+
+    ⚠⚠ **`-s<ep>` 有兩個產出端**：步驟列自己的 `id`，以及區塊錨點的中段。
+    **兩邊一律走這一支**，不可以各寫一份判斷（`bookmarks-p4fix-codex-r2` Low：
+    第一版只在 `block_anchor()` 擋負值，於是同一個 group 裡區塊錨點正確消失、
+    步驟列照樣輸出 `k…-s-900`——而那正是 `bmGrammarOk()` 會拒絕的字串，
+    使用者點了只會得到「找不到」）。**同一條規則寫兩次就會分岔**，這條線為此付過三次。
+
+    不給的兩種情況：
+    - `step_ep is None`——那一步沒有時戳，或同輪內撞號被呼叫端歸零。
+    - **`step_ep < 0`**——`-` 就是段落分隔符，帶號數字會讓每一個用 `-` 切字串的消費者
+      （`bmGrammarOk()`、`openSub()` 的 `lastIndexOf('-')` 退化階梯）都切在錯的地方。
+
+    守它的是 `test_bookmark_block_anchors` 第 7 節（純函式的四＋二條契約）與
+    **第 7b 節（走 `render_turn_html()`，守的就是第二個產出端）**，各自帶正的對照組。
+    """
+    if not kanchor or step_ep is None or step_ep < 0:
+        return ""
+    return f"{kanchor}-s{step_ep}"
+
+
+def turn_block_anchors(group):
+    """這一輪每個 block 的區塊錨點，回一個**與 `group["blocks"]` 等長**的 list（沒有就是 `""`）。
+
+    ⚠⚠ **產品碼與探針共用這一支，不可以各抄一份**（`bookmarks-p4-fam` Low ＋
+    `bookmarks-p4-codex` Low，同一課付了兩次）：`scripts/probe_turn_identity.py` 的
+    `blocks` 模式要統計「實際可標記的區塊有幾個」，而那個條件**不只是「渲染得出來」**——
+    還要求該輪有 `kanchor`、所在步有 `tms`、且 `tms` 在同一輪內沒撞號。
+    探針自己抄一份的話，統計出來的是「可渲染」而不是「可標記」，
+    而那組數字**正是第 4 期的設計依據**。
+
+    ⚠ `_step` 自己不是可標記區塊，對應的位置一律是 `""`。
+    """
+    blocks = group.get("blocks") or []
+    kanc = group.get("kanchor") or ""
+    role = group.get("role")
+    # 同一輪內 `tms` 撞號的那些步，整步不給錨點（見 `_epoch_ms` 與 `block_anchor`）
+    seen, dup = set(), set()
+    for b in blocks:
+        if b.get("type") != "_step":
+            continue
+        v = b.get("tms")
+        if v is None:
+            continue
+        (dup if v in seen else seen).add(v)
+    out = []
+    in_step, step_ep, bn = False, None, 0
+    for b in blocks:
+        if b.get("type") == "_step":
+            step_ep = b.get("tms")
+            if step_ep in dup:
+                step_ep = None
+            in_step, bn = True, 0
+            out.append("")
+            continue
+        # ⚠ 壓縮點那種回合 `render_turn_html` 提前 return，一個 `.blk` 都不產
+        if group.get("compact") or not block_is_renderable(b, role):
+            out.append("")
+            continue
+        bn += 1
+        out.append(block_anchor(kanc, step_ep, bn, in_step))
+    return out
+
+
+def wrap_block(inner, anchor):
+    """把一個可標記區塊包成 `.blk`，掛上錨點與 `#`／`☆`（第 4 期）。沒有錨點就原樣回傳。
+
+    ⚠ **控制項放在內容前面、用 `position:absolute` 疊在右上角。** 放在後面的話，
+    `md_to_html()` 產出的最後一個區塊元素（表格、`<pre>`）會把它擠到下一行去。
+
+    ⚠ `class` 帶 `blk-ctl`：`bkMark()` 靠 `.bmk` 找按鈕、靠 `data-k` 認身分，所以行為那一半
+    **必須沿用同一個 class**（多開一個 class 就要兩邊同步，遲早分岔）；`blk-ctl` 只給 CSS
+    用來把顯形範圍從「滑過整輪」縮成「滑過這一塊」——一輪 p99 有 101 個區塊，
+    沿用 `.turn:hover` 會讓滑過任一處就亮起一百組按鈕。
+
+    ⚠ **這段標記是逐區塊展開的靜態文字**，每個可標記區塊約 475 bytes（全語料 1068 頁／116758
+    區塊＝總量的 7.92%；⚠ 最大的幾頁只佔 1–2%，平均是被中小型頁面拉上來的）。這裡刻意**與整輪那組按鈕沿用同一套寫法**（`onclick` 直掛、
+    錨點字串出現三次），不為了壓體積另開一條事件委派的路徑——**範圍限制
+    `SCOPE-BOOKMARK-BLOCK-CTL-BYTES`：詳見 planning/scope-limits.md**。
+    """
+    if not anchor:
+        return inner
+    a = esc_attr(anchor)
+    return (f'<div class="blk" id="{a}"><span class="blk-ctls">'
+            f'<a class="alink blk-ctl" href="#{a}" title="這一塊的直達連結"'
+            f' onclick="return openSub(\'{a}\')">#</a>'
+            f'<button class="bmk blk-ctl" type="button" data-k="{a}"'
+            f' title="加書籤／編輯書籤" aria-label="加書籤"'
+            f' onclick="bkOpen(this.getAttribute(\'data-k\'))">☆</button>'
+            f'</span>{inner}</div>')
+
+
+def render_step_meters(idx, u, cause=None, gap=None, t=None, masked=None, anchor=""):
     """回合內單一步驟（API 呼叫）的分隔列：步驟序號＋該步的快取% / (可勾)細分 / ctx / 產出，
     另加 API 自報的失效成因（有才出現）與可勾選的「距上一步 / effort」。
     沿用 m-cache/m-in/m-cw/m-cr/m-ctx/m-out class，與整段彙總共用同一組勾選開關（cost 不在步驟層顯示）。
@@ -3236,8 +3414,15 @@ def render_step_meters(idx, u, cause=None, gap=None, t=None, masked=None):
     # 是哪一天；與回合標頭 `class="when"` 的 title 同一個作法，也不多包一層 span。
     full = epoch_str(t, "%Y-%m-%d %H:%M:%S")
     ntip = f' title="{esc_attr(full)}"' if full else ""
+    # 退化階梯的**中間那一階**（第 4 期）：區塊錨點 `k…-s<ep>-b<n>` 找不到時，`openSub()`
+    # 會退成 `k…-s<ep>`；沒有這一階的話，一個 286 個區塊的回合裡任何一次區塊漂移都直接
+    # 彈回整輪最上面。⚠ 這個 id 只在**多步**回合出現（單步回合根本不畫步驟列，`multi_step`
+    # 為假時 `render_turn_html` 不呼叫本函式）。單步回合的區塊照樣拿 `-s…-b<n>` 錨點，
+    # 只是中間那一階不存在、直接退到回合——**那正是逐段退化本來就該有的行為**。
+    sid_at = f' id="{esc_attr(anchor)}"' if anchor else ""
     if not u:
-        return f'<div class="step-sep"><span class="step-n"{ntip}>步驟 {idx}{when}</span></div>'
+        return (f'<div class="step-sep"{sid_at}><span class="step-n"{ntip}>步驟 {idx}{when}</span>'
+                '</div>')
     pct = _pct_display(u["cache_read"], u["total_in"])
     # 冷/熱的界線一律用整數交叉相乘（與 _step_cold／_acc_turn_usage／報告同一判準），不用四捨五入後的
     # pct——否則 24.6〜24.99% 這種邊界會顯示成「⚡25% 沒著色」卻同時掛著整段失效的 ⚠，自相矛盾。
@@ -3251,7 +3436,7 @@ def render_step_meters(idx, u, cause=None, gap=None, t=None, masked=None):
     if cold_now:
         cold = " " + _cold_display(cause)
         title = _cold_cause_title(cause, masked)
-    return (f'<div class="step-sep"><span class="step-n"{ntip}>步驟 {idx}{when}</span>'
+    return (f'<div class="step-sep"{sid_at}><span class="step-n"{ntip}>步驟 {idx}{when}</span>'
             f'<span class="meter m-cache{cold}" title="{esc_attr(title)}">⚡{pct}%</span>'
             + _miss_meter(u.get("miss"), u.get("miss_tok", 0), u.get("miss_usd"),
                           partial=(bool(u["total_in"]) and not cold_now),
@@ -3319,33 +3504,68 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
                 f'<div class="tbody">{summ}</div></details>')
     parts = []
     multi_step = group.get("n_steps", 0) >= 2   # 單步回合不必逐步標示（與整段彙總相同）
+    # 區塊層級錨點（第 4 期）。三個狀態變數要一起讀，語意見 `block_anchor()` 的表：
+    #   `in_step`＝走進某一步了沒（**不等於** `step_ep is not None`，混用會造出撞號）
+    #   `step_ep`＝該步的 epoch（`analyze` 已正規化成該次呼叫的起點）
+    #   `bn`＝目前作用域內的可標記區塊序號，**每進一步就歸零**
+    kanc = group.get("kanchor") or ""     # 只給步驟列的 `-s` 錨點用
+    # ⚠⚠ **區塊錨點一律由 `turn_block_anchors()` 算，這裡不重算一份。**
+    # 探針要統計「實際可標記的區塊」，兩邊各算一份就會分岔——這條線為此付過兩次
+    # （`bookmarks-p4-fam` Low：探針抄了 `block_is_renderable`；
+    #   `bookmarks-p4-codex` Low：統計把「可渲染」誤稱「可標記」）。
+    # 那一支也負責同一輪內 `tms` 撞號時整步不給錨點的底線
+    # （由 `test_bookmark_block_anchor_same_second` 第 2 節在守）。
+    _anchors = turn_block_anchors(group)
+    _dup_tms = set()
+    _seen = set()
+    for _b in group["blocks"]:
+        if _b.get("type") == "_step" and _b.get("tms") is not None:
+            (_dup_tms if _b["tms"] in _seen else _seen).add(_b["tms"])
+    bi = -1
     for b in group["blocks"]:
+        bi += 1
         t = b.get("type")
         if t == "_step":
+            step_ep = b.get("tms")
+            if step_ep in _dup_tms:
+                step_ep = None          # 撞號 ⇒ 這一步當成「沒有時戳」處理
             if multi_step:
-                parts.append(render_step_meters(b.get("idx", 0), b.get("u"), b.get("cause"),
-                                                b.get("gap"), b.get("t"),
-                                                b.get("cause_masked")))
+                parts.append(render_step_meters(
+                    b.get("idx", 0), b.get("u"), b.get("cause"), b.get("gap"), b.get("t"),
+                    b.get("cause_masked"),
+                    anchor=step_anchor(kanc, step_ep)))
             continue
+        # ⚠ 一律先算出 `html` 再統一包裝：舊版每個分支自己 `parts.append`，那樣「這一塊算不算
+        # 一個可標記區塊」會散在五個地方，序號遲早對不上。空字串＝不渲染＝不佔序號。
+        html = ""
+        extra = ""          # 只有 tool_use 用得到：子代理區塊是它的**兄弟**，不進包裝
         if t == "text":
             raw = b.get("text") or ""
             txt = clean_user_text(raw) if role == "user" else str(raw)
             if txt.strip():
-                parts.append(md_to_html(txt))
+                html = md_to_html(txt)
         elif t == "thinking":
             think = b.get("thinking") or b.get("text") or ""
             if think.strip():
-                parts.append('<details class="think"><summary>💭 思考</summary>'
-                             f'<div class="tbody">{md_to_html(think)}</div></details>')
+                html = ('<details class="think"><summary>💭 思考</summary>'
+                        f'<div class="tbody">{md_to_html(think)}</div></details>')
         elif t == "redacted_thinking":
-            parts.append('<div class="think-redacted">💭 思考（已隱藏）</div>')
+            html = '<div class="think-redacted">💭 思考（已隱藏）</div>'
         elif t == "tool_use":
-            parts.append(render_tool_html(b, tmap, used_ids))
+            html = render_tool_html(b, tmap, used_ids)
             if subagent_map:
-                parts.append(render_subagent_block(b.get("id"), subagent_map, subagent_meta or {},
-                                                   tmap, used_ids, rendered_sub if rendered_sub is not None else set(), ai))
+                # ⚠ **不包進 `.blk`**：子代理區塊裡面是一整批完整的回合，每一輪各自帶
+                # `k…` 錨點。包進去會讓外層那個區塊 id 涵蓋幾十輪，`bkSummary()` 抓到的
+                # 就變成整批子代理對話的前 120 字。
+                extra = render_subagent_block(b.get("id"), subagent_map, subagent_meta or {},
+                                              tmap, used_ids,
+                                              rendered_sub if rendered_sub is not None else set(), ai)
         elif t == "image":
-            parts.append(render_image_block(b))
+            html = render_image_block(b)
+        if html:
+            parts.append(wrap_block(html, _anchors[bi]))
+        if extra:
+            parts.append(extra)
 
     if not parts:
         return ""
@@ -3645,13 +3865,17 @@ function bkRescue(){
     ⚠⚠ **但訊息要跟著實際狀態走。** 舊版一律說「瀏覽器拒絕存取 localStorage」，
     理由寫的是「`lsGet` 丟例外時 `bkLoad()` 回 `{bad:1,raw:''}`」——**那個狀態到不了**：
     `lsGet` 自己就 try/catch 回 `null`，`bkLoad` 的 `if(!r)` 先把它接走 ⇒ 永遠不是 `bad`。
-    真正到得了這一格的只有「store 完全正常、只是還沒有任何書籤」，
-    而那時候那句話是**反的**（收斂確認輪 Low）。
-    ⚠ `st.bad` 那半仍然留著：`bkFoot` 的救援鈕只在 `st.bad` 時畫得出來，
-    而那時 `st.raw` 必定非空——所以那一半是**純防禦**，沒有任何素材走得到，
-    不要在那裡寫「守它的是 XXX」。
-    守這一格的是探針的 `rescue_refuses_when_nothing_to_save`（不下載）
-    與 `rescue_message_matches_reality`（話是對的）。 */
+    ⚠⚠ **訂正（`bookmarks-p4-fam` Low）：整個 `if(!raw)` 分支從 UI 都到不了，不只 `st.bad` 那半。**
+    `bkFoot()` 的救援鈕**只在 `st.bad` 為真時**畫得出來，而 `bkLoad()` 在 `st.bad` 時
+    `raw` 必定非空（`if(!r)` 先把 null 接走了，JSON 壞掉那條一定帶著原字串）
+    ⇒ 按得到鈕的時候 `raw` 一定有東西。
+    這裡原本寫「真正到得了這一格的只有『store 完全正常、只是還沒有任何書籤』」——
+    **也不成立**（那個狀態下鈕根本不會出現）。
+    ⇒ **這整段是純防禦**：唯一走得到的是探針**直接呼叫** `bkRescue()`。
+    留著它的理由是「訊息不可以和實際發生的事相反」這條規則不該有例外，
+    **不是**因為有哪個使用者操作序列走得到。
+    ⚠ 所以這裡刻意**不寫**「守它的是 XXX」——探針那兩格驗的是直接呼叫下的行為，
+    那證明不了任何 UI 路徑。 */
  if(!raw){
   bkSay(st.bad
         ?'連原始資料都讀不到（瀏覽器拒絕存取 localStorage）。'
@@ -4485,8 +4709,18 @@ function bkMine(st){var out=[];
 function bkSummary(anchor){
  var el=document.getElementById(anchor);
  if(!el)return '';
- var b=el.querySelector('.body');
- var t=((b?b.textContent:el.textContent)||'').replace(/\s+/g,' ').trim();
+ var src=el.querySelector('.body')||el;
+ /* \u26a0\u26a0 **\u63a7\u5236\u9805\u7684\u6587\u5b57\u5fc5\u9808\u5148\u5254\u6389**\uff08\u7b2c 4 \u671f\uff09\u3002`.blk-ctls` \u88e1\u662f\u771f\u7684\u6587\u5b57\u7bc0\u9ede\uff08`#` \u8207
+    \u2606\uff0f\u2605\uff0c`bkMark()` \u8981\u9760 `textContent` \u6539\u90a3\u9846\u661f\uff09\uff0c\u6240\u4ee5 `textContent` \u6703\u628a\u5b83\u5011\u4e00\u8d77\u8b80\u9032\u4f86\u3002
+    \u26a0 \u9019**\u4e0d\u53ea\u5f71\u97ff\u5340\u584a\u5c64\u7d1a\u7684\u66f8\u7c64**\uff1a\u6574\u8f2a\u7684 `.body` \u88e1\u73fe\u5728\u6bcf\u4e00\u584a\u90fd\u6709\u4e00\u7d44\u63a7\u5236\u9805 \u21d2
+    \u4e0d\u5254\u7684\u8a71\uff0c\u9023\u65e2\u6709\u7684\u6574\u8f2a\u6458\u8981\u90fd\u6703\u8b8a\u6210\u300c#\u2606\u9019\u662f\u56de\u8986\u2026#\u2606\ud83d\udd27 Bash\u2026\u300d\u3002
+    \u26a0 \u7528 clone \u518d\u522a\uff0c\u4e0d\u53ef\u4ee5\u76f4\u63a5\u52d5\u5be6\u9ad4 DOM\u2014\u2014\u90a3\u6703\u628a\u4f7f\u7528\u8005\u773c\u524d\u7684\u6309\u9215\u771f\u7684\u62ff\u6389\u3002
+    \u53ea\u5728\u771f\u7684\u6709\u63a7\u5236\u9805\u6642\u624d\u4ed8 clone \u7684\u6210\u672c\uff08\u6574\u8f2a\u4e14\u5340\u584a\u591a\u6642\u90a3\u662f\u4e00\u68f5\u5927\u6a39\uff09\u3002 */
+ if(src.querySelector('.blk-ctls')){
+  src=src.cloneNode(true);
+  var k=src.querySelectorAll('.blk-ctls'),i;
+  for(i=0;i<k.length;i++)k[i].parentNode.removeChild(k[i]);}
+ var t=(src.textContent||'').replace(/\s+/g,' ').trim();
  return t.length>120?t.slice(0,120)+'\u2026':t;}
 
 function bkOpen(anchor){
@@ -5255,6 +5489,57 @@ function isK(id){{                          /* 嚴格認 k<8碼日期>T<9碼時�
  if(id.length>20&&id.charAt(20)!=='-')return false;   /* 不准直接黏東西上去（k…Zjunk） */
  for(var i=1;i<19;i++){{if(i===9)continue;var c=id.charAt(i);if(c<'0'||c>'9')return false;}}
  return true;}}
+/* ⚠⚠ **文法驗證器**：`isK()` 只驗前 20 字，之後只要求第一個字元是 `-`
+   ⇒ `-s`、`-b`、裸 `-tb`、`-s1-b1-b2`、`|`、引號、超長垃圾**全部**會被 `openSub()`
+   的 `lastIndexOf('-')` 一段段剝掉、最後框住基底回合並顯示「退化命中」
+   （`bookmarks-p4-codex` Medium，六種輸入實測全中）。
+   那不是靜默指錯（有橫幅、不改網址），但它把**根本不合文法**的輸入表現成一次成功的
+   粗略定位——而那個回合跟輸入毫無關係。
+   ⇒ 只有**完整合法**的錨點才准走退化階梯，其餘一律走未命中。
+   文法：`k<8碼>T<9碼>Z` 之後，依序最多各出現一次 `-tb<數字>`／`-s<數字>`／`-b<數字>`。
+   ⚠ 順序、重複、大小寫都要管：`-b1-tb2`（順序反）與 `-S1-b1`（大寫）都必須被拒。
+   ⚠ 長度上限擋掉「幾百個 `-`」造成的反覆切字串。
+   守它的是 `scripts/probe_anchor_js.js` 的第 ⑬ 組（含一格前置條件與一組對照組）。 */
+function bmGrammarOk(id){{
+ if(id.length>200)return false;
+ if(!isK(id))return false;
+ if(id.length===20)return true;
+ /* 槽位是**有序**的：回合 tiebreak → 步 → 區塊 → 子定位符自己的 tiebreak。
+    ⚠ 最後那一格不是多餘的：第 1 期的逐段退化規則就設計成「`k…-s…-tb2` 的 tb 屬於
+    子定位符、要連它一起退」，而 `probe_anchor_js.js` 的第 ④ 組一直在守那個保證。
+    ⚠⚠ **但它只准接在 `s` 後面**（`bookmarks-p4fix-codex` Medium）：原本只靠「槽位往後走」
+    這一條，於是 `b → tb` 也被放行 ⇒ `-b1-tb2` 通過守門、退化後框住基底回合＝**安靜指錯**，
+    而上面那段註解自己寫著「`-b1-tb2`（順序反）必須被拒」——**實作與註解當時是相反的**。
+    差別在**前一段是誰**，不在「有沒有末尾 tb」，所以這裡要記住上一個吃掉的槽位。
+    守它的是第 ⑬ 組的 `-b1-tb2`，對照組是第 ④ 組的 `-s…-tb2`（**必須仍然合法**）。 */
+ var SLOT=['tb','s','b','tb'], p=id.split('-'), wi=0, last=-1, i, j;
+ var digits=function(t){{
+  if(!t.length)return false;
+  for(var k=0;k<t.length;k++){{var c=t.charAt(k);if(c<'0'||c>'9')return false;}}
+  return true;}};
+ /* `-s` 兩種寫法都要收：第 4 期產的是 **epoch 毫秒**（純數字），
+    而第 1 期凍結文法時寫的是**可讀式 UTC**（`20260801T051501000Z`）。
+    真實輸出只會有前者，但後者是已出貨的退化規則承諾過的形狀。 */
+ /* ⚠ 19 碼不是 20：`isK` 驗的 20 碼含開頭那個 `k`，這裡的 payload 沒有它。
+    `20260801T051501000Z` ＝ 8＋1＋9＋1。算錯一格會讓合法的舊形狀被當成畸形。 */
+ var stamp=function(t){{
+  if(t.length!==19||t.charAt(8)!=='T'||t.charAt(18)!=='Z')return false;
+  for(var k=0;k<18;k++){{if(k===8)continue;var c=t.charAt(k);if(c<'0'||c>'9')return false;}}
+  return true;}};
+ for(i=1;i<p.length;i++){{
+  var seg=p[i], hit=-1;
+  for(j=wi;j<SLOT.length;j++){{
+   var pre=SLOT[j];
+   if(seg.slice(0,pre.length)!==pre)continue;
+   if(j===3&&last!==1)continue;  /* 末尾 tb 只准接在 `s` 後面，不准接在 `b` 後面 */
+   var rest=seg.slice(pre.length);
+   if(digits(rest)||(pre==='s'&&stamp(rest))){{hit=j;break;}}
+  }}
+  if(hit<0)return false;      /* 不認得的段、順序不對、重複、或 payload 不合法 */
+  wi=hit+1;                   /* 槽位只能往後走 ⇒ 每一種最多出現一次 */
+  last=hit;
+ }}
+ return true;}}
 function bmTurnId(id){{                     /* 錨點文法 k<ts>[-tb<n>][-s<ts>][-b<n>] 的「回合」那一層 */
  var p=id.split('-'),tb=false;
  if(p.length>1&&p[1].slice(0,2)==='tb'&&p[1].length>2){{        /* tb 後面一定要有數字 */
@@ -5289,6 +5574,13 @@ function openSub(id){{var el=document.getElementById(id);
     ⚠⚠ **只退子定位符（s…/b…），絕不退純數字的 tiebreak 後綴。** `-2` 是「同一毫秒的第二輪」，
     把它退掉會跳到**同毫秒的另一輪**、加上代表成功的 .hl 外框、還改寫網址列——那正是這整個
     設計要消滅的「安靜指錯」。⚠ 也只對耐久錨點做：sub-orphans 那種 id 也帶 -。 */
+ /* ⚠⚠ 文法不合的一律當未命中，**不准走退化階梯**（見 `bmGrammarOk` 的說明）。
+    ⚠ 判準用 `isK` 不是 `bmGrammarOk`：`isK` 為假代表「那根本不是耐久錨點」
+    （子代理目錄的 `sub-…` 也帶 `-`），那是既有行為，照原樣走。
+    這裡新增的只有「看起來是耐久錨點、但後綴不合文法」那一格。 */
+ if(isK(id)&&!bmGrammarOk(id)){{
+  document.querySelectorAll('.hl').forEach(function(x){{x.classList.remove('hl');}});
+  bmMiss(id);return true;}}
  var deg=false,bt=isK(id)?bmTurnId(id):id;
  /* 一段一段退到**回合那一層**為止，不再靠「最後一段是不是數字」猜。
     `k…-tb2` 本身就是回合層 ⇒ 一步都不退（退了就會跳到同毫秒的另一輪＝安靜指錯）；
@@ -5972,9 +6264,12 @@ function lsSet(k,v){{try{{localStorage.setItem(k,v);return true;}}catch(e){{retu
 var FKEY='idx_filter_v1';
 /* ⚠ `b` ＝「只看有書籤的」。它和其他七個條件一樣要被記住：實際用法是**勾著它來來回回**
    （索引 → 某一場 → 回索引 → 下一場），而每次回索引都是一次重新載入。
-   ⚠⚠ **還原不在 `restoreF()` 裡，在 `bkIndexRestoreFilter()`**（見 `_INDEX_BOOKMARK_JS`）：
-   `restoreF()` 跑在 `bkIndexMark()` 之前，那時每一列的 `data-bm` 還沒填，
-   在這裡把它勾起來會讓第一次 `af()` 把整張表濾成空的（畫面閃一下 0 / N）。 */
+   ⚠ 還原就在 `restoreF()` 裡（往下十行，那裡有完整的理由）。
+   ⚠⚠ **這裡原本寫著「還原不在 `restoreF()` 裡，在 `bkIndexRestoreFilter()`」——那是 2026-08-23
+   修好之前的舊說法，而且 `bkIndexRestoreFilter` 這個名字整份 repo 裡不存在。**
+   留著它會讓下一個人照錯的那條改，直接重演教訓 39。
+   ⇒ 一般化：**改了承重的機制，就要去找「解釋舊機制」的那幾段註解**，
+   它們不會跟著程式一起變紅。 */
 function saveF(){{lsSet(FKEY,JSON.stringify({{q:Q.value,s:FS?FS.value:'',p:FP.value,m:FM.value,a:FA?FA.value:'',k:FK?FK.value:'',w:(FW&&FW.checked)?1:0,b:(FB&&FB.checked)?1:0}}));}}
 function setSel(el,v){{if(!el||!v)return;for(var i=0;i<el.options.length;i++){{if(el.options[i].value===v){{el.value=v;return;}}}}}}
 /* ⚠⚠ **`b`（只看有書籤的）一定要在這裡還原，不可以拖到 `bkIndexMark()` 那邊。**
@@ -8060,7 +8355,9 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
    靠右，新元件進同一列本來就會推它）——那是刻意加的 UI，不是版面缺陷。 */
 .alink{margin-left:8px;color:var(--muted);text-decoration:none;font-weight:600;
        opacity:0;pointer-events:none;transition:opacity .12s}
-.turn:hover .alink,.alink:focus{opacity:.65;pointer-events:auto}
+/* ⚠ `:not(.blk-ctl)` 是第 4 期加的：區塊層級也用 `.alink`，沒排除的話滑過一輪就會
+   同時亮起該輪**每一個區塊**的按鈕（實測 p99 有 101 個）。見下方〈區塊層級的 #／☆〉。 */
+.turn:hover .alink:not(.blk-ctl),.alink:not(.blk-ctl):focus{opacity:.65;pointer-events:auto}
 .alink:hover{opacity:1;color:var(--accent)}
 /* ⚠ 沒有 hover 的裝置上，靠 `.turn:hover` 顯形等於這個功能的主要入口永遠看不到。 */
 @media (hover:none){.alink{opacity:.55;pointer-events:auto;margin-left:6px;padding:2px 8px}}
@@ -8100,11 +8397,42 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
 .bmk{margin-left:4px;border:0;background:transparent;color:var(--muted);cursor:pointer;
      font-size:13px;line-height:1;padding:0;min-width:24px;min-height:24px;
      opacity:0;pointer-events:none;transition:opacity .12s}
-.turn:hover .bmk,.bmk:focus{opacity:.65;pointer-events:auto}
+/* ⚠ `:not(.blk-ctl)` 的理由同 .alink（第 4 期）。 */
+.turn:hover .bmk:not(.blk-ctl),.bmk:not(.blk-ctl):focus{opacity:.65;pointer-events:auto}
 .bmk:hover{opacity:1;color:var(--accent)}
 .bmk.on{opacity:1;pointer-events:auto;color:var(--accent)}
 /* ⚠ 沒有 hover 的裝置上靠 .turn:hover 顯形＝這個功能的入口永遠看不到（同 .alink）。 */
 @media (hover:none){.bmk{opacity:.55;pointer-events:auto}}
+/* ── 區塊層級的 #／☆（第 4 期）─────────────────────────────────────────
+   ⚠⚠ **顯形範圍一定要縮到 `.blk`，不能沿用 `.turn:hover`。** 全語料實測一輪的可標記
+   區塊數 p99＝101（Codex 129、max 412）——沿用整輪的規則，滑過任何一處就會同時亮起
+   一百組按鈕。上面兩條 `.turn:hover` 規則因此加了 `:not(.blk-ctl)` 把區塊那組排除掉。
+   ⚠ 用 `>` 直接子選擇器。**但這裡原本寫的理由是假的**（`bookmarks-p4-fam` Low）：
+   舊版說「工具區塊裡可能巢著子代理的回合，那裡面又有 `.blk`」——**不會**：
+   `render_turn_html` 把子代理區塊放在 `extra`、當成工具區塊的**兄弟**，
+   實測真頁上 `.blk .blk` 恒為 0，而且探針的 `subagent_not_wrapped_in_block`
+   正好在保證它永遠為 0。
+   → `>` 留著是因為它**比較窄、而且未來真的巢起來時不會壞**，
+   不是因為現在有巢狀結構。**理由寫錯比沒寫更貴**：下一個人會拿它去推別的事。 */
+.blk{position:relative}
+/* ⚠⚠ **容器一定要 `pointer-events:none` ＋ 透明背景。**（`bookmarks-p4-fam` Medium）
+   第一版把 `background:var(--panel)` 放在容器上、`opacity:0` 只加在**子元素**上 ⇒
+   每個區塊右上角固定有一塊 49×24px 的不透明方塊，**不管有沒有滑過**：
+   蓋住第一行右端（code fence、寬表格、長工具摘要），而且那塊區域的文字**選不起來也點不到**。
+   實測 `elementFromPoint(控制項內 2px)` 回的是 `SPAN.blk-ctls` 而不是底下的字。
+   背景移到按鈕自己身上——按鈕平常 `opacity:0`，只有顯形時才連背景一起出現。 */
+.blk-ctls{position:absolute;right:4px;top:0;z-index:2;display:inline-flex;align-items:center;
+ line-height:1.6;pointer-events:none;background:transparent}
+.blk-ctls .blk-ctl{opacity:0;pointer-events:none;transition:opacity .12s;
+ background:var(--panel);border-radius:6px}
+.blk:hover>.blk-ctls>.blk-ctl,.blk-ctls>.blk-ctl:focus{opacity:.65;pointer-events:auto}
+.blk-ctls>.blk-ctl:hover{opacity:1;color:var(--accent)}
+/* ⚠ 已加書籤的那一顆要**一直**看得見，否則「這一塊存過沒有」得靠滑鼠一格一格掃。
+   與 `.bmk.on` 同一個理由，但這裡必須再寫一次：上面那條 `.blk-ctls .blk-ctl{opacity:0}`
+   的權重（0,2,0）壓過 `.bmk.on`（0,2,0）後來居上——同權重時後寫的贏。 */
+.blk-ctls>.bmk.on{opacity:1;pointer-events:auto;color:var(--accent)}
+/* ⚠ 沒有 hover 的裝置：同 .alink／.bmk，不給常駐就等於這個入口不存在。 */
+@media (hover:none){.blk-ctls .blk-ctl{opacity:.5;pointer-events:auto}}
 /* 對話窗：fixed 覆蓋層，不進文件流（不造成版面位移）。 */
 .bm-modal{position:fixed;inset:0;z-index:70;display:none;
           background:rgba(0,0,0,.45);padding:16px;overflow-y:auto}

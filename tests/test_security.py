@@ -14,6 +14,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import ai_session_viewer as viewer  # noqa: E402
+sys.path.insert(0, str(ROOT / "tests"))
+# ⚠ 共用 `test_smoke.new_tmp`，**不拄第二份**——拄一份的代價已經付過一次了
+# （探針拄了 `block_is_renderable` 而且拄漏兩件事）。那支的 docstring 寫著為什麼不能直接用 mkdtemp。
+from test_smoke import new_tmp  # noqa: E402
 
 SCRIPT = ROOT / "ai_session_viewer.py"
 PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -173,7 +177,7 @@ def _isolated_home_env(tmp):
 
 
 def test_force_project_keeps_unfiltered_manifest_rows():
-    tmp = Path(tempfile.mkdtemp())
+    tmp = new_tmp()
     projects = tmp / "projects"
     out = tmp / "out"
     _write_session(projects, "proj-a", "aaaaaaaa", "Alpha request")
@@ -202,7 +206,7 @@ def test_force_project_keeps_unfiltered_manifest_rows():
 
 
 def test_codex_source_renders_in_own_namespace():
-    tmp = Path(tempfile.mkdtemp())
+    tmp = new_tmp()
     codex_file = tmp / "rollout-test.jsonl"
     out = tmp / "out"
     _write_codex_session(codex_file)
@@ -236,7 +240,7 @@ def test_codex_source_renders_in_own_namespace():
 
 
 def test_no_codex_run_preserves_codex_outputs():
-    tmp = Path(tempfile.mkdtemp())
+    tmp = new_tmp()
     home = tmp / "home"
     claude_projects = home / ".claude" / "projects"
     codex_dir = home / ".codex" / "sessions"
@@ -268,7 +272,7 @@ def test_no_codex_run_preserves_codex_outputs():
 
 
 def test_collect_sources_dedupes_same_realpath():
-    tmp = Path(tempfile.mkdtemp())
+    tmp = new_tmp()
     proj = tmp / "projects"
     proj.mkdir(parents=True, exist_ok=True)
     # 兩個來源指到同一真實路徑 → 應只留一個（涵蓋 junction/symlink 造成的重複內容）

@@ -68,7 +68,14 @@ MANIFEST_NAME = ".build-manifest.json"
 # 44 → 45（2026-08-22）：撞號 tiebreak 的排序鍵改成 (來源檔, 行序)，整場可比。
 #    ⚠ 這會改變撞號組裡誰拿無後綴錨點 ＝ id 值可能改變 ＝ 呈現層。
 # 45 → 46（2026-08-22）：關閉鈕加大到 28×28、橫幅在小視窗收緊、bmWhen 驗日期範圍。
-RENDERER_VERSION = 46
+# 46 → 47（2026-08-22）：**書籤第 2 期**——每輪標頭加 ☆ 鈕、書籤對話窗、localStorage、
+#    匯出匯入。⚠ 動到 HTML（新元素）＋CSS＋頁面 JS，三樣都是呈現層。
+# 47 → 48（2026-08-22）：**書籤第 3 期**——書籤 JS 拆成 `_BOOKMARK_CORE_JS`（三頁共用）＋
+#    `_BOOKMARK_PAGE_JS`（session 頁專屬）、對話窗的類別改成 chip ＋「＋ 新類別」就地新增、
+#    多內嵌一個 `BK_MGR`。⚠ **session 頁的 JS 與 CSS 都變了 ＝ 呈現層**。
+#    ⚠ 管理頁（`out/sessions/bookmarks.html`）與設定頁（`out/sessions/settings.html`）
+#    本身**不受這個版本閘管**——它們和 `index.html` 一樣每次執行都無條件重產。
+RENDERER_VERSION = 51
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -117,6 +124,20 @@ def esc(s) -> str:
 
 def esc_attr(s) -> str:
     return html.escape("" if s is None else str(s), quote=True)
+
+
+def js_embed(obj) -> str:
+    """把 Python 值變成可直接內嵌進 `<script>` 的 JS 字面值。
+
+    ⚠ **四樣都要跳脫，少一樣就是一個洞**：
+    - `<` / `>`：資料裡出現 `</script>` 會直接破出標籤（對話內容真的會有）；
+    - U+2028 / U+2029：JS 的行終止符，不跳脫會把字串字面值攔腰截斷。
+
+    `json.dumps` 自己**不做**這四樣，所以每個內嵌點都得補——補漏一處就白防。
+    索引頁的 memory 對照表原本就是這樣寫的，抽出來共用，不要再寫第二份。"""
+    return (json.dumps(obj, ensure_ascii=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
 
 _SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*:", re.I)
@@ -3345,10 +3366,17 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
              f' title="這一輪的直達連結 · {esc_attr(when_full)}"'
              f' onclick="return openSub(\'{group["kanchor"]}\')">#</a>'
              if group.get("kanchor") else "")
+    # 加書籤鈕（第 2 期）。⚠ **和 `#` 連結同一個條件**：沒有耐久錨點就不給。
+    # 書籤的身分是 `session_id + 耐久錨點`，沒有錨點就沒有能存下來的身分——
+    # 給了鈕卻存不回來，比沒有鈕更糟。
+    bmk = (f'<button class="bmk" type="button" data-k="{esc_attr(group["kanchor"])}"'
+           f' title="加書籤／編輯書籤" aria-label="加書籤"'
+           f' onclick="bkOpen(this.getAttribute(\'data-k\'))">☆</button>'
+           if group.get("kanchor") else "")
     return (f'<div class="turn {role}{side_cls}"{aid}>'
             f'<div class="head">{tspan}<span class="who">{icon} {who}</span>{side_badge}'
             f'{meters}<span class="when" title="{esc_attr(when_full)}">{esc(when)}</span>'
-            f'{alink}</div>'
+            f'{alink}{bmk}</div>'
             f'<div class="body">{"".join(parts)}</div></div>')
 
 
@@ -3429,6 +3457,1619 @@ def acct_sep_label(ts, day=""):
     if stamp and epoch_str(ts, "%Y-%m-%d") != day:
         stamp = epoch_str(ts, "%m-%d %H:%M")
     return f"換了登入帳號 · {stamp}" if stamp else "換了登入帳號"
+
+
+# =========================================================================
+# 書籤（第 2＋3 期）：核心、共用對話窗、匯出匯入、管理頁、設定頁
+# =========================================================================
+# ⚠⚠ **下面這幾個常數都是普通字串，不是 f-string——大括號寫一個就好。**
+# session 頁的 `<script>` 區塊本身是 f-string（那裡的括號要 double），把這幾大段 JS
+# 直接寫進去等於要手動 double 掉數百個括號，錯一個整頁 JS 就死。改用
+# 「普通 raw 字串 ＋ `__佔位符__`」，由各自的 render 函式用 `js_embed()` 填值。
+#
+# 命名（**刻意分前綴**，免得日後改到錯的那一組）：
+#   `bm*` 第 1 期「錨點找不到」的橫幅；`bk*` 三頁共用的核心與對話窗；
+#   `bx*` 書籤管理頁；`bs*` 設定頁。
+#
+# ⚠ **`_BOOKMARK_CORE_JS` 由三個頁面共用**（session 頁／管理頁／設定頁），
+#   對頁面有四項要求，缺一項就會壞：
+#     1. 先定義 `lsGet`／`lsSet`（包 try/catch 的 localStorage 存取）
+#     2. 先定義 `BK_MGR`＝管理頁的相對路徑（**空字串＝這一頁自己就是管理頁**，不畫那個連結）
+#     3. 定義 `bkRefresh(msg)`：core 改完資料之後叫它，由各頁決定要重畫什麼
+#     4. DOM 裡要有 `#bkModal` / `#bkCard`（共用對話窗的容器）與 `#bkMsg`（訊息列，由 bkFoot 產）
+#   守這四項的是 `test_bookmark_core_contract`（三頁各驗一次）。
+_BOOKMARK_CORE_JS = r"""
+var BK_KEY='asv_bm_v1', BK_SKEY='asv_bmset_v1';
+/* 複查間隔：**單選**（Will 的原話是「下拉使用上比較不方便」），預設半年。
+   ⚠ 到期只是一個狀態，**書籤永遠不會自動刪**（Will 2026-08-22 裁決）。 */
+var BK_SPANS=[['0','不提醒'],['14d','兩週'],['1m','一個月'],['3m','三個月'],
+              ['6m','半年'],['1y','一年']];
+var BK_FALLBACK='6m';   /* 設定頁還沒被寫過時的出廠值 */
+var BK_CATN=6;          /* 對話窗預設露出幾顆類別 chip，其餘收在「更多…」後面 */
+var BK_EDIT=null;       /* 對話窗正在編輯的那一筆（null＝沒開著編輯畫面）*/
+var BK_CAT='';          /* 對話窗目前選著的類別（''＝沒有類別，那也是一種選擇）*/
+var BK_MORE=false;      /* 對話窗的類別 chip 展開了沒 */
+var BK_UNDO=null;       /* 剛移除的那一筆，讓「復原」不必再打一次備註 */
+
+/* ── 匯入檔的型別閘（**進得來的東西一律先過這裡**）────────────────────
+   ⚠⚠ 舊版對字串欄位一律 `String(v)`，於是 `String({})` ＝ `'[object Object]'`
+   ⇒ 造得出 id 為 `[object Object]|[object Object]` 的**幽靈書籤**
+   （跨模型 Medium#7）。`String()` 不是驗證，它是**強制轉型**——把「不是字串」
+   悄悄變成一個看起來像字串的東西，正是驗證要擋的那件事。 */
+function bkStr(v,max){
+ if(typeof v==='number'&&isFinite(v))v=String(v);   /* 舊資料的 sid 可能是數字 */
+ if(typeof v!=='string')return '';
+ return v.slice(0,max||4000);}
+/* `sid` 與 `anchor` 會被 `bkId()` 用 `|` 接成身分：任一邊含 `|` 就分不開了。
+   空白與控制字元也擋掉——那種值只可能來自壞掉或偽造的檔。
+   ⚠⚠ **這個字元類只擋三樣：`|`、空白、控制字元。其餘一律放行。**
+   耐久錨點的文法是 `k<ts>[-tb<n>][-s<ts>][-b<n>]`，把 `-` 也擋掉的話，
+   子代理與撞號那幾種錨點會被整批判成無效、匯入時無聲消失
+   ——而第 4 期（區塊層級）還會再往上加一段。**不要把這裡收緊成白名單。**
+   守它的是探針的 `durable_anchor_shapes_accepted`（四種形狀各一格）。 */
+function bkIdPart(v){
+ var s=bkStr(v,200).replace(/^\s+|\s+$/g,'');
+ return /^[^|\s\u0000-\u001f]+$/.test(s)?s:'';}
+/* `span` 走白名單：不認得的一律「不提醒」，和 `bkDue`／`bkSpanLabel` 的判定一致。 */
+function bkSpanOk(v){
+ var s=bkStr(v,8).replace(/^\s+|\s+$/g,''),i;
+ for(i=0;i<BK_SPANS.length;i++)if(BK_SPANS[i][0]===s)return s;
+ return '0';}
+/* ⚠ `due` 收負值的話會顯示成 1970-01-01 **而且立刻算到期**；超界則是 Invalid Date。
+   兩種都當「沒設」。守它的是探針的 `negative_due_rejected`（負值那半）
+   與 `infinite_due_clamped`（超界那半，⑬e 那一組）。 */
+function bkDueOk(v){
+ var n=Number(v);
+ return (isFinite(n)&&n>0&&n<=8.64e15)?n:0;}
+/* ⚠⚠ 匯入檔的**時間戳**：缺漏或垃圾＝「未知」，權重 0，**不可以退回「匯入當下」**
+   （跨模型 High#2）。退回當下有兩個後果：①同一份檔案匯入兩次結果不同（不冪等）；
+   ②那個值永遠比本機大 ⇒ 一份舊備份可以**反覆**把本機後來的編輯壓掉。
+   未知（0）在 `mtI>bkWhen(cur)` 這個比較裡一定輸 ⇒ 只會補本機缺的欄位，不會蓋掉。
+   「什麼時候拿到的」另外記在 `im`，只給排序與顯示用，**絕不參與合併比較**。 */
+function bkTs(v,now){
+ var n=Number(v);
+ if(!isFinite(n)||n<=0||n>now+86400000)return 0;    /* 允許來源機器的時鐘快一天 */
+ return n;}
+
+/* ── 存取 ───────────────────────────────────────────────────────────
+   全部包 try/catch：`file://` 下 localStorage 可能丟例外、也可能回 null
+   （lsGet/lsSet 已經擋了一層，這裡擋的是 JSON 壞掉那一層）。 */
+/* ⚠⚠ **「讀不到」和「確定沒有書籤」是兩種狀態，不可以混成同一種。**
+   舊版解析失敗就回空陣列，於是**下一次任何寫入**（加一筆、移除、匯入）都把那個空
+   狀態寫回原鍵，把還救得回來的原始字串**永久輾掉**——等於所有書籤自動消失
+   （跨模型 High#4）。現在壞掉時帶 `bad:1` ＋ `raw`，由 `bkStore()` 一律拒寫，
+   footer 給一條「⛑ 匯出原始資料」的救援路。
+   守它的是探針的 `corrupt_store_not_overwritten`／`corrupt_store_drop_also_blocked`。 */
+function bkLoad(){
+ var r=null;
+ try{r=lsGet(BK_KEY);}catch(e){return {v:1,items:[],bad:1,raw:''};}
+ if(!r)return {v:1,items:[]};
+ var o=null;
+ try{o=JSON.parse(r);}catch(e){return {v:1,items:[],bad:1,raw:r};}
+ if(!o||!Array.isArray(o.items))return {v:1,items:[],bad:1,raw:r};
+ /* ⚠ items 裡的**每一筆**也要驗。`{items:[null]}` 是合法 JSON、根形狀也對，
+    但 `bkCatsAll()` 一碰就 `TypeError` ⇒ **整頁死掉**（跨模型 Medium#7）。
+    ⚠ 個別壞掉的紀錄直接丟掉、**不封鎖寫入**：它們連 sid/anchor 都沒有，
+    沒有任何可救的內容，而一個 null 不該讓使用者從此不能再加書籤。
+    這和上面那個「整份讀不到」是**不同等級**的壞，處置也不一樣。 */
+ var out=[],kept=[],i,x,sid,anch;
+ for(i=0;i<o.items.length;i++){
+  x=o.items[i];
+  sid=(x&&typeof x==='object')?bkIdPart(x.sid):'';
+  anch=(x&&typeof x==='object')?bkIdPart(x.anchor):'';
+  if(!sid||!anch){
+   /* ⚠⚠ **認不出來的不可以就這樣丟掉。** 舊版直接 `drop++;continue;`，而
+      `bkStore()` 只寫 `st.items` ⇒ **下一次任何寫入就把它們永久移除**，
+      連帶把裡面的備註一起弄丟。註解當時寫「它們連 sid/anchor 都沒有，
+      沒有任何可救的內容」——**那句是錯的**：`{sid:"",note:"還沒補錨點的筆記"}`
+      有滿滿的可救內容。這和「書籤永遠不會自動刪」直接牴觸。
+      改成**原樣留著**（`kept`），由 `bkStore()` 一起寫回去：不顯示、不參與合併，
+      但也絕不消失，`⬇ 完整備份`（`pay.kept`，見 `bkExport`）與 `⛑ 匯出原始資料`
+      都救得到。⚠ 「救得到」＝**檔案裡有**，不是「匯入會還原」——它們沒有 sid，
+      匯入端一定會略過。
+      ⚠ 不走 `bad:1` 拒寫那條路：那會讓一筆垃圾紀錄害使用者從此不能再加書籤。
+      守它的是探針的 `unreadable_record_survives_write`。 */
+   kept.push(x);continue;}
+  /* ⚠⚠ **逐欄位正規化，不是只驗 sid／anchor 就把原物件塞回去。** 舊版 `out.push(x)`
+     ⇒ `{sid:'s',anchor:'k',cat:{}}` 過得了這一關，然後 `bkCatsUsed()` 的
+     `(cat||'').replace` 直接 `TypeError`＝**整頁死掉**。那正是 `{items:[null]}`
+     那一條（跨模型 Medium#7）的同一個病，只是換到欄位層——當時只補了最外層。
+     ⚠ **`url` 刻意不在這裡過 `bkSafeRel`**：那會讓匯出端那道閘再也沒有素材走得到
+     （手改進去的絕對路徑會在載入時就被清掉），縱深就變成只剩一道而且量不到。
+     形狀驗證留給匯出端（`export_gate_drops_hand_edited_url` 在守）。
+     守它的是探針的 `bad_field_type_does_not_kill_page`。 */
+  out.push({id:(typeof x.id==='string'&&x.id)?x.id:bkId(sid,anch),
+            sid:sid,anchor:anch,
+            url:bkStr(x.url,400),
+            stitle:bkStr(x.stitle,400),
+            town:x.town?1:0,
+            note:bkStr(x.note,20000),
+            cat:bkStr(x.cat,200).replace(/^\s+|\s+$/g,'').slice(0,60),
+            sum:bkStr(x.sum,400),
+            ct:bkDueOk(x.ct),mt:bkDueOk(x.mt),im:bkDueOk(x.im),lr:bkDueOk(x.lr),
+            span:bkSpanOk(x.span),due:bkDueOk(x.due)});}
+ return kept.length?{v:1,items:out,kept:kept,drop:kept.length}
+                   :{v:1,items:out};}
+/* ⚠⚠ **回傳寫入成敗，呼叫端一定要看。** `lsSet` 把例外吞掉是對的（不能讓整頁死掉），
+   但**吞掉之後還跟使用者說「已加入書籤」就是騙人**——`file://` 在 Chrome 眼裡是單一
+   origin，配額由所有本機開過的頁面共用；隱私模式下 `setItem` 會直接丟例外。
+   這是少數幾個該讓使用者**立刻知道**的錯誤：他以為存好了，其實一筆都沒有，
+   而那句「真正的備份是匯出的 JSON」還會讓他覺得不急著匯出。
+   守它的是探針的 `quota_failure_is_reported`。
+   ⚠⚠ **壞掉的 store 一律拒寫，而且擋在這裡**——這是唯一的寫入口，
+   `bkCommit`／`bkDrop`／`bkUndo`／`bkImport` 全部經過它。擋在各呼叫端就會漏
+   （教訓：**保險只寫在一條分支上等於沒寫**）。 */
+function bkStore(st){
+ if(st&&st.bad)return false;
+ /* ⚠⚠ **認不出形狀的紀錄要原樣寫回去**（見 `bkLoad()` 的 `kept`）。
+    少了這一段，任何一次寫入都會把它們永久移除。 */
+ var items=((st&&st.items)||[]).concat((st&&st.kept)||[]);
+ return lsSet(BK_KEY,JSON.stringify({v:1,items:items}));}
+/* 寫入失敗時統一的說法：講清楚「沒有存進去」，並指向唯一還有救的動作。 */
+var BK_FAILMSG='⚠⚠ 沒有存進去（瀏覽器'
+ +'儲存空間滿了，或這個模式不'
+ +'允許寫入）。請先按「⬇ 完整'
+ +'備份」把現有的書籤存成檔案。';
+/* ⚠ 壞掉的 store 要講**不一樣的話**：說「空間滿了」會讓人去做沒有用的事（清空間），
+   而真正該做的是先把原始字串救出來。 */
+var BK_BADMSG='⚠⚠ 讀不到現有的書籤（'
+ +'localStorage 裡那份資料壞了）'
+ +'，所以這次沒有存進去——硬存'
+ +'會把還救得回來的原始資料蓋'
+ +'掉。請先按「⛑ 匯出原始資料'
+ +'」存成檔案。';
+function bkWhyFail(st){return (st&&st.bad)?BK_BADMSG:BK_FAILMSG;}
+/* ── 兩把鍵要一起成立時的回捲 ──────────────────────────────────────
+   ⚠⚠ 類別的改名／刪除／復原**先寫書籤那把鍵、再寫設定那把**。只有第二把失敗時，
+   書籤其實**已經改掉了**，而畫面上卻印著通用的「沒有存進去」——使用者會以為
+   什麼都沒發生，實際上書籤的類別已經全部換成新名字了。
+   （寫入順序本身是對的：先書籤後設定，見 `bkImport` 那段的理由。）
+   所以第二把失敗時要把第一把回捲，並依回捲結果講**不一樣的話**。
+   守它的是探針的 `settings_second_write_rolls_back`。 */
+function bkRawSnap(){try{return lsGet(BK_KEY);}catch(e){return null;}}
+function bkRollback(raw){
+ if(raw===null||raw===undefined)return false;
+ try{return !!lsSet(BK_KEY,raw);}catch(e){return false;}}
+var BK_PARTIALMSG='⚠⚠ 只做到一半：'
+ +'書籤那邊已經改掉了，類別設定'
+ +'沒有存進去，而且要復原回去也'
+ +'失敗了。請先按「⬇ 完整備份」'
+ +'存檔，再檢查瀏覽器的儲存空間'
+ +'。';
+/* ⛑ 救援：把 localStorage 裡那串**原始字串**原封不動存成檔案。
+   ⚠ 不修補、不重新 JSON 化——壞在哪裡要留給人看得到。 */
+function bkRescue(){
+ var st=bkLoad(), raw=st.bad?(st.raw||''):(lsGet(BK_KEY)||'');
+ /* ⚠⚠ **沒有原始字串就不要下載**：照存下去就是一個 0 位元組的檔 ＋ 一句
+    「已把原始資料存成檔案」——訊息和實際發生的事相反。
+    ⚠⚠ **但訊息要跟著實際狀態走。** 舊版一律說「瀏覽器拒絕存取 localStorage」，
+    理由寫的是「`lsGet` 丟例外時 `bkLoad()` 回 `{bad:1,raw:''}`」——**那個狀態到不了**：
+    `lsGet` 自己就 try/catch 回 `null`，`bkLoad` 的 `if(!r)` 先把它接走 ⇒ 永遠不是 `bad`。
+    真正到得了這一格的只有「store 完全正常、只是還沒有任何書籤」，
+    而那時候那句話是**反的**（收斂確認輪 Low）。
+    ⚠ `st.bad` 那半仍然留著：`bkFoot` 的救援鈕只在 `st.bad` 時畫得出來，
+    而那時 `st.raw` 必定非空——所以那一半是**純防禦**，沒有任何素材走得到，
+    不要在那裡寫「守它的是 XXX」。
+    守這一格的是探針的 `rescue_refuses_when_nothing_to_save`（不下載）
+    與 `rescue_message_matches_reality`（話是對的）。 */
+ if(!raw){
+  bkSay(st.bad
+        ?'連原始資料都讀不到（瀏覽器拒絕存取 localStorage）。'
+         +'請改用一般視窗（非無痕）開這一頁再試一次——資料可能還在。'
+        :'目前一筆書籤都沒有，沒有東西可以救。');
+  return;}
+ if(bkDownload('asv-bookmarks-raw-'+bkStamp()+'.txt',raw))
+  bkSay('已把原始資料存成檔案（'+raw.length+' 個字元），可以用文字編輯器打開來救。');}
+
+/* ── 設定（第 3 期的設定頁在寫它；第 2 期就已經在讀了）───────────────
+   形狀：{rv:'6m', cats:['設計決策',…]}。`cats` 是**設定頁管理的清單**，
+   有順序、可以含還沒被任何書籤用到的名字。 */
+function bkCatsClean(a){
+ /* ⚠ 去重用的表一律 `Object.create(null)`：拿 `{}` 當表時，名叫 `constructor`／
+    `__proto__` 的類別會撞到原型上的成員 ⇒ 被當成「已經看過」而**無聲吃掉**。
+    匯入檔是別人給的，那種名字進得來。守它的是 `cat_named_constructor_survives`。 */
+ var out=[],seen=Object.create(null),i,c;
+ if(!Array.isArray(a))return out;
+ for(i=0;i<a.length&&out.length<200;i++){
+  if(typeof a[i]!=='string')continue;
+  c=a[i].replace(/^\s+|\s+$/g,'').slice(0,60);
+  if(!c||seen[c])continue;
+  seen[c]=1; out.push(c);}
+ return out;}
+/* `cta` ＝每個類別**第一次被建立**的時刻，只給對話窗的「最近用過」排序當第二把尺
+   （見 `bkCatsRecent`）。⚠ 只留還在 `cats` 裡的鍵：改名／刪除之後不清就會一直累積死鍵。
+   ⚠ 一律 `Object.create(null)`：類別名可能叫 `constructor`／`__proto__`。 */
+function bkCatTimes(src,cats){
+ var out=Object.create(null), i, t;
+ if(!src||typeof src!=='object')return out;
+ for(i=0;i<cats.length;i++){
+  t=Number(Object.prototype.hasOwnProperty.call(src,cats[i])?src[cats[i]]:0);
+  if(isFinite(t)&&t>0)out[cats[i]]=t;}
+ return out;}
+/* ⚠⚠ **「壞掉就拒寫」原本只做在書籤那把鍵上。** 類別清單是使用者自己建的資料、
+   同樣只活在 localStorage 裡（README 特別說明過），卻是舊行為：解析失敗就當成
+   「這台還沒有設定」，然後**下一次任何寫入**（加一個類別、按一顆間隔 chip、匯入）
+   就把原字串輾掉。又一次「保險只寫在一條分支上」——兩把鍵同一個等級，只守了一把。
+   守它的是探針的 `corrupt_settings_not_overwritten`。 */
+function bkSetBad(){
+ var r=null;
+ try{r=lsGet(BK_SKEY);}catch(e){return true;}
+ if(!r)return false;            /* 沒有＝還沒設定過，那不是壞掉 */
+ try{var o=JSON.parse(r);
+     return !(o&&typeof o==='object'
+              &&(typeof o.rv==='string'||Array.isArray(o.cats)));}
+ catch(e){return true;}}
+function bkSettings(){
+ /* ⚠⚠ **`rv` 缺漏不可以整份丟掉。** `{"cats":["甲","乙"]}` 原本會回 null ⇒
+    對話窗與設定頁的**整份類別清單直接消失**，看起來像「你沒有任何類別」，
+    接著第一次存偏好就寫成 `cats:[]`，永久。`cats` 是陣列就先救回來，
+    `rv` 退回出廠值。守它的是探針的 `settings_without_rv_keeps_cats`。 */
+ try{var r=lsGet(BK_SKEY);var o=r?JSON.parse(r):null;
+     if(o&&typeof o==='object'
+        &&(typeof o.rv==='string'||Array.isArray(o.cats))){
+      var cs=bkCatsClean(o.cats);
+      return {rv:(typeof o.rv==='string')?o.rv:BK_FALLBACK,
+              cats:cs,cta:bkCatTimes(o.cta,cs)};}}catch(e){}
+ return null;}                 /* null ＝ 這台還沒有個人設定（或讀不到，見 bkSetBad）*/
+function bkSet(){var s=bkSettings();
+ return s?s:{rv:BK_FALLBACK,cats:[],cta:Object.create(null)};}
+var BK_SETBADMSG='⚠⚠ 讀不到現有的'
+ +'類別設定（localStorage 裡那份'
+ +'資料壞了），所以這次沒有存進'
+ +'去——硬存會把還救得回來的原始'
+ +'資料蓋掉。請先用瀏覽器的開發'
+ +'者工具把 asv_bmset_v1 那一項'
+ +'複製出來，再回來修改。';
+/* 設定寫失敗時的說法：壞掉和「空間滿了」要講不一樣的話——講錯會讓人去清空間
+   （沒有用），而真正該做的是先把原始字串救出來。和 `bkWhyFail` 是同一條規則。 */
+function bkWhySetFail(){return bkSetBad()?BK_SETBADMSG:BK_FAILMSG;}
+function bkSaveSet(o){
+ if(bkSetBad())return false;
+ var cs=bkCatsClean(o?o.cats:[]);
+ return lsSet(BK_SKEY,JSON.stringify({rv:String(o&&o.rv?o.rv:BK_FALLBACK),
+                                      cats:cs,cta:bkCatTimes(o?o.cta:null,cs)}));}
+function bkDefSpan(){
+ var s=bkSettings(); s=s?s.rv:null;
+ for(var i=0;i<BK_SPANS.length;i++)if(BK_SPANS[i][0]===s)return s;
+ return BK_FALLBACK;}          /* 沒設定、或設定值不認得，都退回半年——不要讓 UI 一片空白 */
+function bkSpanLabel(v){
+ for(var i=0;i<BK_SPANS.length;i++)if(BK_SPANS[i][0]===v)return BK_SPANS[i][1];
+ return BK_SPANS[0][1];}       /* 不認得的值＝不提醒，和 bkDue 的判定一致 */
+function bkId(sid,a){return sid+'|'+a;}
+function bkFindId(st,id){
+ for(var i=0;i<st.items.length;i++)if(st.items[i].id===id)return st.items[i];
+ return null;}
+/* ⚠ 匯入檔的數字欄位一律過這一層：`Number('1e999')` 是 `Infinity`，
+   拿它當「比較新」的依據就會**永遠贏過任何本機值**（`bookmarks-p23` 的 High #2 順帶項）。
+   守它的是探針的 `infinite_ct_clamped`／`infinite_due_clamped`。 */
+function bkNum(v,def){var n=Number(v);return isFinite(n)?n:def;}
+/* 合併時的「時刻」：優先用 `mt`（最後修改），沒有就退回 `ct`（建立）。
+   ⚠ 舊版的備份沒有 `mt`，那條路一定要走得通。
+   ⚠ 下界夾在 0：負值（手改過的 store、別的工具寫進來的）會讓
+   `newer=incWhen>bkWhen(cur)` 對「未知時間戳（0）」的匯入檔**恆真**，
+   而 `cur.mt` 只在 `newer&&incWhen>0` 時才寫回去 ⇒ 那個條件恆假
+   ⇒ 同一份檔案每匯一次就再判一次衝突、備註尾巴每次長一截（＝不冪等）。
+   ⚠⚠ **但這個夾制是純防禦，沒有素材走得到**（教訓 29）：`bkLoad()` 是唯一的讀取口，
+   它已經用 `bkDueOk` 把 `mt` 正規化掉負值了，所以進到這裡的 `x.mt` 不可能是負的。
+   突變檢驗實測：只把這裡的夾制拿掉，探針**全綠**。
+   ⇒ **不要在這裡寫「守它的是 XXX」。** 真正在守那個不冪等症狀的是
+   `bkLoad()` 的 `mt:bkDueOk(x.mt)`（探針 `negative_mt_import_is_idempotent` 測的是它）。
+   ⚠⚠ **`mt` 是 0 要當成「沒有」，繼續退回 `ct`。** 不可以寫成
+   `bkNum(x.mt, bkNum(x.ct,0))` 然後夾下界——`bkLoad()` 現在會把缺漏的 `mt`
+   正規化成 **0**（而 0 是 finite），於是那個寫法再也不會退回 `ct`，
+   所有舊格式紀錄的時刻一起變成 0 ⇒「最近用過」的排序整個垮掉。
+   （這一格是探針的 `recent_used_first` 當場抓到的。） */
+function bkWhen(x){
+ var m=bkNum(x&&x.mt,0); if(m>0)return m;
+ var c=bkNum(x&&x.ct,0); return c>0?c:0;}
+/* 排序用的「時刻」：`ct` 未知（匯入檔沒帶時間戳）時退回 `im`＝什麼時候匯進來的。
+   ⚠⚠ **`im` 只給排序與顯示，絕不參與 `bkWhen()` 的合併比較**——「拿收到的時間當
+   修改時間」正是跨模型 High#2 的成因。兩個用途分開，才不會又混回去。 */
+function bkOrd(x){return bkNum(x&&x.ct,0)||bkNum(x&&x.im,0);}
+
+/* ── 合併一筆（匯入 ↔ 本機，兩個方向共用同一段）─────────────────────
+   ⚠⚠ **「只增不減」是這一套的最高不變量**，而它一度是假的：舊版是**整筆勝者制**
+   ——較新那一筆的非空欄位直接取代本機，輸家的 note/cat/sum **原地消失、不留痕跡**；
+   反向分支自稱「只補缺欄位」卻漏掉 `url`／`town`／獨立的 `due`（跨模型 High#3）。
+   上一輪的 commit 訊息寫「兩個方向都改成逐欄位、只增不減」，**那句話對非空衝突是假的**，
+   而且沒有任何測試在守它。這次連測試一起補（探針 ⑭c）。
+
+   欄位分兩類，處置不同：
+   · **使用者自己寫的**（`note`／`cat`）：一個字都不可以掉。兩邊都有而且不同、
+     **而且匯入的那邊比較新**時（＝本機那份即將被取代），贏的留在欄位裡、
+     **輸的那一份寫進備註尾巴**，讓人自己決定要留哪個。
+     ⚠⚠ **反過來（本機比較新）就不記。** 那個方向本機什麼都沒有被破壞，
+     而匯入端那個值**還好端端躺在使用者剛剛選的那個檔案裡**——記進備註只是噪音，
+     而且會讓「同一份檔案匯入兩次」在備註尾巴一直長東西（＝不冪等）。
+     **判準是「這個值會不會就此消失」，不是「兩邊有沒有不一樣」。**
+   · **快取欄位**（`url`／`stitle`／`sum`）：本來就可以重算（見 `bkEditRec`），
+     新的贏、缺的補，衝突不記——那不是資料損失。
+   · **`town`**：**永遠不吃匯入端的**，理由見 `bkImport` 裡那一段。
+   ⚠ 兩個方向共用這一段，是因為「保險只寫在一條分支上等於沒寫」——這條線上
+   同一個保證已經連續寫錯過三次，全部都是分支之間漏掉一邊。 */
+var BK_LOST='—— 合併時保留的另一份值：';
+function bkKeepLost(note,lost){
+ if(!lost)return note||'';
+ /* ⚠ 已經記過就不要再記：同一份檔案匯入兩次不可以讓備註一直長（冪等）。
+    ⚠⚠ **比對要帶標記前綴。** 只比 `lost` 的話，輸家只要**碰巧是贏家的子字串**
+    就被判成「已經記過」而整個吞掉——而那正是最該留下來的東西：
+    本機備註「記得看設計決策那段」會讓舊類別名「設計決策」一聲不響地消失。
+    帶上 `BK_LOST` 就只認我們自己寫過的那一行。
+    守它的是探針的 `lost_substring_still_recorded`。 */
+ if(note&&note.indexOf(BK_LOST+lost)>=0)return note;
+ return (note?note+'\n':'')+BK_LOST+lost;}
+function bkMerge(cur,inc,incWhen){
+ var newer=incWhen>bkWhen(cur), n=0, lost;
+ if(inc.note&&inc.note!==cur.note){
+  if(!cur.note){cur.note=inc.note;n++;}
+  else if(newer){lost=cur.note;cur.note=bkKeepLost(inc.note,lost);n++;}}
+ /* 一筆只能掛一個類別，所以本機那個即將被取代的**名字**要寫進備註，不然它就真的沒了。 */
+ if(inc.cat&&inc.cat!==cur.cat){
+  if(!cur.cat){cur.cat=inc.cat;n++;}
+  else if(newer){lost=cur.cat;cur.cat=inc.cat;cur.note=bkKeepLost(cur.note,lost);n++;}}
+ if(inc.sum&&(newer||!cur.sum)){cur.sum=inc.sum;n++;}
+ if(inc.stitle&&(newer||!cur.stitle)){cur.stitle=inc.stitle;n++;}
+ if(inc.url&&(newer||!cur.url)){cur.url=inc.url;n++;}
+ /* 提醒間隔與到期日一起搬（`bkOverdue` 只看 `due`，兩者不同步就會說謊）。
+    ⚠⚠ **`cur.span==='0'` 不可以放進這個條件裡。** `'0'` 是使用者在對話窗裡
+    **明確關掉提醒**的結果，不是「還沒設定」；把它當成缺值去補，就會讓一份**較舊**的
+    備份把關掉的提醒無聲復活，而且連 `due` 一起帶回來 ⇒ 立刻算「該複查了」。
+    這和下面那一行的註解本來是同一條規則，卻只寫在下面那半——又一次
+    「保險只寫在一條分支上」：下面那道守著的東西，上面這道先放行了。
+    只有「**根本沒有這個欄位**」（舊格式）才補。
+    守它的是探針的 `older_import_does_not_revive_off_reminder`。 */
+ if(inc.span!=='0'&&(newer||!cur.span)){
+  cur.span=inc.span;cur.due=inc.due;n++;}
+ /* ⚠⚠ **本機已經有間隔、卻沒有到期日**時才單獨補 `due`（那正是舊版漏掉的一格）。
+    ⚠ 反過來**不可以**在 `cur.span==='0'` 時補 `due`：那是使用者明確關掉的提醒，
+    補了會讓它無聲復活（`bkOverdue` 只看 `due`，畫面上的 chip 卻寫著「不提醒」）。 */
+ else if(cur.span&&cur.span!=='0'&&!cur.due&&inc.due){cur.due=inc.due;n++;}
+ if(newer&&incWhen>0){if(!cur.ct)cur.ct=inc.ct;cur.mt=incWhen;}
+ else if(!cur.ct&&inc.ct)cur.ct=inc.ct;
+ if(!cur.im&&inc.im)cur.im=inc.im;
+ /* ⚠⚠ 真的改了東西就遞增本機修訂號，讓**已經開著的對話窗**察覺得到
+    （見 `bkEditRec` 的 `lr0`）。`mt` 在「補缺欄位」那幾條路上刻意不動，
+    所以不能只靠它。`lr` 不匯出、不參與比較。 */
+ if(n)cur.lr=bkNum(cur.lr,0)+1;
+ return n;}
+
+/* ── 複查到期時刻 ───────────────────────────────────────────────────
+   ⚠ **不可以直接 `d.setMonth(d.getMonth()+n)`**：1/31 加一個月會溢位成 3/2 或 3/3。
+   先把日設成 1 再換月，最後夾到該月最後一天。 */
+function bkAddMonths(ms,n){
+ var d=new Date(ms), day=d.getDate();
+ d.setDate(1); d.setMonth(d.getMonth()+n);
+ var last=new Date(d.getFullYear(),d.getMonth()+1,0).getDate();
+ d.setDate(day<last?day:last);
+ return d.getTime();}
+function bkDue(span,from){
+ if(span==='14d')return from+14*86400000;
+ if(span==='1m')return bkAddMonths(from,1);
+ if(span==='3m')return bkAddMonths(from,3);
+ if(span==='6m')return bkAddMonths(from,6);
+ if(span==='1y')return bkAddMonths(from,12);
+ return 0;}                    /* '0' 與任何不認得的值都當「不提醒」 */
+function bkOverdue(x){return !!(x&&x.due&&x.due<=Date.now());}
+function bkDate(ms){
+ /* ⚠ 匯入檔的 `due` 可能超出 JS Date 的 ±8.64e15（`1e999` ⇒ Infinity）。
+    超界就是 Invalid Date、`getFullYear()` 回 NaN，畫面會印出「複查 NaN-NaN-NaN」。
+    **算不出來就什麼都不印**——和 `bmWhen` 那條（`durable-anchor-r4` #8）是同一課：
+    不要自信地印一個不存在的日期。守它的是探針的 `overflow_due_no_nan`。 */
+ if(!ms||!isFinite(ms)||Math.abs(ms)>8.64e15)return '';
+ var d=new Date(ms);
+ function p(n){return (n<10?'0':'')+n;}
+ return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());}
+function bkStamp(){var d=new Date();function p(n){return (n<10?'0':'')+n;}
+ return ''+d.getFullYear()+p(d.getMonth()+1)+p(d.getDate());}
+
+/* ⚠ 一律跳脫再進 innerHTML：備註與類別是使用者輸入、摘要是對話原文，
+   而匯入的檔案可能來自別人。三個來源都不可信。 */
+function bkEsc(s){return String(s==null?'':s)
+ .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+ .replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+
+/* ⚠⚠ 記錄裡的 `url` **可能來自別人給的匯入檔**，而管理頁會拿它組 href。
+   進 DOM 之前先驗形狀：只收「相對 out/ 的 sessions/… 路徑」，其餘一律回空字串，
+   由呼叫端顯示「對不到檔案」而不是生一個怪連結。
+   （`javascript:` 這種即使被前面接上 `../` 也只會變成一個不存在的相對路徑，
+   但**不要靠那個巧合**——這裡明著擋。） */
+function bkSafeRel(u){
+ u=String(u==null?'':u);
+ if(u.indexOf('sessions/')!==0)return '';
+ if(u.indexOf(':')>=0||u.indexOf('\\')>=0)return '';
+ if(u.indexOf('//')>=0||u.indexOf('../')>=0||u.indexOf('/..')>=0)return '';
+ return u;}
+
+/* 「這個識別字看起來像不像一條路徑」——像就回空字串。
+   ⚠ 用在**遮蔽匯出**的 `sid`／`anchor`（見 `bkExport`）。
+   ⚠ 判準刻意比 `bkSafeRel` 窄：只認 `/`、`\` 與開頭的磁碟機代號。
+   拿「有沒有 `:`」當判準會誤殺時間戳形狀的識別字，而那不是洩漏。
+   ⚠⚠ **這道閘的正當性不建立在「`sid` 來自哪裡」，而是建立在「像路徑就遮」。**
+   （曾經寫成「`sid` 的來源是檔名主幹，任何平台上都不會含分隔符」——**那對 Codex 不成立**：
+   Claude 的 `session_id` 確實是 `path.stem`，但 Codex 的來自 **JSONL 檔內**的
+   `session_meta.payload.id`，那是資料不是檔名。實務上兩者都是 uuid，所以閘不會誤殺，
+   但**別拿那個推理當放寬這道閘的理由**——store 裡的值本來就可能是手改的。）
+   ⚠ 這裡**不做 trim、不做長度截斷**：那些在 `bkLoad`／`bkIdPart` 已經做過，
+   在這裡重做只會讓「哪一層才承重」變模糊。 */
+function bkSafePart(s){
+ s=String(s==null?'':s);
+ if(s.indexOf('/')>=0||s.indexOf('\\')>=0)return '';
+ if(/^[A-Za-z]:/.test(s))return '';
+ return s;}
+
+/* ── 類別 ──────────────────────────────────────────────────────────
+   來源有兩個：**設定頁管理的清單**（有順序、可含沒被用到的）與**書籤實際用到的**。
+   ⚠⚠ 合起來才是完整清單。只認設定頁那一份的話，就退化成「只能從 Settings 選」
+   ——那正是 Will 自己點出的那個問題（`bookmarks-proposal.md`〈類別的裁決〉）。 */
+function bkCatsUsed(st){
+ var seen=Object.create(null),out=[],i,c;
+ for(i=0;i<st.items.length;i++){c=(st.items[i].cat||'').replace(/^\s+|\s+$/g,'');
+  if(c&&!seen[c]){seen[c]=1;out.push(c);}}
+ return out;}
+function bkCatsAll(st){
+ /* 順序＝設定頁的手動順序在前，其餘（只有書籤在用的）依字典序接在後面。
+    ⚠ 這是**設定頁與管理頁篩選列**用的順序；對話窗另外照「最近用過」排（見下）。 */
+ var out=bkCatsClean(bkSet().cats), seen=Object.create(null), used, i;
+ for(i=0;i<out.length;i++)seen[out[i]]=1;
+ used=bkCatsUsed(st).slice().sort();
+ for(i=0;i<used.length;i++)if(!seen[used[i]]){seen[used[i]]=1;out.push(used[i]);}
+ return out;}
+function bkCatsRecent(st){
+ /* 「最近用過的排前面」：用每個類別最後一次被存下的時間排。
+    ⚠ 這個順序**只給對話窗用**——現場加書籤要快，不該要求 Will 手動維護顯示順序。
+    Array.sort 是穩定的，所以同分時仍照 bkCatsAll 的順序。 */
+ /* ⚠ 這裡要用 `mt`（最後修改）不是 `ct`（建立）：`ct` 只在新建時寫，
+    把一筆舊書籤改成類別 X 之後 X 不會往前排——那和「最近用過」這個名字不符。
+    ⚠ 剛用「＋ 新類別」建出來、還沒有任何書籤的類別沒有「用過」的時刻可用，
+    但**剛建好的下一秒就被收進「更多…」是最糟的**。
+    ⚠⚠ 舊版把**所有**沒被用到的類別都給 `Infinity`：於是它們全部同分，
+    穩定排序保留 `bkCatsAll` 的順序（設定頁的手動順序），而新類別是**接在尾端**的
+    ⇒ 已經有六個未使用類別時，剛建好的那顆排第七、直接被藏起來（跨模型 Low#10）。
+    ⚠ 而舊探針只造了**一個**未使用類別，所以它必定排第一——**那一格是空心的**。
+    改法：用 `cta`（什麼時候建的）當它的時刻，和「什麼時候用過」**同一把尺**比。
+    沒有建立時刻的（舊資料、匯入來的）給 0：那種類別本來就不算「最近」。
+    守它的是 `just_created_cat_ranks_first`／`reused_cat_moves_up`
+    ＋`new_cat_visible_among_many_unused`（六個未使用類別的那一格）。 */
+ var last=Object.create(null),i,c,s=bkSet(),setc=s.cats,used=Object.create(null);
+ for(i=0;i<st.items.length;i++){c=(st.items[i].cat||'').replace(/^\s+|\s+$/g,'');
+  if(c){used[c]=1;if(bkWhen(st.items[i])>(last[c]||0))last[c]=bkWhen(st.items[i]);}}
+ for(i=0;i<setc.length;i++)if(!used[setc[i]])last[setc[i]]=bkNum(s.cta[setc[i]],0);
+ return bkCatsAll(st).slice().sort(function(a,b){return (last[b]||0)-(last[a]||0);});}
+function bkCatCount(st,c){
+ var n=0,i;
+ for(i=0;i<st.items.length;i++)if((st.items[i].cat||'')===c)n++;
+ return n;}
+
+/* ── 對話窗（三頁共用）─────────────────────────────────────────────── */
+function bkModalEl(){return document.getElementById('bkModal');}
+function bkClose(){var m=bkModalEl();if(m)m.classList.remove('open');BK_EDIT=null;}
+function bkBackdrop(ev){if(ev.target===bkModalEl())bkClose();}
+function bkSay(m){var e=document.getElementById('bkMsg');if(e&&m)e.textContent=m;}
+/* 「全部書籤」＝離開編輯畫面、回到清單。預設就是把窗關掉（管理頁的清單本來就在窗後面）；
+   ⚠ session 頁**覆寫**成打開「這一頁的書籤」清單——那一頁沒有別的清單可以回。 */
+function bkList(){bkClose();}
+
+/* 類別 chip：一排可點的 chip ＋ 最後固定一顆「＋ 新類別」（Will 2026-08-22 裁決）。
+   ⚠ **新增就地做、整理才去設定頁**：現場想到新類別時跑一趟設定頁太麻煩。 */
+function bkCatChips(cur){
+ var st=bkLoad(), all=bkCatsAll(st), rec=bkCatsRecent(st);
+ var show=[], seen=Object.create(null), h='', rest=0, i, c;
+ /* ⚠⚠ 目前選著的那一顆**一定要看得見**，否則使用者會以為類別被清掉了。
+    ⚠ 這條保險**收合與展開共用**，一定要放在分岔之前。原本只寫在收合分支，
+    於是展開之後、選著的那顆若不在聯集裡（帶空白的、被 60 字截斷的、
+    設定清單已滿 200 的）就整個消失——畫面看起來「沒有選類別」，
+    但 `BK_CAT` 還在、一存就把它寫回去。
+    守它的是探針的 `unlisted_cat_still_visible_when_expanded`／`_collapsed`。 */
+ if(cur){show.push(cur);seen[cur]=1;}
+ if(BK_MORE){for(i=0;i<all.length;i++)if(!seen[all[i]]){seen[all[i]]=1;show.push(all[i]);}}
+ else{
+  for(i=0;i<rec.length&&show.length<BK_CATN;i++)
+   if(!seen[rec[i]]){seen[rec[i]]=1;show.push(rec[i]);}}
+ for(i=0;i<all.length;i++)if(!seen[all[i]])rest++;
+ for(i=0;i<show.length;i++){c=show[i];
+  h+='<button type="button" class="bm-chip cat'+(c===cur?' on':'')+'"'
+    +' data-c="'+bkEsc(c)+'" aria-pressed="'+(c===cur?'true':'false')+'"'
+    +' onclick="bkCatPick(this)">'+bkEsc(c)+'</button>';}
+ if(rest)h+='<button type="button" class="bm-chip more" id="bkCatMore"'
+           +' onclick="bkCatMore()">\u66f4\u591a\u2026 ('+rest+')</button>';
+ h+='<button type="button" class="bm-chip add" id="bkCatAdd"'
+   +' onclick="bkCatNew()">\uff0b \u65b0\u985e\u5225</button>';
+ return h;}
+function bkCatDraw(){
+ var g=document.getElementById('bkCats');
+ if(g)g.innerHTML=bkCatChips(BK_CAT);}
+function bkCatPick(btn){
+ var c=btn.getAttribute('data-c');
+ BK_CAT=(BK_CAT===c)?'':c;     /* 再點一次＝取消選取 */
+ bkCatDraw();}
+function bkCatMore(){BK_MORE=true;bkCatDraw();}
+/* 「＋ 新類別」按下去**就地**變輸入框，Enter 建好並選起來，全程不離開對話窗。 */
+function bkCatNew(){
+ var b=document.getElementById('bkCatAdd');
+ if(!b||!b.parentElement)return;
+ var wrap=document.createElement('span');
+ wrap.className='bm-newcat';
+ var inp=document.createElement('input');
+ inp.type='text'; inp.id='bkCatNew'; inp.maxLength=60;
+ inp.setAttribute('aria-label','\u65b0\u985e\u5225\u540d\u7a31');
+ /* ⚠⚠ Esc 只取消這個輸入框，**不可以往上冒泡把整個對話窗關掉**——
+    那會連使用者剛打好的備註一起弄丟。守它的是探針的 `esc_keeps_note`
+    （同一組還有 `esc_closes_only_the_input`／`esc_keeps_modal_open`）。 */
+ inp.onkeydown=function(ev){
+  if(ev.key==='Enter'){ev.preventDefault();bkCatAdd();}
+  else if(ev.key==='Escape'){ev.stopPropagation();ev.preventDefault();bkCatDraw();}};
+ var okb=document.createElement('button');
+ okb.type='button'; okb.className='bm-chip ok'; okb.id='bkCatOk';
+ okb.textContent='\u2713'; okb.onclick=bkCatAdd;
+ wrap.appendChild(inp); wrap.appendChild(okb);
+ b.parentElement.replaceChild(wrap,b);
+ inp.focus();}
+function bkCatAdd(){
+ var inp=document.getElementById('bkCatNew');
+ if(!inp)return;
+ var c=String(inp.value==null?'':inp.value).replace(/^\s+|\s+$/g,'').slice(0,60);
+ if(!c){bkCatDraw();return;}
+ /* 順手寫進設定的類別清單，設定頁那邊立刻看得到、可以改名／排序。
+    ⚠ 同時記下**建立時刻**（`cta`）：`bkCatsRecent` 靠它讓剛建好的那顆排第一，
+    否則六個未使用類別在前時它會被藏進「更多…」（跨模型 Low#10）。 */
+ var s=bkSet(), i, has=false;
+ for(i=0;i<s.cats.length;i++)if(s.cats[i]===c)has=true;
+ if(!has){s.cats.push(c);s.cta[c]=Date.now();
+          if(!bkSaveSet(s))bkSay(bkWhySetFail());}
+ BK_CAT=c; BK_MORE=true; bkCatDraw();}
+
+/* 複查間隔 chip（單選）。 */
+function bkSpanChips(span){
+ var h='',i;
+ for(i=0;i<BK_SPANS.length;i++)
+  h+='<button type="button" class="bm-chip" role="radio" data-v="'+bkEsc(BK_SPANS[i][0])+'"'
+    +' aria-checked="'+(BK_SPANS[i][0]===span?'true':'false')+'"'
+    +' onclick="bkPick(this)">'+bkEsc(BK_SPANS[i][1])+'</button>';
+ return h;}
+function bkPick(btn){
+ var all=document.getElementById('bkSpans').querySelectorAll('.bm-chip');
+ for(var i=0;i<all.length;i++)all[i].setAttribute('aria-checked','false');
+ btn.setAttribute('aria-checked','true');}
+function bkPicked(){
+ var g=document.getElementById('bkSpans');
+ if(!g)return '0';
+ var all=g.querySelectorAll('.bm-chip');
+ for(var i=0;i<all.length;i++)
+  if(all[i].getAttribute('aria-checked')==='true')return all[i].getAttribute('data-v');
+ return '0';}
+
+/* ── 編輯畫面（session 頁與管理頁走同一個）──────────────────────────
+   `seed` ＝ {id,sid,anchor,url,stitle,town,sum}。已經存在的那一筆以 store 為準，
+   只有 `url`／`stitle`／`town` 這三個**快取欄位**吃 seed 給的新值
+   ——session 頁每次開都給當下這份輸出的值（檔名會變，見〈網址本身不耐久〉）；
+   管理頁沒有那些資訊，就把記錄自己存的值原樣傳回來，不會把它洗掉。 */
+function bkEditRec(seed){
+ var st=bkLoad(), rec=bkFindId(st,seed.id), card=document.getElementById('bkCard');
+ if(!card)return false;
+ var span=rec?(rec.span||'0'):bkDefSpan();
+ /* ⚠ 編輯既有書籤時**沿用當初存的摘要，不重抓**。摘要的用處是
+    「跳過去之後，這一輪還是不是我當初存的那一輪」——重抓就把那個對照弄丟了。 */
+ var sum=(rec&&rec.sum)?rec.sum:(seed.sum||'');
+ BK_CAT=rec?(rec.cat||''):(seed.cat||'');
+ BK_MORE=false;
+ card.innerHTML=
+  '<h3 id="bkTitle">'+(rec?'\u7de8\u8f2f\u66f8\u7c64':'\u52a0\u66f8\u7c64')+'</h3>'
+ +'<div class="bm-lab">\u9019\u4e00\u8f2a\uff08\u6703\u4e00\u8d77\u5b58\u9032\u66f8\u7c64\uff0c'
+ +'\u4e4b\u5f8c\u5728\u7ba1\u7406\u9801\u8a8d\u5f97\u51fa\u662f\u54ea\u4e00\u6bb5\uff09</div>'
+ +'<div class="bm-prev">'+(bkEsc(sum)||'\uff08\u9019\u4e00\u8f2a\u6c92\u6709\u6587\u5b57\u5167\u5bb9\uff09')+'</div>'
+ +'<label class="bm-lab" for="bkNote">\u5099\u8a3b</label>'
+ +'<textarea id="bkNote">'+bkEsc(rec?rec.note:'')+'</textarea>'
+ +'<div class="bm-lab">\u985e\u5225<span class="bmi-sum"> \u00b7 '
+ +'\u9ede\u4e00\u4e0b\u9078\u8d77\u4f86\uff0c\u518d\u9ede\u4e00\u6b21\u53d6\u6d88'
+ +'\uff1b\u6539\u540d\u8207\u6574\u7406\u5728\u8a2d\u5b9a\u9801</span></div>'
+ +'<div class="bm-chips" id="bkCats">'+bkCatChips(BK_CAT)+'</div>'
+ +'<div class="bm-lab">\u63d0\u9192\u6211\u8907\u67e5<span class="bmi-sum"> \u00b7 '
+ +'\u5230\u671f\u53ea\u6703\u6a19\u8a18\uff0c\u66f8\u7c64\u6c38\u9060\u4e0d\u6703\u81ea\u5df1\u6d88\u5931</span></div>'
+ +'<div class="bm-chips" id="bkSpans" role="radiogroup" aria-label="\u63d0\u9192\u6211\u8907\u67e5">'
+ +bkSpanChips(span)+'</div>'
+ +'<div class="bm-act"><button class="pri" onclick="bkCommit()">'
+ +(rec?'\u5132\u5b58\u8b8a\u66f4':'\u52a0\u5165\u66f8\u7c64')+'</button>'
+ +(rec?'<button class="dang" onclick="bkRemove()">\u79fb\u9664\u66f8\u7c64</button>':'')
+ +'<span class="grow"></span>'
+ +'<button onclick="bkList()">\u5168\u90e8\u66f8\u7c64</button>'
+ +'<button onclick="bkClose()">\u53d6\u6d88</button></div>';
+ /* ⚠ `span0` ＝開窗時的間隔。`bkCommit` 靠它分辨「使用者真的動了 chip」與「只改了備註」
+    ——只有前者才該重算到期日，見那裡的說明。
+    ⚠⚠ `mt0` ＝**開窗那一刻這一筆的修改時刻**。四個頁面吃同一份 localStorage，
+    開著窗的時候別的分頁可能改過同一筆；沒有 `mt0` 就沒有任何辦法察覺
+    ⇒ 存回去等於拿開窗時的表單**整筆覆寫**掉對方剛寫的東西（跨模型 Medium#8）。
+    `null` ＝這一筆本來就不存在（新建），那沒有衝突可言。
+    ⚠⚠ **光有 `mt0` 不夠。** `bkMerge()` 補缺欄位（`cat`／`url`／`due`）時
+    **不會動 `mt`**——那是刻意的（`mt` 是合併排序用的尺，一動就會改變誰比較新）。
+    於是「別的分頁匯入了一份較舊的備份、補上了本機空著的類別」這條路，
+    `bkWhen(rec)` 完全沒變 ⇒ 開著的窗察覺不到 ⇒ 一存就把剛補進來的值洗掉，
+    而且不會有衝突提示。所以另記一把**只在本機用**的尺 `lr`（local revision）：
+    任何實際改動都遞增，**不匯出、也絕不參與合併比較**（和 `im` 同一個原則）。
+    守它的是探針的 `import_fill_is_seen_as_clash`。 */
+ BK_EDIT={id:seed.id,sid:seed.sid,anchor:seed.anchor,url:seed.url||'',
+          stitle:seed.stitle||'',town:seed.town?1:0,sum:sum,span0:span,
+          mt0:(rec?bkWhen(rec):null),
+          lr0:(rec?bkNum(rec.lr,0):0)};
+ bkModalEl().classList.add('open');
+ var n=document.getElementById('bkNote'); if(n)n.focus();
+ return false;}
+
+function bkCommit(){
+ if(!BK_EDIT)return;
+ var st=bkLoad();
+ /* ⚠ store 壞掉時**先擋在這裡**：讓使用者知道原因是「讀不到」，
+    而不是走到下面才被 `bkStore` 拒掉、看到一句像是配額不足的訊息。 */
+ if(st.bad){bkRefresh(BK_BADMSG);return;}
+ var rec=bkFindId(st,BK_EDIT.id), now=Date.now(), isNew=!rec;
+ var span=bkPicked();
+ var note=(document.getElementById('bkNote')||{}).value||'';
+ /* ⚠⚠ 開窗到現在，**別的分頁可能改過同一筆**（跨模型 Medium#8）。
+    偵測到就把兩邊的備註都留著——和匯入衝突走**同一個 `bkKeepLost()`**，
+    不要在這裡另寫一套（同一條規則寫兩次就會分岔）。 */
+ var clash=(!isNew&&BK_EDIT.mt0!==null
+            &&(bkWhen(rec)!==BK_EDIT.mt0||bkNum(rec.lr,0)!==BK_EDIT.lr0));
+ /* ⚠⚠ **類別也要保留輸家，不是只有備註。** 上面那句「和匯入衝突走同一個
+    `bkKeepLost()`，不要在這裡另寫一套」寫對了原則，實作卻只做了 `note` 那半
+    ——`bkMerge()` 對同一件事的處置是「一筆只能掛一個類別，所以本機那個即將被
+    取代的名字要寫進備註，不然它就真的沒了」，這裡漏了 ⇒ 另一個分頁選的類別
+    **無聲消失、不留痕跡**。這正是「同一條規則寫兩次就會分岔」自己應驗了。
+    守它的是探針的 `concurrent_edit_keeps_lost_cat`。 */
+ /* ⚠⚠ **`rec.note!==note` 那個守門條件也要抄過來。** `bkMerge` 那半寫的是
+    `if(inc.note&&inc.note!==cur.note)`——**兩邊一樣就不記**，因為那時候
+    「沒有任何值即將消失」。這裡漏掉它的後果是：別的分頁改的是**別的欄位**
+    （匯入補缺欄位、設定頁改類別名，這幾條路都會動 `lr`）而備註兩邊完全相同時，
+    使用者一個字都沒改按下儲存，備註就被貼上自己一份，**每觸發一次長一截**
+    （實測 48→111→237→489 字，唯一的煞車是 `bkLoad` 的 20000 字截斷）。
+    那直接和「同一份檔案匯入兩次結果必須相同」那條不變量打架。
+    ⚠ 這正是「同一條規則寫兩次就會分岔」第二次應驗——上一次漏的是 `cat`（就在下一行），
+    這一次漏的是 `note` 的守門條件。**兩半的形狀現在一致了，改一邊要改兩邊。**
+    守它的是探針的 `clash_does_not_duplicate_unchanged_note`，
+    對照組 `clash_still_keeps_really_lost_note`（真的有東西要消失時仍要保留）。 */
+ if(clash){
+  if(rec.note&&rec.note!==note)note=bkKeepLost(note,rec.note);
+  if(rec.cat&&rec.cat!==BK_CAT)note=bkKeepLost(note,rec.cat);}
+ if(isNew){rec={id:BK_EDIT.id,sid:BK_EDIT.sid,anchor:BK_EDIT.anchor,ct:now};st.items.push(rec);}
+ /* URL／標題只是快取，每次存都刷新成呼叫端給的那一份 */
+ rec.url=BK_EDIT.url; rec.stitle=BK_EDIT.stitle; rec.town=BK_EDIT.town;
+ rec.note=note; rec.cat=BK_CAT; rec.sum=BK_EDIT.sum;
+ rec.span=span;
+ /* ⚠⚠ **只有新建、或使用者真的動了間隔 chip 時才重算到期日。**
+    一律用 `now` 重算的話，改一個錯字就等於把複查時鐘重新上緊：一筆已經到期的書籤
+    被編輯之後就不再到期，索引頁的 ⏰、管理頁的「只看該複查的」、星星的 tooltip
+    全部一起變回正常，而畫面上沒有任何地方講出到期日被改了
+    ——那等於把「提醒我複查」這個功能本身抵銷掉。
+    守它的是探針的 `edit_keeps_due`／`edit_still_overdue`，
+    對照組是 `changing_span_recomputes_due`（真的改了 chip 就要重算）。 */
+ if(isNew||span!==BK_EDIT.span0)rec.due=bkDue(span,now);
+ /* ⚠⚠ **`span` 與 `due` 是不可拆的一對。** 上面那個條件只在「新建／真的動了 chip」
+    時重算，於是分頁衝突時會留下**另一個分頁設的 `due` ＋ 這一頁寫回去的 `span`**：
+    chip 上寫著「不提醒」，`bkOverdue()` 卻只看 `due` ⇒ 索引頁的 ⏰ 亮著、
+    管理頁的「只看該複查的」抓得到它，而畫面上沒有任何地方解釋得通。
+    ⚠ 這裡**不用 `now` 重算**：那會把複查時鐘重新上緊（`edit_keeps_due` 正是在守
+    這件事）。只要守住「關掉提醒就不可以留著到期日」這個方向就夠了。
+    守它的是探針的 `clash_no_span_due_mismatch`。 */
+ if(rec.span==='0')rec.due=0;
+ /* `mt` ＝最後修改時刻。⚠ 合併匯入檔時比的是它，不是 `ct`：`ct` 只在新建時寫，
+    同一筆在兩台機器上永遠相等 ⇒ 沒有 `mt` 就分不出誰比較新。 */
+ rec.mt=now;
+ rec.lr=bkNum(rec.lr,0)+1;   /* 本機修訂號，見 bkEditRec 的 lr0 */
+ /* ⚠ 寫失敗就**不可以**說「已加入書籤」——那句話會讓使用者不再去按匯出。 */
+ if(!bkStore(st)){bkRefresh(bkWhyFail(st));return;}
+ bkRefresh((isNew?'\u5df2\u52a0\u5165\u66f8\u7c64\u3002':'\u5df2\u5132\u5b58\u8b8a\u66f4\u3002')
+          +(clash?('\u26a0 \u9019\u4e00\u7b46\u5728\u5225\u7684\u5206\u9801\u4e5f\u88ab'
+                  +'\u6539\u904e\uff0c\u5169\u908a\u7684\u5099\u8a3b\u90fd\u7559\u4e0b\u4f86\u4e86'
+                  +'\uff0c\u8acb\u81ea\u5df1\u770b\u4e00\u4e0b\u3002'):'')
+          +'\u26a0 localStorage \u6e05\u6389\u5c31\u6c92\u4e86\uff0c'
+          +'\u771f\u6b63\u7684\u5099\u4efd\u662f\u532f\u51fa\u7684 JSON\u3002');}
+
+/* ⚠ 移除不跳 confirm()：瀏覽器 modal 會卡住整頁，而且「按錯」的代價是打好的備註消失。
+   改成移除後留一顆「復原」——可逆比確認框好。 */
+function bkRemove(){if(BK_EDIT)bkDrop(BK_EDIT.id);}
+function bkDrop(id){
+ var st=bkLoad();
+ if(st.bad){bkRefresh(BK_BADMSG);return;}
+ var out=[], hit=null, i;
+ for(i=0;i<st.items.length;i++){
+  if(st.items[i].id===id)hit=st.items[i]; else out.push(st.items[i]);}
+ if(!hit)return;                 /* \u627e\u4e0d\u5230\u5c31\u4ec0\u9ebc\u90fd\u4e0d\u8981\u52d5\uff08\u4e5f\u4e0d\u8981\u767d\u5beb\u4e00\u6b21\uff09 */
+ st.items=out;
+ if(!bkStore(st)){bkRefresh(bkWhyFail(st));return;}
+ /* \u26a0 **\u5beb\u5165\u6210\u529f\u4e4b\u5f8c\u624d\u52d5 `BK_UNDO`**\uff1a\u5148\u8a2d\u7684\u8a71\uff0c\u5beb\u5931\u6557\u6642\u756b\u9762\u4e0a\u6703\u591a\u4e00\u9846
+    \u5c0d\u4e0d\u4e0a\u5be6\u969b\u72c0\u614b\u7684\u300c\u5fa9\u539f\u300d\u2014\u2014\u6309\u4e0b\u53bb\u53cd\u800c\u628a\u4e00\u7b46\u9084\u5728\u7684\u66f8\u7c64\u53c8\u63a8\u4e00\u6b21\u3002 */
+ BK_UNDO=hit;
+ bkRefresh('\u5df2\u79fb\u9664\u3002');}
+function bkUndo(){
+ if(!BK_UNDO)return;
+ var st=bkLoad();
+ if(st.bad){bkRefresh(BK_BADMSG);return;}
+ if(!bkFindId(st,BK_UNDO.id))st.items.push(BK_UNDO);
+ /* \u26a0\u26a0 **\u5beb\u5165\u6210\u529f\u4e86\u624d\u53ef\u4ee5\u6e05\u6389 `BK_UNDO`**\uff08\u8de8\u6a21\u578b Medium#6\uff09\u3002
+    \u5148\u6e05\u7684\u8a71\u5beb\u5165\u4e00\u5931\u6557\uff0c\u552f\u4e00\u9084\u539f\u5f97\u56de\u4f86\u7684\u90a3\u4efd\u8cc7\u6599\u5c31\u6c92\u4e86\u3001\u800c\u4e14**\u7121\u6cd5\u91cd\u8a66**
+    \u2014\u2014\u90a3\u9846\u300c\u5fa9\u539f\u300d\u9215\u4e5f\u8ddf\u8457\u6d88\u5931\uff0c\u4f7f\u7528\u8005\u9023\u518d\u6309\u4e00\u6b21\u7684\u6a5f\u6703\u90fd\u6c92\u6709\u3002
+    \u5b88\u5b83\u7684\u662f\u63a2\u91dd\u7684 `undo_survives_write_failure`\uff0f`undo_retry_restores`\u3002 */
+ if(!bkStore(st)){bkRefresh(bkWhyFail(st));return;}
+ BK_UNDO=null;
+ bkRefresh('\u5df2\u5fa9\u539f\u3002');}
+
+/* ── 匯出／匯入那一排（**和存檔鈕同一批出貨**）────────────────────
+   ⚠⚠ 真正的耐久保證是匯出的 JSON，不是 localStorage：第一顆書籤存下去的那一刻，
+   資料就只在瀏覽器裡，一次「清除瀏覽資料」就沒了。所以這一排**就放在存完之後
+   會看到的那一頁**，不是藏在別處。 */
+function bkFoot(st){
+ /* \u26a0\u26a0 store \u58de\u6389\u6642\uff0cfooter \u8981**\u540c\u6642**\u505a\u5169\u4ef6\u4e8b\uff1a\u8b1b\u51fa\u4f86\uff0c\u4e26\u7d66\u552f\u4e00\u9084\u6709\u6551\u7684\u52d5\u4f5c\u3002
+    \u53ea\u8b1b\u4e0d\u7d66\u8def\uff0c\u4f7f\u7528\u8005\u80fd\u505a\u7684\u5c31\u53ea\u5269\u300c\u6e05\u6389\u91cd\u4f86\u300d\u2014\u2014\u90a3\u6b63\u662f\u628a\u8cc7\u6599\u5f04\u4e1f\u7684\u90a3\u689d\u8def\u3002 */
+ if(st&&st.bad)
+  return '<div class="bm-foot"><span class="bmi-due">\u26a0\u26a0 '
+   +'\u8b80\u4e0d\u5230\u73fe\u6709\u7684\u66f8\u7c64\uff08\u8cc7\u6599\u58de\u4e86\uff09'
+   +'\uff0c\u5df2\u505c\u6b62\u6240\u6709\u5beb\u5165\u4ee5\u514d\u8f3e\u6389\u539f\u59cb\u8cc7\u6599'
+   +'\u3002</span><span class="grow"></span>'
+   +'<button class="dang" onclick="bkRescue()">\u26d1 '
+   +'\u532f\u51fa\u539f\u59cb\u8cc7\u6599</button>'
+   +'</div><div class="bm-msg" id="bkMsg"></div>';
+ return '<div class="bm-foot"><span>\u5171 '+st.items.length
+  +' \u7b46\uff08\u6240\u6709 session\uff09</span>'
+  /* \u26a0 \u63aa\u8fad\u8981\u548c `bkExport` \u5be6\u969b\u505a\u7684\u4e8b\u4e00\u81f4\uff1a\u5b8c\u6574\u5099\u4efd**\u539f\u6a23\u5e36\u8457**\u5b83\u5011\uff0c
+     \u4f46\u532f\u5165\u7aef\u6703\u7565\u904e\uff08\u6c92\u6709 sid\uff0fanchor\uff09\u21d2 \u4fdd\u7684\u662f\u300c\u4f60\u7684\u5b57\u4e0d\u6703\u6d88\u5931\u300d\uff0c\u4e0d\u662f\u300c\u4e00\u9375\u9084\u539f\u300d\u3002
+     \u8b1b\u6210\u300c\u5c31\u80fd\u62ff\u5230\u300d\u6703\u8b93\u4eba\u4ee5\u70ba\u9084\u539f\u5f97\u56de\u4f86\uff0c\u90a3\u662f\u53e6\u4e00\u7a2e\u300c\u8a0a\u606f\u548c\u4e8b\u5be6\u76f8\u53cd\u300d\u3002 */
+  +(st&&st.drop?('<span class="bmi-due">\uff08\u53e6\u6709 '+st.drop
+                 +' \u7b46\u8a8d\u4e0d\u51fa\u5f62\u72c0\uff0c\u756b\u9762\u4e0a\u4e0d\u986f\u793a\uff0c\u4f46\u5df2\u539f\u6a23\u4fdd\u7559\u3001\u4e0d\u6703\u88ab\u5beb\u6389\uff1b'
+                 +'\u300c\u2b07 \u5b8c\u6574\u5099\u4efd\u300d\u6703\u539f\u6a23\u5e36\u8457\u5b83\u5011'
+                 +'\uff08\u532f\u5165\u4e0d\u6703\u9084\u539f\uff0c\u8981\u81ea\u5df1\u5f9e\u6a94\u6848\u88e1\u6488\uff09\uff09</span>'):'')
+  +(BK_MGR?('<a class="bm-mgr" href="'+bkEsc(BK_MGR)+'">🔖 \u7ba1\u7406\u9801</a>'):'')
+  +'<span class="grow"></span>'
+  +'<button onclick="bkExport(1)" title="\u542b\u6bcf\u4e00\u8f2a\u7684 120 \u5b57\u6458\u8981'
+  +'\u2014\u2014\u90a3\u662f\u771f\u7684\u5c0d\u8a71\u5167\u5bb9">\u2b07 \u5b8c\u6574\u5099\u4efd</button>'
+  +'<button onclick="bkExport(0)" title="\u4e0d\u542b\u5c0d\u8a71\u6458\u8981\u8207\u81ea\u52d5'
+  +'\u6a19\u984c\uff0c\u53ef\u4ee5\u62ff\u7d66\u5225\u4eba">\u2b07 \u53ea\u532f\u66f8\u7c64</button>'
+  +'<button onclick="bkPickFile()">\u2b06 \u532f\u5165</button>'
+  +'<input type="file" id="bkFile" accept="application/json,.json" style="display:none"'
+  +' onchange="bkImport(this)"></div><div class="bm-msg" id="bkMsg"></div>';}
+
+/* 遮蔽規則（2026-08-22 設計諮詢，方向和初稿相反）：
+   · **備註不遮** ——那是使用者自己知情打進去的字，而他按的是「備份」。
+     **有損的備份是壞掉的備份**，這比洩漏風險更該優先。
+   · **摘要要遮** ——那是真的對話內容，他不見得意識到被一起存進去了。
+   · **自動標題也要遮** ——`s.title` 沒改名時就等於「第一則使用者訊息」，一樣是對話內容；
+     使用者自己改過名的（town=1）才留著。
+   · **路徑要過形狀閘** ——⚠⚠ 原本這裡寫的是「`url` 本來就是相對路徑，沒有絕對路徑
+     可洩漏」。**那句話對「本機自己存的」成立，對「匯入進來的」不成立**
+     （跨模型 High#1）：匯入端原樣收下 `url`，遮蔽匯出又無條件把它吐回去。
+     現在匯入端擋一次（`bkSafeRel`）、這裡再擋一次——**入口與出口各一道**，
+     因為「只寫一條分支」正是這條線上重複踩的那個坑。
+   ⚠ **設定也要一起匯出**（含類別清單）：只在 localStorage 裡＝一次「清除瀏覽資料」就沒了。 */
+function bkExport(full){
+ var st=bkLoad(), out=[], i;
+ /* ⚠ 壞掉的 store 匯出來會是一份**空的備份**，而使用者會以為備份好了
+    ——那比不匯出更糟。導去救援那條路。 */
+ if(st.bad){bkSay(BK_BADMSG);return;}
+ for(i=0;i<st.items.length;i++){var x=st.items[i];
+  /* ⚠ `mt` 一定要一起匯出：匯入端靠它分辨誰比較新（`ct` 只在新建時寫，兩台會永遠相等）。
+     ⚠ `im`（什麼時候匯進來的）**不匯出**：那是本機的簿記，對別台沒有意義。 */
+  var o={id:x.id,sid:x.sid,anchor:x.anchor,url:bkSafeRel(x.url),
+         note:x.note||'',cat:x.cat||'',
+         ct:x.ct||0,mt:bkWhen(x),span:x.span||'0',due:x.due||0,town:x.town?1:0};
+  /* ⚠⚠ **`id`／`sid`／`anchor` 也要有出口閘**（收斂確認輪 Medium）。上面那道
+     `bkSafeRel` 把 `url` 顧到了，但這三個欄位**入口與出口都沒有任何形狀檢查**：
+     `bkIdPart` 只擋 `|`／空白／控制字元（那是對的——錨點文法 `k<ts>-tb<n>-s<ts>-b<n>`
+     需要 `-`），`bkLoad` 又明著保留任何非空字串 `id`。於是手改過的 localStorage、
+     別的工具寫的、舊版留下的紀錄，只要 `sid` 或 `id` 帶著絕對路徑，
+     就從「可以拿給別人」的那一份原樣流出去，而 `_warning` 還寫著「相對路徑」。
+     ⚠ 只在**遮蔽**那一份做（和 `stitle`／`town` 同一個道理）：完整備份本來就含私密。
+     ⚠ 判準只認**真的像路徑**的（含 `/`、`\`，或開頭是磁碟機代號），不是任何 `:` ——
+     時間戳形狀的識別字不該被誤殺。認不出來的一律遮成空字串：那一筆在別台會被
+     `bkImport` 略過，而「少一筆別人本來就認不得的紀錄」遠比洩漏可回復。
+     守它的是探針的 `redacted_export_gates_id_and_sid`，
+     對照組 `redacted_export_still_keeps_note_after_gate`。 */
+  if(!full){
+   o.sid=bkSafePart(o.sid); o.anchor=bkSafePart(o.anchor);
+   o.id=(o.sid&&o.anchor)?bkId(o.sid,o.anchor):'';}
+  /* ⚠⚠ **遮蔽匯出一律不留 `stitle`，不看 `town`。**
+     舊寫法是 `(full||x.town)`＝**無條件相信紀錄自己宣稱的 `town`**。匯入端雖然
+     把 `town` 歸零了（`bkImport`），但那只擋住「從匯入進來」那一條路：
+     手改過的 localStorage、別的工具寫的、或**這次修正之前那版**匯入寫進去的資料，
+     都帶著 `town:1` 躺在 store 裡，於是一個由**第一則使用者訊息**衍生的標題
+     就從「只匯書籤」流出去了。註解當時寫「入口與出口各一道」——那對 `url` 成立
+     （`bkSafeRel` 在這裡再驗一次），對 `town`/`stitle` **從來沒有出口那一道**。
+     ⚠ 為什麼不做「出口交叉驗證」而是直接遮掉：靜態頁沒有任何**不可偽造**的本機
+     所有權證據可用——`town` 就在使用者可改的 localStorage 裡，怎麼比都是拿它自己
+     證明它自己。而這是隱私保證（最高不變量 ①），**認不出來時寧可多遮**。
+     代價：使用者自己 `/rename` 過的標題不再出現在遮蔽匯出裡（完整備份仍然有）。
+     那是可回復的——回到那一場的頁面開一次書籤，`stitle` 就刷新回來；
+     而洩漏出去是不可回復的。範圍限制 SCOPE-BOOKMARK-REDACTED-DROPS-ALL-TITLES。
+     守它的是探針的 `red_masks_all_titles`／`red_drops_town_claim`，
+     對照組是 `full_keeps_own_title`（完整備份仍要帶著自訂標題）。 */
+  o.stitle=full?(x.stitle||''):'';
+  if(!full)o.town=0;   /* 連宣稱本身都不要帶出去，免得下一版又有人拿它當依據 */
+  if(full)o.sum=x.sum||'';
+  out.push(o);}
+ var pay={_warning:full
+   ?'\u542b\u79c1\u5bc6\u5c0d\u8a71\u5167\u5bb9\uff08\u6bcf\u7b46\u5e36 120 \u5b57\u56de\u5408\u6458\u8981'
+    +'\u8207\u81ea\u52d5\u6a19\u984c\uff09\uff0c\u52ff\u63d0\u4ea4\u7248\u63a7'
+   :'\u542b\u4f60\u81ea\u5df1\u5beb\u7684\u5099\u8a3b\u8207\u76f8\u5c0d\u8def\u5f91\uff1b'
+    +'\u5df2\u79fb\u9664\u5c0d\u8a71\u6458\u8981\u8207\u6240\u6709 session \u6a19\u984c',
+  v:1,redacted:full?0:1,exported:new Date().toISOString(),
+  settings:bkSet(),items:out};
+ /* ⚠⚠ **認不出形狀的那些（`kept`）也要進完整備份。** `bkStore` 已經把它們寫回
+    localStorage 了（`unreadable_record_survives_write` 在守），但這個函式只跑
+    `st.items` ⇒ footer 那句「用『⬇ 完整備份』就能拿到」**是假的**；
+    而那個狀態下 `st.bad` 是 false ⇒ 畫面上不會出現「⛑ 匯出原始資料」那顆鈕，
+    唯一真的救得到的路使用者**按不到**。UI 一路在勸「真正的備份是匯出的 JSON」，
+    照做之後清掉 localStorage，那些備註就真的沒了——那和「書籤永遠不會自動刪」牴觸。
+    ⚠ 放在**自己的鍵**、不混進 `items`：`items` 的每一筆都被匯入端假設有
+    `sid`／`anchor`，混進去只會讓對方的匯入報一堆「略過」。
+    ⚠⚠ **遮蔽那一份絕對不帶**：`kept` 是原封不動的未知資料，裡面可能有絕對路徑、
+    也可能有對話內容，而遮蔽那份的保證是「可以拿給別人」。
+    ⚠ 誠實邊界：帶進備份**不等於**還原得回來——匯入端仍會略過它們（沒有 `sid`）。
+    這一格保的是「**你的字不會消失**」，不是「一鍵還原」。footer 的措辭要跟著這一點。
+    守它的是探針的 `full_export_carries_kept`／`redacted_export_drops_kept`。 */
+ if(full&&st.kept&&st.kept.length)pay.kept=st.kept;
+ if(bkDownload('asv-bookmarks-'+bkStamp()+(full?'':'-redacted')+'.json',
+               JSON.stringify(pay,null,2)))
+  bkSay('\u5df2\u532f\u51fa '+out.length+' \u7b46'
+        +(full?'\uff08\u5b8c\u6574\uff09':'\uff08\u5df2\u906e\u8511\u5c0d\u8a71\u5167\u5bb9\uff09')+'\u3002');}
+
+/* ⚠ `file://` 下也要能下載：Blob + createObjectURL + <a download>。
+   ⚠ 一定要 revokeObjectURL——不撤的話每按一次就漏一整包 JSON 在記憶體裡。 */
+function bkDownload(name,text){
+ try{
+  var u=URL.createObjectURL(new Blob([text],{type:'application/json'}));
+  var a=document.createElement('a');
+  a.href=u; a.download=name; a.style.display='none';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(function(){URL.revokeObjectURL(u);},2000);
+  return true;}
+ catch(e){bkSay('\u532f\u51fa\u5931\u6557\uff1a'+e);return false;}}
+
+/* ⚠⚠ **一律合併，絕不整包覆蓋。** 這台可能有別台沒有的書籤，覆蓋＝無聲刪掉它們。
+   ⚠ 欄位逐一挑（白名單），不要整包 assign——來源檔可能是別人給的。 */
+function bkPickFile(){var f=document.getElementById('bkFile');if(f){f.value='';f.click();}}
+function bkImport(inp){
+ var f=inp&&inp.files&&inp.files[0];
+ if(!f)return;
+ var rd=new FileReader();
+ rd.onload=function(){
+  try{
+   var o=JSON.parse(rd.result);
+   var items=(o&&Array.isArray(o.items))?o.items:null;
+   if(!items){bkSay('\u9019\u500b\u6a94\u770b\u4e0d\u51fa\u662f\u66f8\u7c64\u5099\u4efd'
+                    +'\uff08\u627e\u4e0d\u5230 items \u9663\u5217\uff09\u3002');return;}
+   var st=bkLoad(), by=Object.create(null), add=0, upd=0, skip=0, i;
+   /* ⚠ store 壞掉時**整個匯入都不要開始**：合併是拿本機那份當基準的，
+      基準讀不到卻照樣合併，等於把匯入檔當成全部（＝無聲覆蓋）。 */
+   if(st.bad){bkRefresh(BK_BADMSG);return;}
+   for(i=0;i<st.items.length;i++)by[st.items[i].id]=i;
+   var nowI=Date.now();
+   for(i=0;i<items.length;i++){
+    var x=items[i];
+    if(!x||typeof x!=='object'){skip++;continue;}
+    /* ⚠⚠ **型別要真的是字串**，不可以 `String()` 硬轉——見 `bkIdPart` 的說明。
+       `{sid:{},anchor:{}}` 原本會造出 id 為 `[object Object]|[object Object]`
+       的幽靈書籤（跨模型 Medium#7）。 */
+    var sidI=bkIdPart(x.sid), anchI=bkIdPart(x.anchor);
+    if(!sidI||!anchI){skip++;continue;}
+    /* ⚠⚠ **`id` 一律重算，不吃檔案裡的那個。** `id` 是可導出的（`sid|anchor`），
+       信任它等於讓一份偽造／撞號的檔案**指定要取代本機哪一筆**——實測可以無聲刪掉
+       不相干的書籤，也可以造出「標頭星星亮著、對話窗卻認不出來」的幽靈
+       （`bkMark` 依 anchor 畫、`bkOpen` 依 sid|anchor 找，兩邊會對不起來）。
+       守它的是探針的 `forged_id_does_not_replace`／`forged_id_recomputed`。 */
+    var ridI=bkId(sidI,anchI);
+    /* ⚠⚠ 缺漏／垃圾時間戳＝**未知（0）**，不是「匯入當下」。理由見 `bkTs`。 */
+    var ctI=bkTs(x.ct,nowI), mtI=bkTs(x.mt,nowI)||ctI;
+    var rec={id:ridI,sid:sidI,anchor:anchI,
+             /* ⚠⚠ **`url` 一律過 `bkSafeRel()`**（跨模型 High#1）。匯入檔可以塞
+                絕對路徑，而「只匯書籤」原本無條件把 `url` 再吐出去 ⇒「可以拿給別人」
+                這個保證整個破掉，而且 `bkSafeRel()` 在這條路上**完全沒被用到**。
+                對不到形狀就丟掉——那個路徑本來就是可以用 sid 重算的快取
+                （見 `bxHref`），丟了不是資料損失。 */
+             url:bkSafeRel(bkStr(x.url,400)),
+             stitle:bkStr(x.stitle,400),
+             /* ⚠⚠ **`town` 永遠不吃匯入端的值。** 它的意思是「這個標題是使用者自己
+                取的」，而遮蔽匯出正是靠它決定要不要留 `stitle`。信任匯入端 ⇒ 別人
+                （或自己舊機器）的檔可以把**自動標題**（＝第一則使用者訊息的內容）
+                偽裝成自訂標題，再從「只匯書籤」流出去。
+                只有本機 session 頁用 `BK_TOWN` 刷新過的才算數（見 `bkCommit`）：
+                那台機器上真的有那份輸出，才有資格說這個標題是誰取的。
+                ⚠ 代價講清楚：換機器還原時 `town` 退回 0，那筆的自訂標題在**遮蔽匯出**
+                裡會被遮掉——直到你在該場 session 頁開一次書籤為止。
+                保守的方向是對的：認不出來時寧可多遮，不可以少遮。
+                範圍限制 SCOPE-BOOKMARK-IMPORTED-TITLE-OWNERSHIP：這個函式對
+                「標題是誰取的」只認本機刷新過的那一份，詳見 planning/scope-limits.md。 */
+             town:0,
+             note:bkStr(x.note,20000),
+             /* ⚠ 類別在**匯入這條路**也要正規化（trim ＋ 60 字，和 `bkCatsClean` 同一條規則）。
+                不然會冒出「設定頁列得出來、卻改不動也刪不掉、計數 0 筆」的孤兒類別
+                ——`bkCatsUsed` 顯示前有 trim，而 `bkCatCount`／`bsRenCommit`／`bsDel`
+                比的是原字串，兩邊對不起來。 */
+             cat:bkStr(x.cat,200).replace(/^\s+|\s+$/g,'').slice(0,60),
+             sum:bkStr(x.sum,400),ct:ctI,mt:mtI,im:nowI,
+             span:bkSpanOk(x.span),due:bkDueOk(x.due)};
+    if(rec.span==='0')rec.due=0;      /* 不提醒就不該留著一個到期日 */
+    if(by[rec.id]===undefined){st.items.push(rec);by[rec.id]=st.items.length-1;add++;}
+    else{
+     /* ⚠⚠ **比 `mt` 不是 `ct`。** `ct` 只在新建時寫（`bkCommit` 從不更新它），
+        同一筆在兩台機器上**永遠相等** ⇒ 舊規則的 `>=` 讓匯入檔一定贏 ⇒
+        「先加書籤、之後才補備註」的人一匯入舊備份就被空字串洗掉。
+        而 UI 一直在勸使用者匯出備份——**有損的備份是壞掉的備份**。
+        平手（兩邊都沒有 `mt` 的舊格式）一律**保留本機**。
+        ⚠ 逐欄位的規則、以及非空衝突怎麼處理，**全部在 `bkMerge()` 裡**（兩個方向共用
+        同一段——這條線上同一個保證已經因為「只寫了一條分支」錯過三次）。 */
+     if(bkMerge(st.items[by[rec.id]],rec,mtI))upd++; else skip++;}}
+   /* 設定：**類別清單取聯集**（那是清單，只增不減），`rv` 這種單值偏好**本機優先**
+      ——本機已經有設定就代表使用者刻意選過（跨模型 High#3：舊版在本機已有設定時
+      把匯入的類別**整份忽略**，於是「換機器還原」只還原得到一半）。
+      ⚠ 這裡只算出要寫什麼，**先不寫**：寫入順序見下面那一段。 */
+   var nset=null, os=(o&&o.settings&&typeof o.settings==='object')?o.settings:null;
+   if(os){
+    var mine=bkSettings();
+    /* 兩條分支都過 `bkCatsClean`，形狀對稱。
+       ⚠⚠ **但這一行不是承重的，不要以為它在守什麼。** 真正把類別正規化的是
+       `bkSaveSet()`（它對每一次寫入都跑 `bkCatsClean`），所以就算這裡把 `os.cats`
+       原封不動傳下去，髒資料**也到不了 localStorage**。
+       這一行純粹是對稱／防禦，**沒有任何素材只會走到它**（教訓 29）。
+       ⚠ 突變檢驗實測：把這裡改回 `cats:os.cats`，探針**全綠**。所以不要在這裡寫
+       「守它的是 XXX」——那會變成又一句沒有東西在守的保證。真正在守正規化的是
+       `bkSaveSet` 那一層（探針 `first_import_cleans_setting_cats` 測的是那一層）。
+       ⚠ `rv` 這裡**刻意不動**：讀取端（`bkRv()`）本來就走白名單、認不得就退回
+       `BK_FALLBACK`（半年）。在這裡套 `bkSpanOk` 反而會把認不得的值變成 `'0'`＝
+       **不提醒**，那是比「退回半年」更糟的靜默選擇。 */
+    if(!mine){if(typeof os.rv==='string')nset={rv:os.rv,cats:bkCatsClean(os.cats)};}
+    else{
+     var merged=bkCatsClean(mine.cats), inc=bkCatsClean(os.cats), j;
+     for(j=0;j<inc.length;j++)if(merged.indexOf(inc[j])<0)merged.push(inc[j]);
+     if(merged.length!==mine.cats.length)nset={rv:mine.rv,cats:merged,cta:mine.cta};}}
+   /* ⚠⚠ **先寫書籤，成功了才寫設定**（跨模型 Medium#6）。反過來的話 bookmark 那把
+      鎖被拒時設定已經改掉＝**半套匯入**：類別清單多了一批、書籤一筆也沒進來。
+      兩個 key 之間沒有交易可用，能做的就是**把會失敗的那一邊放前面**。 */
+   if(!bkStore(st)){bkRefresh(bkWhyFail(st));return;}
+   if(nset&&!bkSaveSet(nset)){
+    bkRefresh('書籤已匯入，但個人設定'
+            +'（預設值與類別清單）'
+            +'沒有存進去。');return;}
+   bkRefresh('\u532f\u5165\u5b8c\u6210\uff1a\u65b0\u589e '+add+' \u7b46\u3001\u66f4\u65b0 '+upd
+           +' \u7b46\u3001\u7565\u904e '+skip+' \u7b46\u3002');}
+  catch(e){bkSay('\u532f\u5165\u5931\u6557\uff1a\u9019\u500b\u6a94\u4e0d\u662f\u6709\u6548\u7684 JSON\u3002');}};
+ rd.onerror=function(){bkSay('\u8b80\u4e0d\u5230\u9019\u500b\u6a94\u3002');};
+ rd.readAsText(f);}
+
+addEventListener('keydown',function(ev){if(ev.key==='Escape')bkClose();});
+
+/* ── 別的分頁改了資料，這一頁要跟著重畫 ─────────────────────────────
+   ⚠⚠ 四個頁面（session／索引／管理／設定）吃**同一個** `file://` origin 的
+   localStorage，而靜態頁沒有任何其他同步管道。沒有這一段的話：在 session 頁加了書籤，
+   已經開著的索引頁與管理頁**永遠不會知道**——畫面停在舊狀態，而且沒有任何跡象
+   （跨模型 Medium#8）。
+   ⚠ **這一段只涵蓋三頁**（session／管理／設定）——索引頁不內嵌 core，
+   它自己那一份在 `_INDEX_BOOKMARK_JS` 尾端。改同步行為時**兩邊都要改**。
+   ⚠ `storage` 事件**只在別的分頁**觸發，自己的寫入不會叫到它 ⇒ 不會遞迴。
+   ⚠⚠ **對話窗開著、而且正在編輯時不要重畫**：那會把使用者正在打的字洗掉。
+   那條路的衝突交給 `bkCommit()` 的 `mt0` 比對處理（兩邊都要有，缺一邊就是
+   「保險只寫在一條分支上」）。
+   守它的是探針的 `storage_event_redraws_star`。
+
+   ⚠⚠ **不可以在這裡叫 `bkRefresh()`。** `bkRefresh` 的語意是「**我自己**改完了」，
+   各頁的版本因此都會改變畫面狀態：session 頁的會 `bkPanel()`＝**無條件開窗**、
+   管理頁的會 `bkClose()`、設定頁的會把改名／新增的輸入框整個重建。
+   別的分頁寫一次 localStorage 就讓所有開著的 session 分頁跳出全螢幕對話窗、
+   或把使用者正在打的類別名洗掉——那是把「跟著更新」做成了「打斷你」。
+   ⚠ 而且那道 `bkModalEl()` 的保險在**設定頁結構上不可能生效**（那一頁沒有對話窗、
+   `bkModalEl()` 恆回 null）——又一次「保險只寫在一條分支上」。
+   所以另立 `bkSync()`：語意是「**別人**改的，跟著更新，但**絕不改變這一頁目前的
+   開闔與編輯狀態**」。各頁自己覆寫（和 `bkRefresh` 一樣是逐頁覆寫的慣例）。
+   守它的是探針的 `storage_event_does_not_open_modal`（session 頁）／
+   `storage_event_keeps_rename_input`（設定頁）。 */
+function bkSync(){bkRefresh('');}
+addEventListener('storage',function(ev){
+ if(ev&&ev.key&&ev.key!==BK_KEY&&ev.key!==BK_SKEY)return;
+ var m=bkModalEl();
+ if(m&&m.classList.contains('open')&&BK_EDIT)return;
+ try{bkSync();}catch(e){}});
+"""
+
+
+# ⚠ session 頁專屬的那一半（core 之後才載）。管理頁／設定頁**不會**有這一段。
+_BOOKMARK_PAGE_JS = r"""
+/* ⚠ 身分是 `session_id + 耐久錨點`，**URL 只當快取**：檔名由本地時間＋專案名＋帳號名
+   組出來，專案改名或機器換時區就全變。BK_URL 存的是**相對 out/ 的相對路徑**
+   ——順帶把「匯出檔含 C:\Users\<名字>\」那個洩漏面整個消掉。 */
+var BK_SID=__BK_SID__, BK_URL=__BK_URL__, BK_TITLE=__BK_TITLE__, BK_TOWN=__BK_TOWN__;
+var BK_ONLY_DUE=false;  /* ⏰ 該複查了：Will 要求它能當篩選條件 */
+
+function bkMine(st){var out=[];
+ for(var i=0;i<st.items.length;i++)if(st.items[i].sid===BK_SID)out.push(st.items[i]);
+ return out;}
+
+/* ── 那一輪的 120 字摘要 ────────────────────────────────────────────
+   ⚠ **在加書籤的當下從 DOM 抓，不在建置期寫進 HTML。** 管理頁只看得到書籤自己存下來的
+   東西，所以摘要非存不可；但每一輪都多渲染 120 字會把一千多頁一起變胖。
+   從 DOM 抓是零頁面成本，而且永遠和使用者眼前看到的內容一致。 */
+function bkSummary(anchor){
+ var el=document.getElementById(anchor);
+ if(!el)return '';
+ var b=el.querySelector('.body');
+ var t=((b?b.textContent:el.textContent)||'').replace(/\s+/g,' ').trim();
+ return t.length>120?t.slice(0,120)+'\u2026':t;}
+
+function bkOpen(anchor){
+ var st=bkLoad(), id=bkId(BK_SID,anchor), rec=bkFindId(st,id);
+ return bkEditRec({id:id,sid:BK_SID,anchor:anchor,url:BK_URL,stitle:BK_TITLE,town:BK_TOWN,
+                   sum:(rec&&rec.sum)?rec.sum:bkSummary(anchor)});}
+
+/* ── 把「這一輪存過沒有」畫回標頭 ───────────────────────────────────
+   ⚠ 那是使用者來這一頁要問的第一個問題；沒有這一步，加了書籤和沒加長得一模一樣。 */
+function bkMark(){
+ var st=bkLoad(), list=bkMine(st), mine=Object.create(null), i;
+ for(i=0;i<list.length;i++)mine[list[i].anchor]=list[i];
+ var btns=document.querySelectorAll('.bmk');
+ for(i=0;i<btns.length;i++){
+  var b=btns[i], r=mine[b.getAttribute('data-k')];
+  b.classList.toggle('on',!!r);
+  b.textContent=r?'\u2605':'\u2606';
+  b.setAttribute('aria-label',r?'\u7de8\u8f2f\u66f8\u7c64':'\u52a0\u66f8\u7c64');
+  b.title=r?('\u5df2\u52a0\u66f8\u7c64'+(r.cat?(' \u00b7 '+r.cat):'')
+             +(bkOverdue(r)?' \u00b7 \u23f0 \u8a72\u8907\u67e5\u4e86':''))
+           :'\u52a0\u66f8\u7c64';}
+ var tb=document.getElementById('bkbtn');
+ if(tb){var due=0;
+  for(i=0;i<list.length;i++)if(bkOverdue(list[i]))due++;
+  tb.textContent='🔖 \u66f8\u7c64'+(list.length?(' ('+list.length+')'):'')
+                 +(due?(' \u23f0'+due):'');
+  tb.classList.toggle('has',!!list.length);}}
+
+/* ── 這一頁的書籤清單（完整的篩選在管理頁）───────────────────────── */
+function bkToggleDue(cb){BK_ONLY_DUE=!!cb.checked;bkPanel();}
+function bkPanel(msg){
+ var st=bkLoad(), list=bkMine(st), i;
+ /* ⚠ 排序用 `bkOrd` 不是 `x.ct`：匯入檔沒帶時間戳時 `ct` 是 0（未知），
+    直接拿去排會讓那些書籤全部沉到最底，看起來像「最舊的」。`bkOrd` 會退回 `im`。 */
+ list.sort(function(a,b){return bkOrd(b)-bkOrd(a);});
+ var due=0; for(i=0;i<list.length;i++)if(bkOverdue(list[i]))due++;
+ var shown=[];
+ for(i=0;i<list.length;i++)if(!BK_ONLY_DUE||bkOverdue(list[i]))shown.push(list[i]);
+ var rows='';
+ for(i=0;i<shown.length;i++){var x=shown[i];
+  rows+='<li class="bm-item"><div class="bmi-top">'
+   +'<a href="#'+bkEsc(x.anchor)+'" data-a="'+bkEsc(x.anchor)+'"'
+   +' onclick="bkClose();return openSub(this.getAttribute(\'data-a\'))">\u8df3\u904e\u53bb \u2192</a>'
+   +(x.cat?'<span class="bmi-cat">'+bkEsc(x.cat)+'</span>':'')
+   +(bkOverdue(x)?'<span class="bmi-due">\u23f0 \u8a72\u8907\u67e5\u4e86</span>'
+     :(x.due?'<span class="bmi-sum">\u8907\u67e5 '+bkEsc(bkDate(x.due))+'</span>':''))
+   +'<span class="grow"></span>'
+   +'<button data-a="'+bkEsc(x.anchor)+'" onclick="bkOpen(this.getAttribute(\'data-a\'))">'
+   +'\u7de8\u8f2f</button></div>'
+   +(x.note?'<div class="bmi-note">'+bkEsc(x.note)+'</div>':'')
+   +(x.sum?'<div class="bmi-sum">'+bkEsc(x.sum)+'</div>':'')
+   +'</li>';}
+ if(!shown.length)
+  rows='<li class="bmi-sum">'+(BK_ONLY_DUE?'\u9019\u4e00\u9801\u6c92\u6709\u8a72\u8907\u67e5\u7684\u66f8\u7c64\u3002'
+       :'\u9019\u4e00\u9801\u9084\u6c92\u6709\u66f8\u7c64\u3002\u6ed1\u904e\u4efb\u4e00\u8f2a\u3001'
+       +'\u6309\u6a19\u982d\u53f3\u908a\u7684 \u2606 \u5c31\u80fd\u52a0\u3002')+'</li>';
+ document.getElementById('bkCard').innerHTML=
+  '<h3 id="bkTitle">\u9019\u4e00\u9801\u7684\u66f8\u7c64<span class="bmi-sum"> \u00b7 '
+ +list.length+' \u7b46'+(due?('\uff0c'+due+' \u7b46\u8a72\u8907\u67e5'):'')+'</span></h3>'
+ +'<label class="bm-lab"><input type="checkbox" id="bkOnlyDue" onchange="bkToggleDue(this)"'
+ +(BK_ONLY_DUE?' checked':'')+'> \u53ea\u770b \u23f0 \u8a72\u8907\u67e5\u7684</label>'
+ +'<ul class="bm-list">'+rows+'</ul>'
+ +'<div class="bm-act">'
+ +(BK_UNDO?'<button onclick="bkUndo()">\u5fa9\u539f\u525b\u79fb\u9664\u7684\u90a3\u4e00\u7b46</button>':'')
+ +'<span class="grow"></span><button onclick="bkClose()">\u95dc\u9589</button></div>'
+ +bkFoot(st);
+ BK_EDIT=null;
+ bkModalEl().classList.add('open');
+ bkSay(msg);
+ return false;}
+
+/* core 改完資料就叫這個；這一頁要重畫的是標頭的星星與清單畫面。 */
+function bkRefresh(msg){bkMark();bkPanel(msg);}
+/* ⚠⚠ **別的分頁改的**：只重畫星星，**不可以開窗**。`bkPanel()` 會無條件
+   `add('open')`，而這一頁的 `.bm-modal` 是 `position:fixed;inset:0` 的全螢幕遮罩
+   ⇒ 別人在管理頁移除一筆，所有開著的 session 分頁就全部被蓋住（連書籤屬於別場的
+   也會跳）。窗**本來就開著**時才順便把清單內容更新掉。
+   守它的是探針的 `storage_event_does_not_open_modal`。 */
+function bkSync(){
+ var m=bkModalEl(), wasOpen=!!(m&&m.classList.contains('open'));
+ bkMark();
+ if(wasOpen)bkPanel('');}
+/* ⚠ 覆寫 core 的預設（那個只是把窗關掉）：session 頁的「全部書籤」要打開這一頁的清單，
+   因為窗後面沒有別的清單。**匯出／匯入那一排也只在這個清單畫面上**。 */
+function bkList(){return bkPanel();}
+bkMark();
+"""
+
+
+# ⚠⚠ 同樣是**普通 raw 字串，不是 f-string**（單大括號），理由見 `_BOOKMARK_CORE_JS`。
+# 書籤管理頁（第 3 期）。⚠ **這一頁是空殼**：書籤在 localStorage 裡，建置期看不到任何一筆。
+#
+# 建置期唯一能給的是 `BX_SESS`＝「這次輸出裡有哪些 session、現在的檔名是什麼」
+# ——那正是〈網址本身不耐久〉要的反查表：檔名由**本地時間＋專案名＋帳號名**組出來
+# （`main()` 的 `base = f"{date}__{proj}__{sid[:8]}"`），專案改名或機器換時區就全變。
+# 所以記錄裡的 `url` 只是快取，**每次開這一頁都拿 sid 重算一次**。
+# ⚠ 不用 fetch 去讀 `.build-manifest.json`：`file://` 下 Chrome 擋 XHR／fetch，讀不到。
+_MANAGE_JS = r"""
+var BX_SESS=__BX_SESS__;
+var BX_Q='', BX_DUE=false, BX_CAT='', BX_SORT='new';
+
+/* ⚠ 用 hasOwnProperty 問，不要直接 `BX_SESS[sid]`：sid 可能來自別人給的匯入檔，
+   叫 `constructor` 的話會撈到原型上的成員、被當成「這一場存在」。 */
+function bxSess(sid){
+ return (BX_SESS&&Object.prototype.hasOwnProperty.call(BX_SESS,String(sid)))
+        ?BX_SESS[String(sid)]:null;}
+/* ⚠⚠ 連結**只認以 sid 重算出來的檔名**，對不到就不生連結。
+   一度寫成「對不到就退回記錄裡的 `url`」——那正是這整套設計要避免的事：
+   sid 對不到的原因八成就是**檔名變了或那一場沒了**，此時那個快取路徑幾乎一定是死的，
+   拿它生一個看起來正常的連結＝安靜地把過期資訊當現況。改成講清楚、另外把
+   舊位置當**文字**印出來當線索。守它的是探針的 `missing_session_no_link`。
+   ⚠ `bkSafeRel` 留著是對**我們自己烤進去的那張表**再驗一次形狀（便宜的不變量）。
+   這一頁在 `out/sessions/` 底下、而路徑相對 `out/` ⇒ 前面補一層 `../`。 */
+function bxHref(x){
+ var s=bxSess(x.sid), u=s?bkSafeRel(s.u):'';
+ return u?('../'+u+'#'+encodeURIComponent(String(x.anchor==null?'':x.anchor))):'';}
+
+function bxMatch(x,q){
+ var s=bxSess(x.sid);
+ var hay=(x.note||'')+' '+(x.cat||'')+' '+(x.sum||'')+' '
+        +(s?((s.t||'')+' '+(s.p||'')+' '+(s.a||'')):(x.stitle||''));
+ return hay.toLowerCase().indexOf(q)>=0;}
+
+function bxRows(st){
+ var out=[], i, x;
+ for(i=0;i<st.items.length;i++){x=st.items[i];
+  if(BX_DUE&&!bkOverdue(x))continue;
+  if(BX_CAT&&(x.cat||'')!==BX_CAT)continue;
+  if(BX_Q&&!bxMatch(x,BX_Q))continue;
+  out.push(x);}
+ out.sort(function(a,b){
+  /* ⚠ 一律用 `bkOrd`（`ct` 未知時退回 `im`），理由見 core 那裡的說明。 */
+  if(BX_SORT==='old')return bkOrd(a)-bkOrd(b);
+  if(BX_SORT==='due'){
+   /* 「快到期的先」：沒設提醒的一律排最後，不要讓它們插在到期日中間。 */
+   var da=a.due||Infinity, db=b.due||Infinity;
+   if(da!==db)return da-db;
+   return bkOrd(b)-bkOrd(a);}
+  return bkOrd(b)-bkOrd(a);});
+ return out;}
+
+function bxFilters(st){
+ var cats=bkCatsAll(st), h='', i;
+ h+='<button type="button" class="bm-chip cat'+(BX_CAT===''?' on':'')+'" data-c=""'
+   +' aria-pressed="'+(BX_CAT===''?'true':'false')+'"'
+   +' onclick="bxPickCat(this)">全部類別</button>';
+ for(i=0;i<cats.length;i++)
+  h+='<button type="button" class="bm-chip cat'+(BX_CAT===cats[i]?' on':'')+'"'
+    +' data-c="'+bkEsc(cats[i])+'" aria-pressed="'+(BX_CAT===cats[i]?'true':'false')+'"'
+    +' onclick="bxPickCat(this)">'+bkEsc(cats[i])+' <span class="bmi-sum">'
+    +bkCatCount(st,cats[i])+'</span></button>';
+ return h;}
+function bxPickCat(btn){
+ BX_CAT=btn.getAttribute('data-c')||'';
+ bxRender();}
+function bxPickSort(btn){BX_SORT=btn.getAttribute('data-s')||'new';bxRender();}
+function bxSearch(el){BX_Q=String(el.value==null?'':el.value).toLowerCase();bxRender();}
+function bxToggleDue(cb){BX_DUE=!!cb.checked;bxRender();}
+
+function bxRender(){
+ var st=bkLoad(), rows=bxRows(st), i, x, h='', due=0;
+ for(i=0;i<st.items.length;i++)if(bkOverdue(st.items[i]))due++;
+ document.getElementById('bxCount').textContent=
+  st.bad
+  ? '讀不到（資料壞了）'      /* ⚠ 不可以印「共 0 筆」——那是在報一個我們並不知道的事實 */
+  : ('共 '+st.items.length+' 筆'
+     +(due?('，'+due+' 筆 ⏰ 該複查'):'')
+     +((rows.length!==st.items.length)?('　·　篩選後 '+rows.length+' 筆'):''));
+ document.getElementById('bxCats').innerHTML=bxFilters(st);
+ for(i=0;i<rows.length;i++){x=rows[i];
+  var s=bxSess(x.sid), href=bxHref(x);
+  var title=s?(s.t||''):(x.stitle||'');
+  h+='<li class="bm-item bx-item'+(bkOverdue(x)?' due':'')+'"><div class="bmi-top">'
+   +(href?('<a class="bx-go" href="'+bkEsc(href)+'">跳過去 →</a>')
+        :('<span class="bmi-due">⚠ 對不到檔案</span>'))
+   +(x.cat?'<span class="bmi-cat">'+bkEsc(x.cat)+'</span>':'')
+   +(bkOverdue(x)?'<span class="bmi-due">⏰ 該複查了</span>'
+     :(x.due?'<span class="bmi-sum">複查 '+bkEsc(bkDate(x.due))+'</span>'
+            :'<span class="bmi-sum">不提醒</span>'))
+   +'<span class="grow"></span>'
+   +'<button data-i="'+bkEsc(x.id)+'" onclick="bxEdit(this.getAttribute(\'data-i\'))">'
+   +'編輯</button>'
+   +'<button class="dang" data-i="'+bkEsc(x.id)+'" onclick="bxDrop(this.getAttribute(\'data-i\'))">'
+   +'移除</button></div>'
+   /* ⚠ 這一場**不在這次輸出裡**時要講出來，不要安靜地拿快取路徑當現況
+      ——書籤本來就永遠不會自己消失，那條連結壞掉是使用者該知道的事。 */
+   +'<div class="bx-sess">'
+   +(s?'':'<span class="bmi-due">⚠ 不在這次的輸出裡：</span>')
+   +bkEsc(title||'（沒有標題）')
+   +(s?('<span class="bmi-sum"> · '+bkEsc(s.p||'')
+        +(s.a?(' · '+bkEsc(s.a)):'')+(s.d?(' · '+bkEsc(s.d)):'')+'</span>')
+      /* 舊位置只當**文字**線索印出來，不是連結——它多半已經失效（見 bxHref）。 */
+      :(bkSafeRel(x.url)?('<span class="bmi-sum"> · 上次的位置 '
+                          +bkEsc(bkSafeRel(x.url))+'</span>'):''))
+   +'</div>'
+   +(x.note?'<div class="bmi-note">'+bkEsc(x.note)+'</div>':'')
+   +(x.sum?'<div class="bmi-sum">'+bkEsc(x.sum)+'</div>':'')
+   +'</li>';}
+ if(!rows.length)
+  h='<li class="bmi-sum" id="bxEmpty">'
+   /* ⚠⚠ **「讀不到」和「確定沒有書籤」不可以講成同一句。** 這整套 `bad:1` 的出發點
+      就是這件事，而 `bkFoot()` 分開了、這裡沒有：store 壞掉時主畫面會印
+      「還沒有任何書籤。到任一場對話頁…就能加」——那是把使用者往「重新開始建」推，
+      正是最糟的建議（原始資料還在，一動就沒了）。
+      守它的是探針的 `manage_bad_store_does_not_say_empty`。 */
+   +(st.bad
+     ?'⚠⚠ 讀不到現有的書籤（localStorage 裡那份資料壞了）。'
+      +'畫面上的空白**不代表你沒有書籤**——請先用下面的「⛑ 匯出原始資料」存檔。'
+     :(st.items.length
+       ?'目前的篩選條件沒有符合的書籤。'
+       :'還沒有任何書籤。到任一場對話頁，'
+        +'按回合標頭右邊的 ☆ 就能加。'))
+   +'</li>';
+ document.getElementById('bxList').innerHTML=h;
+ document.getElementById('bxUndo').innerHTML=
+  BK_UNDO?'<button onclick="bkUndo()">復原剛移除的那一筆</button>':'';
+ document.getElementById('bxFoot').innerHTML=bkFoot(st);}
+
+function bxEdit(id){
+ var st=bkLoad(), rec=bkFindId(st,id);
+ /* ⚠ 管理頁**沒有** BK_URL／BK_TITLE 可以刷新快取欄位，把記錄自己存的原樣傳回去，
+    不然在這裡按一次「儲存變更」就會把 url／標題洗成空的。 */
+ if(rec)bkEditRec({id:rec.id,sid:rec.sid,anchor:rec.anchor,url:rec.url||'',
+                   stitle:rec.stitle||'',town:rec.town?1:0,sum:rec.sum||''});}
+function bxDrop(id){bkDrop(id);}
+
+/* core 改完資料就叫這個。⚠ 先關對話窗再重畫：訊息列 `#bkMsg` 在頁面下方的 bkFoot 裡，
+   不是在對話窗裡，所以關掉窗訊息照樣看得到。 */
+function bkRefresh(msg){bkClose();bxRender();bkSay(msg);}
+/* ⚠ 別的分頁改的：重畫清單就好，**不可以把使用者開著的對話窗關掉**
+   （`bkRefresh` 會 `bkClose()`，那是「我自己存完了」才該做的事）。 */
+function bkSync(){
+ var m=bkModalEl();
+ if(m&&m.classList.contains('open'))return;
+ bxRender();}
+bxRender();
+"""
+
+
+# ⚠⚠ 同樣是**普通 raw 字串，不是 f-string**（單大括號）。
+# 設定頁（第 3 期）：個人偏好的預設值 ＋ 類別管理。
+# ⚠ 分界：**新增類別就地在對話窗做**（很頻繁），**整理才來這一頁**（改名／合併／刪除／排序，
+#   一個月一次）。Will 2026-08-22 的裁決，理由見 `bookmarks-proposal.md`〈類別的裁決〉。
+_SETTINGS_JS = r"""
+var BS_REN=-1;        /* 正在就地改名的那一列（-1＝沒有）*/
+var BS_ADD=false;     /* 「＋ 新增類別」的輸入框開著沒 */
+var BS_UNDO=null;     /* 剛刪掉的類別 {cat,at,ids}，讓刪除可逆 */
+
+function bsRender(){
+ var st=bkLoad(), s=bkSet(), cats=bkCatsAll(st), i, h='';
+ /* ① 預設的「提醒我複查」 */
+ document.getElementById('bsSpans').innerHTML=bkSpanChips(bkDefSpan());
+ document.getElementById('bsSpanNow').textContent=bkSpanLabel(bkDefSpan());
+ /* ② 類別管理 */
+ for(i=0;i<cats.length;i++){
+  var c=cats[i], n=bkCatCount(st,c);
+  var managed=false, j;
+  for(j=0;j<s.cats.length;j++)if(s.cats[j]===c)managed=true;
+  h+='<li class="bs-cat"><span class="bs-name">'+bkEsc(c)+'</span>'
+   +'<span class="bmi-sum">'+n+' 筆'
+   +(managed?'':' · 只有書籤在用')+'</span>'
+   +'<span class="grow"></span>';
+  if(BS_REN===i)
+   h+='<input type="text" id="bsRenInp" maxlength="60" value="'+bkEsc(c)+'"'
+     +' aria-label="新的類別名稱"'
+     +' onkeydown="bsRenKey(event,'+i+')">'
+     +'<button class="pri" onclick="bsRenCommit('+i+')">存</button>'
+     +'<button onclick="bsRenCancel()">取消</button>';
+  else
+   h+='<button onclick="bsRen('+i+')">✏ 改名</button>'
+     +'<button onclick="bsMove('+i+',-1)" aria-label="往上移">▲</button>'
+     +'<button onclick="bsMove('+i+',1)" aria-label="往下移">▼</button>'
+     +'<button class="dang" onclick="bsDel('+i+')">🗑 刪除</button>';
+  h+='</li>';}
+ if(!cats.length)
+  h='<li class="bmi-sum" id="bsNoCat">還沒有任何類別。'
+   +'加書籤的時候按「＋ 新類別」'
+   +'就能就地建一個。</li>';
+ document.getElementById('bsCats').innerHTML=h;
+ document.getElementById('bsAdd').innerHTML=
+  BS_ADD?('<input type="text" id="bsAddInp" maxlength="60"'
+          +' aria-label="新類別名稱" onkeydown="bsAddKey(event)">'
+          +'<button class="pri" onclick="bsAddCommit()">新增</button>'
+          +'<button onclick="bsAddCancel()">取消</button>')
+        :'<button onclick="bsAddOpen()">＋ 新增類別</button>';
+ document.getElementById('bsUndo').innerHTML=
+  BS_UNDO?('<button onclick="bsUndoCat()">復原類別「'
+           +bkEsc(BS_UNDO.cat)+'」</button>'):'';
+ document.getElementById('bsFoot').innerHTML=bkFoot(st);
+ if(BS_REN>=0){var e=document.getElementById('bsRenInp');if(e){e.focus();e.select();}}
+ if(BS_ADD){var a=document.getElementById('bsAddInp');if(a)a.focus();}}
+
+/* ① 預設值：按下去就存，不要另外一顆「儲存」——一顆 chip 就是一個決定。 */
+function bkPick(btn){        /* ⚠ 覆寫 core 的版本：這一頁的 chip 按下即生效 */
+ var g=document.getElementById('bsSpans'), all=g.querySelectorAll('.bm-chip'), i;
+ for(i=0;i<all.length;i++)all[i].setAttribute('aria-checked','false');
+ btn.setAttribute('aria-checked','true');
+ var s=bkSet(); s.rv=btn.getAttribute('data-v');
+ /* ⚠⚠ **寫入的回傳值一定要看。** 這一頁原本改名／刪除／復原／排序／預設值
+    幾乎全部忽略回傳值，然後照樣宣稱成功（跨模型 Medium#6）——
+    使用者以為存好了，重新整理才發現什麼都沒變。 */
+ if(!bkSaveSet(s)){bsRender();bkSay(bkWhySetFail());return;}
+ bsRender();
+ bkSay('已存：之後新加的書籤預設「'
+       +bkSpanLabel(s.rv)+'」。已經存過的書籤不受影響。');}
+
+/* ② 改名——⚠ **要連動**：改了名，所有用到它的書籤一起改（Will 2026-08-22 裁決）。
+   不連動的話改名就只是多造一個孤兒類別。改成一個已經存在的名字＝合併，刻意允許。 */
+function bsRen(i){BS_REN=i;BS_ADD=false;bsRender();}
+function bsRenCancel(){BS_REN=-1;bsRender();}
+function bsRenKey(ev,i){
+ if(ev.key==='Enter'){ev.preventDefault();bsRenCommit(i);}
+ else if(ev.key==='Escape'){ev.preventDefault();bsRenCancel();}}
+function bsRenCommit(i){
+ var inp=document.getElementById('bsRenInp');
+ if(!inp)return;
+ var st=bkLoad(), cats=bkCatsAll(st), old=cats[i];
+ var nu=String(inp.value==null?'':inp.value).replace(/^\s+|\s+$/g,'').slice(0,60);
+ BS_REN=-1;
+ if(old===undefined||!nu||nu===old){bsRender();return;}
+ if(st.bad){bsRender();bkSay(BK_BADMSG);return;}
+ var n=0,j,now=Date.now(),snap=bkRawSnap();
+ /* ⚠⚠ 動到書籤的 `cat` 就**一定要更新它的 `mt`**（跨模型 Medium#8）。
+    不更新的話，之後匯入一份「改名前」的備份會被判成比本機新，把舊類別壓回來
+    ——而畫面上沒有任何跡象。守它的是探針的 `rename_bumps_mt`。 */
+ for(j=0;j<st.items.length;j++)if((st.items[j].cat||'')===old){
+  st.items[j].cat=nu; st.items[j].mt=now; st.items[j].lr=bkNum(st.items[j].lr,0)+1; n++;}
+ if(!bkStore(st)){bsRender();bkSay(bkWhyFail(st));return;}
+ /* 設定清單裡也換掉。⚠ 舊名不在清單裡（只有書籤在用）時要把新名**補進去**，
+    否則改完名字就從管理頁的篩選列順序裡掉出去。去重交給 bkCatsClean。 */
+ var s=bkSet(), hit=false;
+ for(j=0;j<s.cats.length;j++)if(s.cats[j]===old){s.cats[j]=nu;hit=true;}
+ if(!hit)s.cats.push(nu);
+ /* 建立時刻跟著搬（`bkCatTimes` 只留還在 cats 裡的鍵，舊名那筆會自己被清掉）。 */
+ if(s.cta[old]!==undefined&&s.cta[nu]===undefined)s.cta[nu]=s.cta[old];
+ if(!bkSaveSet(s)){
+  var ok1=bkRollback(snap);
+  bsRender();bkSay(ok1?bkWhySetFail():BK_PARTIALMSG);return;}
+ bsRender();
+ bkSay('已改名：「'+old+'」→「'+nu
+       +'」，連動更新 '+n+' 筆書籤。');}
+
+/* ③ 新增（這裡是「整理」用的入口；現場新增請用對話窗那顆「＋ 新類別」）*/
+function bsAddOpen(){BS_ADD=true;BS_REN=-1;bsRender();}
+function bsAddCancel(){BS_ADD=false;bsRender();}
+function bsAddKey(ev){
+ if(ev.key==='Enter'){ev.preventDefault();bsAddCommit();}
+ else if(ev.key==='Escape'){ev.preventDefault();bsAddCancel();}}
+function bsAddCommit(){
+ var inp=document.getElementById('bsAddInp');
+ if(!inp)return;
+ var c=String(inp.value==null?'':inp.value).replace(/^\s+|\s+$/g,'').slice(0,60);
+ BS_ADD=false;
+ if(!c){bsRender();return;}
+ var s=bkSet(), i, has=false;
+ for(i=0;i<s.cats.length;i++)if(s.cats[i]===c)has=true;
+ /* ⚠ 建立時刻要記（同 `bkCatAdd`），不然新類別在對話窗裡排不到前面。 */
+ if(!has){s.cats.push(c);s.cta[c]=Date.now();
+          if(!bkSaveSet(s)){bsRender();bkSay(bkWhySetFail());return;}}
+ bsRender();
+ bkSay(has?('「'+c+'」已經在清單裡了。')
+          :('已新增類別「'+c+'」。'));}
+
+/* ④ 刪除——⚠ 不跳 confirm()（會卡住整頁），改成刪完留一顆「復原」。
+   訊息要**講清楚有幾筆書籤的類別被清空**，不要只說「已刪除」。 */
+function bsDel(i){
+ var st=bkLoad(), cats=bkCatsAll(st), c=cats[i];
+ if(c===undefined)return;
+ if(st.bad){bsRender();bkSay(BK_BADMSG);return;}
+ var s=bkSet(), at=-1, j;
+ for(j=0;j<s.cats.length;j++)if(s.cats[j]===c)at=j;
+ /* ⚠ `wasManaged` ＝這個類別本來就在設定清單裡嗎。沒有它的話，
+    復原會把一個「只有書籤在用」的類別**升格成設定管理的**，不是回到原狀。
+    ⚠ `cta` 也要記著，不然復原之後它在對話窗的順序會掉到最後（＝不是回到原狀）。 */
+ BS_UNDO={cat:c,at:(at<0?s.cats.length:at),wasManaged:(at>=0),
+          cta:s.cta[c],ids:[]};
+ var n=0,now=Date.now(),snap=bkRawSnap();
+ /* ⚠ 和改名同一條規則：動到 `cat` 就要更新 `mt`（跨模型 Medium#8）。 */
+ for(j=0;j<st.items.length;j++)if((st.items[j].cat||'')===c){
+  BS_UNDO.ids.push(st.items[j].id); st.items[j].cat=''; st.items[j].mt=now;
+  st.items[j].lr=bkNum(st.items[j].lr,0)+1; n++;}
+ if(!bkStore(st)){BS_UNDO=null;bsRender();bkSay(bkWhyFail(st));return;}
+ if(at>=0){s.cats.splice(at,1);
+           if(!bkSaveSet(s)){
+            var ok2=bkRollback(snap);
+            if(ok2)BS_UNDO=null;   /* 回捲成功＝什麼都沒發生，那顆「復原」不該留著 */
+            bsRender();bkSay(ok2?bkWhySetFail():BK_PARTIALMSG);return;}}
+ BS_REN=-1; bsRender();
+ bkSay('已刪除類別「'+c+'」'
+       +(n?('，'+n+' 筆書籤的類別被清空'):'')
+       +'。按「復原」可以救回來。');}
+function bsUndoCat(){
+ if(!BS_UNDO)return;
+ var st=bkLoad(), s=bkSet(), ids=Object.create(null), j, now=Date.now();
+ if(st.bad){bsRender();bkSay(BK_BADMSG);return;}
+ var snap=bkRawSnap();
+ for(j=0;j<BS_UNDO.ids.length;j++)ids[BS_UNDO.ids[j]]=1;
+ for(j=0;j<st.items.length;j++)if(ids[st.items[j].id]){
+  st.items[j].cat=BS_UNDO.cat; st.items[j].mt=now;
+  st.items[j].lr=bkNum(st.items[j].lr,0)+1;}
+ /* ⚠⚠ 和 `bkUndo()` 同一條：**寫入成功了才可以清掉 BS_UNDO**（跨模型 Medium#6）。
+    先清的話寫入一失敗，那顆「復原」鈕就消失、而類別再也救不回來。 */
+ if(!bkStore(st)){bsRender();bkSay(bkWhyFail(st));return;}
+ /* ⚠ 只有本來就被管理的才放回清單——否則復原不是回到原狀，是升格。 */
+ if(BS_UNDO.wasManaged){s.cats.splice(Math.min(BS_UNDO.at,s.cats.length),0,BS_UNDO.cat);
+                        if(BS_UNDO.cta!==undefined)s.cta[BS_UNDO.cat]=BS_UNDO.cta;
+                        if(!bkSaveSet(s)){
+                         var ok3=bkRollback(snap);
+                         bsRender();bkSay(ok3?bkWhySetFail():BK_PARTIALMSG);return;}}
+ var c=BS_UNDO.cat; BS_UNDO=null;
+ bsRender();
+ bkSay('已復原類別「'+c+'」。');}
+
+/* ⑤ 排序：這裡的順序決定**設定頁與管理頁篩選列**的順序。
+   ⚠ 加書籤對話窗不看這個順序，它一律把**最近用過的**排前面（現場要快）。 */
+function bsMove(i,d){
+ var st=bkLoad(), cats=bkCatsAll(st), c=cats[i];
+ if(c===undefined)return;
+ var s=bkSet(), at=-1, j;
+ for(j=0;j<s.cats.length;j++)if(s.cats[j]===c)at=j;
+ /* 只有書籤在用、還沒進清單的類別：先把整份現況固定下來，才有東西可以搬。 */
+ if(at<0){s.cats=cats.slice();at=i;}
+ var to=at+d;
+ if(to<0||to>=s.cats.length)return;
+ var t=s.cats[at]; s.cats[at]=s.cats[to]; s.cats[to]=t;
+ if(!bkSaveSet(s)){bsRender();bkSay(bkWhySetFail());return;}
+ BS_REN=-1; bsRender();}
+
+/* core 改完資料就叫這個。⚠ 這一頁**沒有**共用對話窗（它只整理類別、不編輯單筆書籤），
+   所以不必 bkClose()——`bkModalEl()` 在這一頁本來就回 null，core 各處都擋著。 */
+function bkRefresh(msg){bsRender();bkSay(msg);}
+/* ⚠⚠ **別的分頁改的：正在打字就不要重畫。** `bsRender()` 是用 `innerHTML` 整段重建，
+   `#bsRenInp` 的 value 會被塞回**舊的類別名**、`#bsAddInp` 會變回空字串
+   ⇒ 使用者打到一半的新名字直接消失。core 那道 `bkModalEl()` 的保險在這一頁
+   **結構上不可能生效**（這一頁沒有對話窗，`bkModalEl()` 恆回 null），
+   所以擋在這裡才算數。
+   守它的是探針的 `storage_event_keeps_rename_input`。 */
+function bkSync(){
+ if(BS_REN>=0||BS_ADD)return;
+ bsRender();}
+bsRender();
+"""
+
+
+def render_bookmarks_html(rows, fallback=None, sess_dir=None) -> str:
+    """書籤管理頁 → `out/sessions/bookmarks.html`。
+
+    ⚠⚠ **放在 `out/sessions/` 底下，不是 `out/` 根。** session 頁在
+    `out/sessions/<source>/<account>/*.html`，管理頁放根目錄就差三層——那是全域最遠的
+    一對，也是 `file://` origin 規則最可能出問題的地方。放同一棵子樹是**零成本的保險**
+    （`bookmarks-proposal.md`〈B. 管理頁面怎麼生〉）。
+
+    ⚠ 這一頁**每次執行都無條件重產**，和 `index.html` 一樣不受 manifest 版本閘管
+    ——所以改這個函式**不必**升 `RENDERER_VERSION`（那個閘只管 session 頁）。
+    """
+    sess = {}
+
+    def _add(r, overwrite):
+        sid = r.get("session_id")
+        # has_html＝這個 row 的 HTML 真的產過且與 sig 同步（`--format md` 時可能沒有）。
+        # 沒有的話別把死連結烤進去——讓它走「對不到檔案」那條路，訊息才誠實。
+        if not sid or not r.get("out_html") or not r.get("has_html", True):
+            return
+        if sid in sess and not overwrite:
+            return
+        # ⚠⚠ **每一筆都要確認檔案真的在。** manifest 會記著早就被清掉的輸出，
+        #    而縮範圍模式不清孤兒檔，磁碟上還會留著改名前的舊檔。
+        if sess_dir is not None and not (sess_dir / r["out_html"]).exists():
+            return
+        sess[sid] = {"u": "sessions/" + r["out_html"].replace("\\", "/"),
+                     "t": r.get("title", ""), "p": r.get("proj", ""),
+                     "a": r.get("account", ""), "d": r.get("date_str", "")}
+
+    # ⚠⚠ **同一個 sid 可能在 `rows` 裡出現兩次。** 縮範圍模式下 `new_entries` 是
+    #    舊 manifest 的副本，而 manifest 的鍵是**來源檔路徑**：專案夾一改名，
+    #    舊路徑那筆還留著（指向改名前的檔名），新路徑那筆才是現況。
+    #    重建過的那筆會被 `pop` 掉再重新塞回去 ⇒ **排在後面**，所以這裡取後到者。
+    #    （守它的是 `test_bookmark_link_durability` 第 1 節：專案改名後
+    #      同一個 sid 必須對到**新的**檔名，而且它先驗「檔名真的變了」才驗指向。）
+    for r in rows:
+        _add(r, True)
+    # ⚠⚠ 再用 manifest 補上「本次沒涵蓋、但檔案還在磁碟上」的那些。
+    #    升版後第一次跑 `--project X` 時 `rows` 只剩那幾場（manifest 被視為空），
+    #    沒有這一段的話，管理頁會對著還在的檔案說「不在這次的輸出裡」——那是假話。
+    for e in (fallback or {}).values():
+        row = (e or {}).get("row")
+        if row:
+            _add(row, False)
+    body = f"""
+<div class="wrap">
+  <div class="topbar">
+    <span><a class="back" href="../index.html">← 回索引</a>
+    <a class="back" href="settings.html">⚙ 設定</a></span>
+  </div>
+  <h1>🔖 書籤管理</h1>
+  <div class="smeta">書籤存在這台瀏覽器的 localStorage 裡，
+    <b>一次「清除瀏覽資料」就沒了</b>——真正的備份是下面那兩顆匯出鈕。</div>
+  <div class="filters">
+    <input id="bxQ" class="search" type="search" placeholder="🔍 搜尋備註、摘要、類別、對話標題…"
+           aria-label="搜尋書籤" oninput="bxSearch(this)">
+    <label class="wchk"><input type="checkbox" id="bxDue" onchange="bxToggleDue(this)">
+      ⏰ 只看該複查的</label>
+    <span class="bm-chips" id="bxSorts">
+      <button type="button" class="bm-chip" role="radio" data-s="new" aria-checked="true"
+              onclick="bxPickSort(this)">最近加入</button>
+      <button type="button" class="bm-chip" role="radio" data-s="old" aria-checked="false"
+              onclick="bxPickSort(this)">最早加入</button>
+      <button type="button" class="bm-chip" role="radio" data-s="due" aria-checked="false"
+              onclick="bxPickSort(this)">快到期的先</button>
+    </span>
+  </div>
+  <div class="bm-chips" id="bxCats"></div>
+  <div class="bxcount" id="bxCount"></div>
+  <ul class="bm-list bx-list" id="bxList"></ul>
+  <div class="bm-act" id="bxUndo"></div>
+  <div id="bxFoot"></div>
+</div>
+<div class="bm-modal" id="bkModal" onclick="bkBackdrop(event)">
+  <div class="bm-card" id="bkCard" role="dialog" aria-modal="true" aria-labelledby="bkTitle"></div>
+</div>
+<script>
+function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
+function lsSet(k,v){{try{{localStorage.setItem(k,v);return true;}}catch(e){{return false;}}}}
+var BK_MGR='';        /* 這一頁自己就是管理頁，footer 不畫那個連結 */
+</script>
+<script>{_BOOKMARK_CORE_JS}</script>
+<script>{_MANAGE_JS.replace("__BX_SESS__", js_embed(sess))}</script>
+<script>
+/* 排序 chip 的單選外觀：和複查間隔那組共用 aria-checked 的語意，但各自一組。 */
+(function(){{
+ var g=document.getElementById('bxSorts');
+ g.addEventListener('click',function(ev){{
+  var b=ev.target.closest('.bm-chip'); if(!b)return;
+  var all=g.querySelectorAll('.bm-chip');
+  for(var i=0;i<all.length;i++)all[i].setAttribute('aria-checked','false');
+  b.setAttribute('aria-checked','true');}});
+}})();
+</script>
+"""
+    return html_page("書籤管理", body)
+
+
+def render_settings_html() -> str:
+    """設定頁 → `out/sessions/settings.html`（Will 2026-08-22 裁決：**獨立一頁**）。
+
+    ⚠ 和管理頁同一層，理由同上。一樣每次執行都無條件重產，不必升 `RENDERER_VERSION`。
+    """
+    body = f"""
+<div class="wrap">
+  <div class="topbar">
+    <span><a class="back" href="bookmarks.html">← 回書籤管理</a>
+    <a class="back" href="../index.html">← 回索引</a></span>
+  </div>
+  <h1>⚙ 設定</h1>
+  <div class="smeta">設定和書籤一樣存在這台瀏覽器的 localStorage 裡；
+    它<b>會一起寫進匯出的 JSON</b>，換機器時匯入就回來了。</div>
+
+  <h2 class="bs-h">「提醒我複查」的預設值</h2>
+  <div class="bm-lab">新加書籤時預設選哪一個。目前是<b id="bsSpanNow"></b>。
+    <span class="bmi-sum">· 到期只會標記 ⏰，書籤永遠不會自己消失</span></div>
+  <div class="bm-chips" id="bsSpans" role="radiogroup" aria-label="提醒我複查的預設值"></div>
+
+  <h2 class="bs-h">類別管理</h2>
+  <div class="bm-lab">改名、合併、刪除、排序。
+    <span class="bmi-sum">· <b>要新增類別的話不用來這裡</b>：加書籤的對話窗裡按「＋ 新類別」
+    就能就地建好並選起來 · 改名成一個已經存在的名字＝合併這兩個類別
+    · 這裡的順序決定管理頁篩選列的順序；加書籤的對話窗一律把最近用過的排前面</span></div>
+  <ul class="bm-list bs-list" id="bsCats"></ul>
+  <div class="bm-act" id="bsAdd"></div>
+  <div class="bm-act" id="bsUndo"></div>
+
+  <h2 class="bs-h">備份</h2>
+  <div id="bsFoot"></div>
+</div>
+<script>
+function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
+function lsSet(k,v){{try{{localStorage.setItem(k,v);return true;}}catch(e){{return false;}}}}
+var BK_MGR='bookmarks.html';
+</script>
+<script>{_BOOKMARK_CORE_JS}</script>
+<script>{_SETTINGS_JS}</script>
+"""
+    return html_page("書籤設定", body)
 
 
 def render_session_html(s: Session, index_href: str, memory_href: str = "") -> str:
@@ -3541,6 +5182,32 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
                  if s.kind != "chat" else "")
     stats = f"{kind_chip}💬 {s.n_user} 問 / {s.n_assistant} 答 · 🔧 {s.n_tools} 次工具呼叫{usage}"
     h1 = f'<span class="named">✎ {esc(s.title)}</span>' if s.rename else esc(s.title)
+    # 書籤：把「這一頁是誰」填進 JS。
+    # ⚠ `s.out_html` 是相對 `out/sessions/` 的；記錄裡存**相對 `out/`** 的路徑，
+    #   這樣管理頁（放在 `out/sessions/` 底下）與索引頁都算得回去，
+    #   而且匯出檔裡不會出現 `C:\\Users\\<名字>\\`。
+    # ⚠ `town`＝這個標題**是不是使用者自己取的**。沒改過名的標題就是第一則使用者訊息，
+    #   那是對話內容，匯出「只匯書籤」時要跟摘要一起遮掉。
+    # ⚠⚠ **只有 Claude 那條路算數。** Claude 的 `extract_rename` 讀的是 `/rename` 事件
+    #   ——那確實是使用者動作；Codex 的 `s.rename` 來自 `session_index.jsonl` 的
+    #   `thread_name`，那只是索引檔的一個欄位，**不是使用者動作的證據**。
+    #   實查本機語料（2026-08-22）：唯一一筆 `thread_name` 是
+    #   `Codex Companion Task: You are running a TOOLING PROBE, not a`
+    #   ——明顯是從對話內容截出來的 60 字，不是誰取的名字。
+    #   遮蔽是**隱私保證**，證據不足時一律從嚴：Codex 一律當成沒改過名。
+    #   代價只是「只匯書籤」那份少一行標題。守它的是 `test_bookmark_codex_title_masked`。
+    # ⚠ `BK_MGR` 是管理頁的相對路徑：管理頁在 `out/sessions/bookmarks.html`，
+    #   而 `s.out_html` 相對 `out/sessions/` ⇒ 退回 `out/sessions/` 要 (層數-1) 個 `../`。
+    #   `rel_index_href` 退的是 `out/`，比這裡多一層，**不要拿它來算**。
+    bookmark_js = (_BOOKMARK_PAGE_JS
+                   .replace("__BK_SID__", js_embed(s.session_id))
+                   .replace("__BK_URL__",
+                            js_embed("sessions/" + (getattr(s, "out_html", "") or "").replace("\\", "/")))
+                   .replace("__BK_TITLE__", js_embed(s.title))
+                   .replace("__BK_TOWN__",
+                            "1" if (s.rename and s.source_kind == SOURCE_CLAUDE) else "0"))
+    bk_mgr = js_embed("../" * (len(PureWindowsPath(getattr(s, "out_html", "") or "x.html").parts) - 1)
+                      + "bookmarks.html")
     sub = (f'<div class="smeta">自動標題：{esc(s.ai_title)}</div>'
            if (s.rename and s.ai_title and s.ai_title != s.title) else "")
 
@@ -3552,7 +5219,8 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
       {f'<a class="back memlink" href="{esc_attr(memory_href)}" title="此專案 memory">🧠 專案 memory</a>' if memory_href else ''}
     </span>
     <span class="ctrl"><button onclick="toggleAll(true)">展開全部</button>
-    <button onclick="toggleAll(false)">收合全部</button></span>
+    <button onclick="toggleAll(false)">收合全部</button>
+    <button class="bkbtn" id="bkbtn" onclick="bkPanel()" title="這一頁的書籤 · 匯出／匯入">🔖 書籤</button></span>
   </div>
   <div class="meterbar">每則顯示：
     <label><input type="checkbox" id="cb_cache" onchange="tm('cache')">⚡快取%</label>
@@ -3574,6 +5242,11 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
   {sub_toc}
   <div class="thread">{''.join(turns)}</div>
   {side_html}
+</div>
+<!-- 書籤對話窗（第 2 期）。⚠ 空殼在建置期產出，內容全部由 JS 從 localStorage 填——
+     建置期不可能知道書籤內容，它們在瀏覽器裡。 -->
+<div class="bm-modal" id="bkModal" onclick="bkBackdrop(event)">
+  <div class="bm-card" id="bkCard" role="dialog" aria-modal="true" aria-labelledby="bkTitle"></div>
 </div>
 <script>
 function toggleAll(o){{document.querySelectorAll('details.tool,details.think,details.sidechain-wrap').forEach(function(d){{d.open=o;}});}}
@@ -3662,10 +5335,13 @@ addEventListener('hashchange',bmGo);
 var MET=['cache','miss','cost','in','cw','cr','ctx','out','gap','dur','eff'],
     DEF={{cache:1,miss:1,cost:1,in:0,cw:0,cr:0,ctx:0,out:0,gap:1,dur:0,eff:0}};
 function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
-function lsSet(k,v){{try{{localStorage.setItem(k,v);}}catch(e){{}}}}
+function lsSet(k,v){{try{{localStorage.setItem(k,v);return true;}}catch(e){{return false;}}}}
 function applyMet(){{MET.forEach(function(k){{var v=lsGet('m_'+k);v=(v===null)?DEF[k]:(v==='1'?1:0);document.body.classList.toggle('hide-'+k,!v);var cb=document.getElementById('cb_'+k);if(cb)cb.checked=!!v;}});}}
 function tm(k){{var cb=document.getElementById('cb_'+k);lsSet('m_'+k,cb.checked?'1':'0');document.body.classList.toggle('hide-'+k,!cb.checked);}}
 applyMet();
+var BK_MGR={bk_mgr};
+{_BOOKMARK_CORE_JS}
+{bookmark_js}
 </script>
 """
     return html_page(s.title, body,
@@ -4034,6 +5710,99 @@ def cost_summary(rows):
     return " · 估算花費：" + " · ".join(parts)
 
 
+# ⚠⚠ 同樣是**普通 raw 字串，不是 f-string**（單大括號），理由見 `_BOOKMARK_JS`。
+# 索引頁的書籤圖示：建置期看不到書籤（它們在瀏覽器的 localStorage 裡），
+# 只能由頁面 JS 用每一列的 `data-sid` 對回來。
+# ⚠ 這一段**不需要升 RENDERER_VERSION**：`index.html` 每次執行都無條件重產，
+#   不受 manifest 版本閘管（那個閘只管 session 頁）。
+_INDEX_BOOKMARK_JS = r"""
+/* ── 索引頁的書籤圖示（Will 2026-08-22 要求）───────────────────────────
+   ⚠ 讀的是和 session 頁**同一個** localStorage 鍵；`file://` 在 Chrome 眼裡是單一
+   origin，所以索引頁讀得到 session 頁存的東西（第 1.5 期已實測過這個前提）。 */
+function bkIndexMark(){
+ /* ⚠ `Object.create(null)` 不是 `{}`：sid 來自匯入檔時可能叫 `constructor`，
+    拿 `{}` 當表會撈到原型上的成員 ⇒ `e.n++` 打在一個函式上、整列的計數變 NaN。 */
+ var by=Object.create(null);
+ try{
+  var raw=lsGet('asv_bm_v1');
+  var o=raw?JSON.parse(raw):null;
+  var items=(o&&Array.isArray(o.items))?o.items:[];
+  var now=Date.now();
+  for(var i=0;i<items.length;i++){
+   /* ⚠ 每一筆都要驗型別：`{items:[null]}` 與 `{sid:{}}` 都是合法 JSON
+      （跨模型 Medium#7 在 core 那邊的同一件事）。 */
+   var x=items[i]; if(!x||typeof x!=='object'||typeof x.sid!=='string'||!x.sid)continue;
+   var e=by[x.sid]||(by[x.sid]={n:0,due:0,cats:Object.create(null)});
+   e.n++;
+   if(x.due>0&&x.due<=now)e.due++;
+   if(x.cat&&typeof x.cat==='string')e.cats[x.cat]=1;
+  }
+ /* 壞掉的 store 不可以讓整頁索引死掉。
+    ⚠⚠ 這裡**一定要是 `Object.create(null)`**，不可以寫 `{}`：底下用
+    `by[r.dataset.sid]` 查，而 sid 叫 `constructor` 時 `{}` 會撈到原型上的函式
+    ⇒ 判成「這一場有書籤」⇒ `Object.keys(e.cats)` 對 undefined 取值、整頁掛掉。
+    上面那個宣告本來就已經是 `Object.create(null)` 了，catch 這條路漏掉就等於沒防。 */
+ }catch(e){ by=Object.create(null); }
+ ROWS.forEach(function(r){
+  var old=r.querySelector('.bmflag');
+  if(old&&old.parentElement)old.parentElement.removeChild(old);
+  var e=by[r.dataset.sid||''];
+  r.dataset.bm=e?'1':'0';
+  if(!e)return;
+  var cats=Object.keys(e.cats).sort();
+  var flag=document.createElement('span');
+  flag.className='bmflag'+(e.due?' due':'');
+  /* ⚠ 用 textContent 不用 innerHTML：類別是使用者輸入、也可能來自別人給的匯入檔。 */
+  flag.textContent='🔖'+(e.n>1?e.n:'')+(e.due?' ⏰':'');
+  flag.title=e.n+' 筆書籤'
+             +(e.due?('，'+e.due+' 筆該複查'):'')
+             +(cats.length?('：'+cats.join('、')):'');
+  var cell=r.querySelector('td a');
+  if(cell&&cell.parentElement)cell.parentElement.insertBefore(flag,cell);
+ });
+ /* 篩選列多一顆「只看有書籤的」——⚠ 它要參與既有的 af()，不是自己另做一套顯示邏輯，
+    否則和其他篩選條件疊起來會互相打架。 */
+ var fb=document.getElementById('fb');
+ if(fb){
+  /* ⚠⚠ 要數的是**這份索引裡真的有書籤的列**，不是 store 裡的 sid 總數
+     （跨模型 Low#11）。書籤可能來自別台的匯入檔、或指向這次沒涵蓋的 session
+     ⇒ 用總數決定的話，鈕會出現、勾下去卻得到一張空表，而畫面上沒有任何解釋。
+     ⚠ 這一段一定要跑在上面那個 `ROWS.forEach` **之後**（`data-bm` 才填好了）。
+     守它的是索引探針的 `filter_hidden_when_only_offindex`。 */
+  var total=0;
+  ROWS.forEach(function(r){ if(r.dataset.bm==='1')total++; });
+  fb.parentElement.style.display=total?'':'none';
+  fb.parentElement.title=total+' 場有書籤';
+  /* ⚠⚠ **藏起來的篩選不可以還在生效。** 上一行只是把控制項藏起來，`af()` 讀的仍是
+     `fb.checked` ⇒ 勾著的狀態下，別的分頁移除最後一筆書籤時：勾選框消失、篩選照跑
+     ⇒ **整張表 0 列，而畫面上沒有任何東西解釋為什麼**（收斂確認輪 Medium）。
+     ⚠ 這個狀態是新的 storage listener 造出來的：這個函式以前只在載入時跑一次，
+     那時 `fb` 必定沒勾，所以到不了。**每加一條同步路徑，就要問它造出了哪些新狀態。**
+     ⚠ 只在 `total===0`（＝控制項真的被藏起來）時取消勾選；鈕還看得見時勾著就該繼續生效
+     （對照組 `visible_bm_filter_still_applies` 在守這一半）。
+     守它的是索引探針的 `hidden_bm_filter_does_not_blank_table`。 */
+  if(!total)fb.checked=false;
+ }
+}
+/* ⚠ 「只看有書籤的」的還原在 `restoreF()` 裡（理由見那裡）。這一段只負責
+   「這份索引一場書籤都沒有就取消勾選」，而它必須排在還原**之後**——
+   順序是 **restoreF → af → bkIndexMark → af**。
+   守它的是索引探針的 `reload_keeps_bm_filter`（真的重新載入一次）
+   與 `restored_bm_filter_still_unchecked_when_hidden`（順序）。 */
+bkIndexMark();
+af();      /* 圖示會改變 data-bm，重跑一次篩選讓「只看有書籤的」立刻生效 */
+/* ⚠⚠ **索引頁自己要有這一段。** core 的 `storage` listener 只寫在
+   `_BOOKMARK_CORE_JS` 裡，而索引頁**不內嵌 core**（它只有這一段）
+   ⇒ 「在 session 頁加了書籤，開著的索引頁跟著出現 🔖」原本根本沒有實作，
+   但 core 的註解與 README〈開著好幾個分頁〉都寫成有。
+   這一頁沒有對話窗、也沒有任何編輯狀態，所以直接重畫就好。
+   守它的是索引探針的 `index_storage_event_redraws`。 */
+addEventListener('storage',function(ev){
+ if(ev&&ev.key&&ev.key!=='asv_bm_v1')return;
+ try{bkIndexMark();af();}catch(e){}});
+"""
+
+
 def render_index_html(rows, show_account=False, cache_report=False, codex_report=False) -> str:
     rows = sorted(rows, key=lambda r: r.get("start_ts") or 0, reverse=True)
     projects = sorted({r["proj"] for r in rows})
@@ -4058,6 +5827,12 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
     waste_toggle = ('<label class="wchk" title="只列出有人因可避免冷啟的 session">'
                     '<input type="checkbox" id="fw" onchange="af()"> 只看有人因浪費的</label>'
                     if any((r.get("waste_n") or 0) for r in rows) else "")
+    # ⚠ 這顆一開始是隱藏的：書籤在 localStorage 裡，建置期不知道有沒有。
+    #   由 bkIndexMark() 在頁面載入時決定要不要顯示（一場書籤都沒有就別擺著一個
+    #   永遠篩不出東西的控制項——和上面那顆「人因浪費」同一個原則）。
+    bm_toggle = ('<label class="wchk" id="fbwrap" style="display:none" '
+                 'title="只列出有書籤的 session"><input type="checkbox" id="fb" '
+                 'onchange="af()"> 🔖 只看有書籤的</label>')
     acc_th = "<th>帳號/來源</th>" if show_account else ""
     src_th = "<th>工具</th>" if show_source else ""
     tr = []
@@ -4105,9 +5880,12 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
         resume_cell = (f'<td class="num" data-sort="{rc}"{rc_title}>~{fmt_tokens(rc)}</td>'
                        if rc else '<td class="num" data-sort="0"></td>')
         tr.append(
-            f'<tr data-source="{esc_attr(src)}" data-acc="{esc_attr(acc)}" data-proj="{esc_attr(r["proj"])}" '
+            # ⚠ `data-sid` 是索引頁那顆書籤圖示唯一的依據：書籤存在 localStorage 裡、
+            #   建置期看不到，只能由頁面 JS 用 session id 對回來（見 _INDEX_BOOKMARK_JS）。
+            f'<tr data-sid="{esc_attr(r.get("session_id", ""))}" '
+            f'data-source="{esc_attr(src)}" data-acc="{esc_attr(acc)}" data-proj="{esc_attr(r["proj"])}" '
             f'data-month="{esc_attr(r.get("month",""))}" data-kind="{esc_attr(kind)}" '
-            f'data-waste="{1 if wn else 0}" data-text="{esc_attr(blob)}">'
+            f'data-waste="{1 if wn else 0}" data-bm="0" data-text="{esc_attr(blob)}">'
             f'<td class="nowrap">{esc(r.get("date_str",""))}</td>'
             f'{src_td}'
             f'{acc_td}'
@@ -4132,12 +5910,11 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
         ent = {"a": r.get("account", ""), "h": r["mem_href"]}
         if ent not in lst:
             lst.append(ent)
-    # 內嵌到 <script>：跳脫 < > 與 JS 行終止符，避免 </script> 破出或 U+2028/9 截斷字串
-    mem_js = (json.dumps(mem_map, ensure_ascii=False)
-              .replace("<", "\\u003c").replace(">", "\\u003e")
-              .replace(" ", "\\u2028").replace(" ", "\\u2029"))
+    mem_js = js_embed(mem_map)      # 跳脫 < > 與 U+2028/9 的理由見 js_embed
     grand = cost_summary(rows)
-    rlinks = []
+    # ⚠ 管理頁的連結**無條件出現**，不像報告那樣看有沒有資料：書籤在 localStorage 裡，
+    #   建置期永遠不知道有沒有。有書籤才顯示的話，第一次要找管理頁的人就永遠找不到。
+    rlinks = ['<a href="sessions/bookmarks.html">🔖 書籤管理 →</a>']
     if cache_report:
         rlinks += ['<a href="cache-report.html">⚡ 快取分析報告 →</a>',
                    '<a href="cache-hypotheses.html">🧪 快取假說檢定 →</a>']
@@ -4157,6 +5934,7 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
     <select id="fp" onchange="af()"><option value="">全部專案</option>{proj_opts}</select>
     <select id="fm" onchange="af()"><option value="">全部月份</option>{month_opts}</select>
     {waste_toggle}
+    {bm_toggle}
     <button id="clr" class="clr" type="button" onclick="clearF()">清除</button>
     <span id="cnt" class="cnt"></span>
   </div>
@@ -4170,7 +5948,7 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
   </table>
 </div>
 <script>
-var Q=document.getElementById('q'),FS=document.getElementById('fs'),FP=document.getElementById('fp'),FM=document.getElementById('fm'),FA=document.getElementById('fa'),FK=document.getElementById('fk'),FW=document.getElementById('fw'),CNT=document.getElementById('cnt');
+var Q=document.getElementById('q'),FS=document.getElementById('fs'),FP=document.getElementById('fp'),FM=document.getElementById('fm'),FA=document.getElementById('fa'),FK=document.getElementById('fk'),FW=document.getElementById('fw'),FB=document.getElementById('fb'),CNT=document.getElementById('cnt');
 var ROWS=[].slice.call(document.querySelectorAll('#tbl tbody tr'));
 var MEM={mem_js},MSTRIP=document.getElementById('memstrip');
 function updMem(p,s,a){{
@@ -4190,14 +5968,29 @@ function updMem(p,s,a){{
  }});
 }}
 function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
-function lsSet(k,v){{try{{localStorage.setItem(k,v);}}catch(e){{}}}}
+function lsSet(k,v){{try{{localStorage.setItem(k,v);return true;}}catch(e){{return false;}}}}
 var FKEY='idx_filter_v1';
-function saveF(){{lsSet(FKEY,JSON.stringify({{q:Q.value,s:FS?FS.value:'',p:FP.value,m:FM.value,a:FA?FA.value:'',k:FK?FK.value:'',w:(FW&&FW.checked)?1:0}}));}}
+/* ⚠ `b` ＝「只看有書籤的」。它和其他七個條件一樣要被記住：實際用法是**勾著它來來回回**
+   （索引 → 某一場 → 回索引 → 下一場），而每次回索引都是一次重新載入。
+   ⚠⚠ **還原不在 `restoreF()` 裡，在 `bkIndexRestoreFilter()`**（見 `_INDEX_BOOKMARK_JS`）：
+   `restoreF()` 跑在 `bkIndexMark()` 之前，那時每一列的 `data-bm` 還沒填，
+   在這裡把它勾起來會讓第一次 `af()` 把整張表濾成空的（畫面閃一下 0 / N）。 */
+function saveF(){{lsSet(FKEY,JSON.stringify({{q:Q.value,s:FS?FS.value:'',p:FP.value,m:FM.value,a:FA?FA.value:'',k:FK?FK.value:'',w:(FW&&FW.checked)?1:0,b:(FB&&FB.checked)?1:0}}));}}
 function setSel(el,v){{if(!el||!v)return;for(var i=0;i<el.options.length;i++){{if(el.options[i].value===v){{el.value=v;return;}}}}}}
-function restoreF(){{var raw=lsGet(FKEY);if(!raw)return;try{{var f=JSON.parse(raw);if(f.q)Q.value=f.q;setSel(FS,f.s);setSel(FP,f.p);setSel(FM,f.m);setSel(FA,f.a);setSel(FK,f.k);if(FW)FW.checked=!!f.w;}}catch(e){{}}}}
-function clearF(){{Q.value='';if(FS)FS.value='';FP.value='';FM.value='';if(FA)FA.value='';if(FK)FK.value='';if(FW)FW.checked=false;af();}}
-function af(){{var q=Q.value.toLowerCase(),s=FS?FS.value:'',p=FP.value,m=FM.value,a=FA?FA.value:'',k=FK?FK.value:'',w=(FW&&FW.checked),n=0;
- ROWS.forEach(function(r){{var ok=(!q||r.dataset.text.indexOf(q)>=0)&&(!s||r.dataset.source===s)&&(!p||r.dataset.proj===p)&&(!m||r.dataset.month===m)&&(!a||r.dataset.acc===a)&&(!k||r.dataset.kind===k)&&(!w||r.dataset.waste==='1');
+/* ⚠⚠ **`b`（只看有書籤的）一定要在這裡還原，不可以拖到 `bkIndexMark()` 那邊。**
+   下一行就是 `restoreF();af();`，而 **`af()` 尾端會 `saveF()`** ⇒ 還原晚一步的話，
+   那一次 `af()` 會拿「此刻還沒勾」的狀態把 `b` 覆寫成 0，於是永遠記不住。
+   2026-08-23 真的這樣出貨過一次：探針全綠、實際使用無效——因為探針是「存完馬上手動還原」，
+   中間**沒有那一次 `af()`**，恆綠（教訓 39）。
+   ⚠ 這裡勾起來時每一列的 `data-bm` 還沒填 ⇒ 第一次 `af()` 會把整張表濾成空的。
+   **那不會被看到**：整段（含 `_INDEX_BOOKMARK_JS`）是同一個同步 `<script>`，
+   `bkIndexMark();af();` 在第一次繪製之前就跑完了。
+   ⚠ 「這份索引一場書籤都沒有就取消勾選」那條規則仍然有效（在 `bkIndexMark()` 尾端），
+   它排在這之後，所以藏起來的篩選不會被還原回來。 */
+function restoreF(){{var raw=lsGet(FKEY);if(!raw)return;try{{var f=JSON.parse(raw);if(f.q)Q.value=f.q;setSel(FS,f.s);setSel(FP,f.p);setSel(FM,f.m);setSel(FA,f.a);setSel(FK,f.k);if(FW)FW.checked=!!f.w;if(FB)FB.checked=!!f.b;}}catch(e){{}}}}
+function clearF(){{Q.value='';if(FS)FS.value='';FP.value='';FM.value='';if(FA)FA.value='';if(FK)FK.value='';if(FW)FW.checked=false;if(FB)FB.checked=false;af();}}
+function af(){{var q=Q.value.toLowerCase(),s=FS?FS.value:'',p=FP.value,m=FM.value,a=FA?FA.value:'',k=FK?FK.value:'',w=(FW&&FW.checked),bm=(FB&&FB.checked),n=0;
+ ROWS.forEach(function(r){{var ok=(!q||r.dataset.text.indexOf(q)>=0)&&(!s||r.dataset.source===s)&&(!p||r.dataset.proj===p)&&(!m||r.dataset.month===m)&&(!a||r.dataset.acc===a)&&(!k||r.dataset.kind===k)&&(!w||r.dataset.waste==='1')&&(!bm||r.dataset.bm==='1');
   r.style.display=ok?'':'none';if(ok)n++;}});
  CNT.textContent=n+' / '+ROWS.length;updMem(p,s,a);saveF();}}
 restoreF();af();
@@ -4207,6 +6000,7 @@ document.querySelectorAll('#tbl th').forEach(function(th,i){{th.onclick=function
   var x=ca.dataset.sort!==undefined?ca.dataset.sort:ca.innerText,y=cb.dataset.sort!==undefined?cb.dataset.sort:cb.innerText;
   var nx=parseFloat(x),ny=parseFloat(y);if(!isNaN(nx)&&!isNaN(ny)){{return th._d?nx-ny:ny-nx;}}
   return th._d?String(x).localeCompare(y):String(y).localeCompare(x);}});rs.forEach(function(r){{tb.appendChild(r);}});}};}});
+{_INDEX_BOOKMARK_JS}
 </script>
 """
     return html_page("Claude Code 對話紀錄", body)
@@ -6150,6 +7944,11 @@ tr:hover td{background:rgba(127,127,127,.06)}
 .chip.waste{background:rgba(248,81,73,.22)}
 td.waste-td{color:var(--muted)}
 .wchk{font-size:13px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px}
+/* 索引頁「這一場有書籤」的圖示。⚠ 建置期不知道有沒有——由 bkIndexMark() 在載入時插入。
+   ⚠ `white-space:nowrap` ＋ `margin-right`：它插在標題連結**前面**，不可以把標題擠斷行。 */
+.bmflag{display:inline-block;margin-right:6px;font-size:12px;white-space:nowrap;
+        color:var(--accent);cursor:default}
+.bmflag.due{color:#d29922}      /* 有 ⏰ 該複查的那幾場；⚠ 只是標記，永遠不會自動刪 */
 /* 專案 memory */
 .memlink{margin-left:6px;text-decoration:none;font-size:13px}
 .memstrip{margin:6px 0 4px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;
@@ -6288,6 +8087,103 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
 .bm-x:hover{opacity:1}
 /* ⚠ 小視窗下文字會折成很多行——實測 500×400 時橫幅吃掉 44% 視窗高。收緊間距與字級。 */
 @media (max-width:640px){.bm-miss{padding:8px 10px;font-size:13px;line-height:1.5;max-height:30vh}}
+/* ══ 書籤（第 2 期）══════════════════════════════════════════════════════
+   ⚠⚠ 這一整段是**普通字串**，大括號寫一個就好。頁面的 script 區塊才是 f-string、
+   那裡要雙括號。同一個檔裡兩種規則並存，寫錯的話 CSS 會整段壞掉。
+   ⚠ 註解裡**不要寫字面的角括號 script 標籤**：CSS 會原樣落進 style 元素，
+   讓「整頁標籤開闔成對」這條檢查（test_bookmark_ui）永遠對不起來。 */
+/* 每輪標頭的加書籤鈕：與 .alink 同一套顯形規則（滑過該輪才出現）。
+   ⚠ **已加書籤的那一輪要永遠看得見**（.on）——否則使用者看不出自己存過哪幾輪，
+   而「這一輪存過沒有」正是他來這一頁要問的第一個問題。
+   ⚠ 和 .alink 一樣，它**會**永久佔掉標頭右側的寬度（24px + 4px margin）。
+   那是刻意加的 UI，不是版面缺陷；小視窗會不會擠爆由 probe_anchor_layout.py 守。 */
+.bmk{margin-left:4px;border:0;background:transparent;color:var(--muted);cursor:pointer;
+     font-size:13px;line-height:1;padding:0;min-width:24px;min-height:24px;
+     opacity:0;pointer-events:none;transition:opacity .12s}
+.turn:hover .bmk,.bmk:focus{opacity:.65;pointer-events:auto}
+.bmk:hover{opacity:1;color:var(--accent)}
+.bmk.on{opacity:1;pointer-events:auto;color:var(--accent)}
+/* ⚠ 沒有 hover 的裝置上靠 .turn:hover 顯形＝這個功能的入口永遠看不到（同 .alink）。 */
+@media (hover:none){.bmk{opacity:.55;pointer-events:auto}}
+/* 對話窗：fixed 覆蓋層，不進文件流（不造成版面位移）。 */
+.bm-modal{position:fixed;inset:0;z-index:70;display:none;
+          background:rgba(0,0,0,.45);padding:16px;overflow-y:auto}
+.bm-modal.open{display:flex;align-items:flex-start;justify-content:center}
+.bm-card{width:min(560px,100%);margin:auto;background:var(--panel);color:var(--text);
+         border:1px solid var(--border);border-radius:12px;padding:16px 18px;
+         box-shadow:0 8px 32px rgba(0,0,0,.4);font-size:14px;line-height:1.6}
+.bm-card h3{margin:0 0 4px;font-size:16px}
+.bm-lab{display:block;margin:12px 0 4px;color:var(--muted);font-size:12.5px}
+.bm-card input[type=text],.bm-card textarea{width:100%;background:var(--panel2);
+  color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 9px;font:inherit}
+.bm-card textarea{min-height:60px;resize:vertical}
+.bm-prev{background:var(--panel2);border:1px solid var(--border);border-radius:8px;
+         padding:7px 9px;color:var(--muted);font-size:12.5px;max-height:66px;overflow-y:auto;
+         word-break:break-word}
+/* ⚠ 單選用「一排 chip」而不是下拉：Will 的原話是「下拉使用上比較不方便」。
+   語意仍然是單選（role=radio + aria-checked），只是長得比較好按。 */
+.bm-chips{display:flex;flex-wrap:wrap;gap:6px}
+.bm-chip{border:1px solid var(--border);background:var(--panel2);color:var(--text);
+         border-radius:999px;padding:6px 12px;cursor:pointer;font:inherit;font-size:13px;
+         min-height:32px}
+.bm-chip[aria-checked=true]{border-color:var(--accent);color:var(--accent);font-weight:600}
+.bm-act{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px;align-items:center}
+.bm-act .grow{flex:1}
+/* ⚠ 管理頁與設定頁的按鈕**不在 `.bm-card` 裡**（對話窗只是那兩頁的一小部分），
+   所以這四條選擇器一定要一起涵蓋 `.bm-foot`／`.bm-act`／`.bm-item`／`.bs-cat`
+   ——少一個那一區就會退回瀏覽器預設樣式，在深色底上幾乎看不見。 */
+.bm-card button,.bm-foot button,.bm-act button,.bm-item button,.bs-cat button{
+  border:1px solid var(--border);background:var(--panel2);color:var(--text);
+  border-radius:8px;padding:6px 12px;cursor:pointer;font:inherit;font-size:13px;min-height:32px}
+.bm-card button:hover,.bm-foot button:hover,.bm-act button:hover,
+.bm-item button:hover,.bs-cat button:hover{border-color:var(--accent)}
+.bm-card button.pri,.bm-act button.pri,.bs-cat button.pri{
+  border-color:var(--accent);color:var(--accent);font-weight:600}
+.bm-card button.dang:hover,.bm-item button.dang:hover,.bs-cat button.dang:hover{
+  border-color:var(--err);color:var(--err)}
+/* ⚠ 匯出／匯入和存檔鈕**同一批出貨**：第一顆書籤存下去的那一刻，資料就只在
+   localStorage 裡，一次「清除瀏覽資料」就沒了。真正的耐久保證是匯出的 JSON。 */
+.bm-foot{margin-top:14px;padding-top:12px;border-top:1px solid var(--border);
+         display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+         color:var(--muted);font-size:12.5px}
+.bm-list{margin:8px 0 0;padding:0;list-style:none;max-height:42vh;overflow-y:auto}
+.bm-item{border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:6px;
+         background:var(--panel2)}
+.bmi-top{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.bmi-cat{color:var(--accent);font-size:12px}
+.bmi-due{color:#d29922;font-size:12px}      /* ⏰ 該複查了；⚠ 只是標記，永遠不會自動刪 */
+.bmi-note{white-space:pre-wrap;word-break:break-word}
+.bmi-sum{color:var(--muted);font-size:12px;word-break:break-word}
+.bm-msg{margin-top:10px;font-size:12.5px;color:var(--accent);min-height:1.2em}
+.bkbtn.has{border-color:var(--accent);color:var(--accent)}
+@media (max-width:640px){.bm-card{padding:12px 13px;font-size:13.5px}
+  .bm-modal{padding:8px}.bm-list{max-height:38vh}}
+/* 書籤管理頁／設定頁（第 3 期）。
+   ⚠ `button.bm-chip` 這一條要放在上面那組 `.bm-card button` 之後：兩者權重相同（0,1,1），
+   靠**後到者勝**把 chip 拉回圓角膠囊。少了它，對話窗裡的 chip 會被當成一般按鈕。 */
+button.bm-chip{border-radius:999px;padding:6px 12px}
+.bm-chip.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+.bm-chip.add{border-style:dashed}
+.bm-chip.more{color:var(--muted)}
+.bm-newcat{display:inline-flex;gap:4px;align-items:center}
+.bm-newcat input{width:auto;min-width:9em;background:var(--panel2);color:var(--text);
+  border:1px solid var(--accent);border-radius:999px;padding:6px 12px;font:inherit;font-size:13px}
+.bm-mgr{font-size:12.5px;white-space:nowrap}
+.bxcount{color:var(--muted);font-size:12.5px;margin:10px 0 0}
+/* ⚠ 管理頁的清單是**整頁的主體**，不可以沿用對話窗那個 42vh 的內捲高度。 */
+.bx-list{max-height:none;overflow:visible}
+.bx-item.due{border-color:#d29922}
+.bx-item .bmi-top .grow{flex:1}
+.bx-go{white-space:nowrap}
+.bx-sess{font-size:12.5px;margin-top:2px;word-break:break-word}
+.bs-h{font-size:15px;margin:26px 0 6px;padding-top:16px;border-top:1px solid var(--border)}
+.bs-list{max-height:none;overflow:visible}
+.bs-cat{display:flex;gap:8px;align-items:center;flex-wrap:wrap;background:var(--panel2);
+  border:1px solid var(--border);border-radius:8px;padding:6px 10px;margin-bottom:6px}
+.bs-cat .grow{flex:1}
+.bs-name{font-weight:600;word-break:break-word}
+.bs-cat input[type=text],.bm-act input[type=text]{background:var(--panel);color:var(--text);
+  border:1px solid var(--accent);border-radius:8px;padding:6px 10px;font:inherit;font-size:13px}
 details.sgroup{border:1px solid var(--border);border-radius:10px;margin:12px 0;background:var(--panel)}
 details.sgroup>summary{padding:8px 12px;font-size:14px}
 .stitle{font-weight:600}
@@ -6428,6 +8324,26 @@ def load_manifest(out: Path) -> tuple:
     return {}, True
 
 
+def load_manifest_paths(out: Path) -> dict:
+    """只取 `sid → row` 用來**算檔名與標題**，**忽略 renderer 版本**。
+
+    ⚠ 和 `load_manifest` 刻意分開，兩支不可以互相取代：
+    那一支在 renderer 升版時回空字典是**對的**（快取的 row 內容可能已經過時，
+    不能拿來重用輸出）；但**檔名與標題不隨 renderer 改變**，
+    而書籤管理頁需要的就只有那兩樣。
+
+    ⚠⚠ 不做這件事的後果（`bookmarks-p23` Medium）：升版後第一次跑縮範圍建置
+    （`--project X`）時 `rows` 只剩本次掃到的那幾場，管理頁就會對著**磁碟上還好端端
+    躺著**的 session 斬釘截鐵地說「⚠ 不在這次的輸出裡」並且不給連結。
+    索引頁少幾列還看得出是「這次沒涵蓋」，管理頁那句話卻是**明確的假話**。
+    """
+    try:
+        data = json.loads((out / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data.get("entries", {}) or {}
+
+
 def save_manifest(out: Path, entries: dict):
     (out / MANIFEST_NAME).write_text(
         json.dumps({"renderer_version": RENDERER_VERSION, "entries": entries}, ensure_ascii=False),
@@ -6436,6 +8352,73 @@ def save_manifest(out: Path, entries: dict):
 
 def manifest_key(source_kind: str, path: Path) -> str:
     return f"{source_kind}:{path.resolve()}"
+
+
+def _index_rows(entries: dict, include_empty: bool) -> list:
+    """manifest entries → 索引頁要畫的 rows。
+
+    ⚠⚠ **正常路徑與「零場對帳」那條路一定要用同一段。** 那兩處曾經各寫一份，
+    結果零場那份**漏掉了 `empty` 的過濾**（曾用 `--include-empty` 建過的話，
+    manifest 裡會留著 `empty:true` 的 row，之後一次不帶那個旗標的零場建置就會把它畫進索引）
+    ——同一份輸入在兩條路上長得不一樣。`bookmarks-fix2-fam-r2` 驗收找到的。
+    ⚠ 抽成函式**本身就是修法**：把條件複製一份、再叮嚀「兩邊要一致」，是這條線上
+    重複失效的那個做法（`bkMerge` 與 `bkCommit` 的守門條件也是這樣分岔的）。
+    ⚠ 誠實邊界：`empty` 那一格**沒有專屬的測試素材**（要造 `n_turns==0` 的語料）。
+    現在它承重的理由是「兩條路共用同一段」這個結構，不是有一格斷言在守它——
+    不要在這裡寫「守它的是 XXX」。
+    """
+    return [e["row"] for e in entries.values()
+            if e.get("row") and (include_empty or not e["row"].get("empty"))]
+
+
+def prune_gone_sources(entries: dict, scanned_roots) -> tuple:
+    """把「來源檔已經不在了、而且它就在本次掃過的來源根底下」的 entry 拿掉。
+
+    回傳 `(留下來的 entries, 拿掉幾筆)`。
+
+    ⚠⚠ **這是書籤管理頁反查表（`BX_SESS`）唯一的對帳點。** 不做的話，明確來源中
+    **已刪除的 session 會永久留在表裡**（跨模型 Medium#5）：任何縮範圍旗標都讓
+    `filtering=True` ⇒ 整份舊 manifest 原封不動被沿用，而縮範圍模式又不清孤兒檔
+    ⇒ 舊 HTML 還躺在磁碟上 ⇒ fallback 每次都把它烤回去。實測：以明確來源建兩場、
+    刪掉其中一份 JSONL、再用同一個來源重建，程式仍回報共 2 場。
+
+    ⚠ **只對本次真的掃過的根做。** 範圍外的來源可能只是這次沒指定、或磁碟沒掛上，
+    在那裡「檔案不存在」**不代表「被刪掉了」**——那正是 `filtering` 當初保守的理由，
+    這裡不推翻它，只是把「我這次確實看過那個目錄」這件事用上。
+
+    ⚠ 對不上就保留（`relative_to` 丟 ValueError、路徑解析不出來、key 形狀不認得），
+    **失敗方向一律是保守的**：寧可留著一筆過期的，也不要誤刪還在用的。
+
+    範圍限制 SCOPE-BOOKMARK-PRUNED-ORPHAN-FILES：本函式只對帳 manifest 紀錄，
+    **不刪磁碟上已經產出來的檔**；縮範圍模式的孤兒清理範圍見 `main()` 尾端那段。
+    詳見 planning/scope-limits.md。
+    """
+    roots = []
+    for r in scanned_roots:
+        try:
+            roots.append(Path(r).resolve())
+        except OSError:
+            pass
+    if not roots:
+        return entries, 0
+    kept, gone = {}, 0
+    for key, ent in entries.items():
+        src = key.split(":", 1)[1] if ":" in key else ""   # key＝`<來源類型>:<解析過的路徑>`
+        p, under = Path(src), False
+        # ⚠ 用 `relative_to` ＋ try/except，不用 `is_relative_to`（那是 3.9+）：
+        #   README 只保證「Python 3 標準函式庫」，這裡不值得為一個布林值訂下版本門檻。
+        for root in roots:
+            try:
+                p.relative_to(root)
+                under = True
+                break
+            except ValueError:
+                pass
+        if under and not p.exists():
+            gone += 1
+            continue
+        kept[key] = ent
+    return kept, gone
 
 
 def _dedupe_claude_sessions(files):
@@ -7018,6 +9001,54 @@ def main():
         print(f"Codex 來源：{', '.join(a for a, _ in codex_accounts)}")
     if not files:
         print("沒有找到任何 session 檔。")
+        # ⚠⚠ **零場也要對帳。** 舊寫法在這裡直接 `return`，於是
+        #     「來源被刪到一場不剩」時整個對帳流程根本不會執行：舊 manifest、
+        #     書籤管理頁的 `BX_SESS` 反查表、索引頁全部原封不動留著，
+        #     連結指向已經不存在的檔。`prune_gone_sources` 位在這個 return 之後，
+        #     所以它守的那件事在**最極端的那一格**反而失效。
+        #     ⚠ `test_bookmark_deleted_source_pruned` 只做「兩場刪成一場」，
+        #       所以這一格一直沒有素材走到（教訓 29）。
+        #     守它的是 `tests/test_smoke.py::test_bookmark_all_sources_deleted`。
+        scanned_roots = [root for _, root in accounts] + [root for _, root in codex_accounts]
+        # ⚠ 一個來源根都沒掃到（`--no-claude --no-codex`、或來源設定錯）時**什麼都不要動**：
+        #   那不是「東西被刪了」，是「這次沒有去看」。誤判的代價是清掉還在的紀錄。
+        if not scanned_roots:
+            return
+        filtering = bool(args.project or args.claude_source or args.account or args.no_claude
+                         or args.codex_source or args.no_codex)
+        old_manifest, _ = load_manifest(out)
+        new_entries = dict(old_manifest) if filtering else {}
+        new_entries, n_gone = prune_gone_sources(new_entries, scanned_roots)
+        if n_gone:
+            print(f"  （來源已刪除，對掉 {n_gone} 筆舊紀錄）")
+        save_manifest(out, new_entries)
+        if want_html:
+            # ⚠⚠ **索引頁要用對帳後的 `new_entries` 重畫，不可以寫死。**
+            #     `new_entries` 在縮範圍時保留了範圍外的紀錄（正常路徑本來就會把它們
+            #     一起畫出來），這裡卻曾經寫 `render_index_html([], False, False, False)`
+            #     ⇒ manifest 說有、`BX_SESS` 也還指著、HTML 檔還在磁碟上，
+            #     **只有索引頁說一場都沒有**。
+            #     ⚠ 改之前這個分支是直接 `return`（索引不會被動到），所以那是「零場也要
+            #       對帳」自己造出來的新缺陷——正是這條線上重複出現的那個樣態。
+            #     ⚠⚠ **而第一次修的時候只換掉第一個參數**，第三、四個（要不要連到快取報告）
+            #       還是寫死的 `False` ⇒ 報告檔還在磁碟上、索引卻不連它了。**同一個形狀，
+            #       隔壁兩個參數。** 所以現在四個參數全部照正常路徑算一次。
+            #     ⚠ rows 一律走 `_index_rows()`：兩條路各寫一份就會分岔（`empty` 的過濾
+            #       第一次修的時候也漏了）。
+            #     守它的是 `tests/test_smoke.py::test_zero_scan_keeps_out_of_scope_index`
+            #     （列還在）與 `::test_zero_scan_keeps_cache_report_links`（連結還在）。
+            zero_rows = _index_rows(new_entries, args.include_empty)
+            zero_cache = build_cache_report(zero_rows, acct_health=acct_health)
+            (out / "index.html").write_text(
+                render_index_html(zero_rows,
+                                  len({r.get("account", "") for r in zero_rows}) > 1,
+                                  zero_cache["has_data"],
+                                  build_codex_survival(zero_rows)["has_data"]),
+                encoding="utf-8")
+            bx_fallback, _ = prune_gone_sources(load_manifest_paths(out), scanned_roots)
+            (sess_dir / "bookmarks.html").write_text(
+                render_bookmarks_html([], bx_fallback, sess_dir), encoding="utf-8")
+            (sess_dir / "settings.html").write_text(render_settings_html(), encoding="utf-8")
         return
     if n_raw > len(files):
         print(f"  （去重 {n_raw - len(files)} 個跨來源重複的 Claude session）")
@@ -7036,6 +9067,14 @@ def main():
               "從索引/報告消失；請另跑一次涵蓋全部來源的完整建置以補齊。", file=sys.stderr)
     # 預設（無縮範圍旗標）時 Claude + Codex 兩邊都會掃，可安全全量對帳
     new_entries = dict(old_manifest) if filtering else {}
+    # ⚠⚠ 沿用舊 manifest 不等於「舊的都還在」。本次真的掃過的來源根底下、檔案已經不在的，
+    #     一律對掉——不做的話已刪除的 session 會**永久**留在書籤管理頁的反查表裡
+    #     （跨模型 Medium#5）。判準與保守方向見 `prune_gone_sources` 的 docstring。
+    scanned_roots = [root for _, root in accounts] + [root for _, root in codex_accounts]
+    if filtering:
+        new_entries, n_gone = prune_gone_sources(new_entries, scanned_roots)
+        if n_gone:
+            print(f"  （來源已刪除，對掉 {n_gone} 筆舊紀錄）")
     scanned_source_dirs = {safe_name(source_kind, 24) for source_kind, *_ in files}
 
     codex_titles = {}
@@ -7066,6 +9105,12 @@ def main():
         new_entries.pop(key, None)
         reusable = (
             cached.get("sig") == sig and row
+            # ⚠⚠ 帳號標籤變了就**一定要重建**（跨模型 Medium#5 的 [推論] 那半）。
+            #    輸出路徑是 `<來源>/<帳號>/<檔名>`，而 sig 只看檔案內容 ⇒ 同一份 JSONL
+            #    換一個 `--claude-source 標籤=路徑` 重跑時，舊 row 會被沿用、頁面留在
+            #    **舊的帳號目錄**下，索引與 BX_SESS 也跟著指到那裡。標籤是會改輸出位置
+            #    的因素，就必須進 reusable 的判定。
+            and row.get("account", "") == (acc_name or "")
             and (source_kind != SOURCE_CLAUDE                  # 正規名變了就重建，避免同夾兩名/舊檔名殘留
                  or (row.get("proj") == proj_names.get((acc_name, proj_name))
                      and "cache_steps" in row))                # 缺 cache_steps（理論上不會）→ 重建補上
@@ -7125,8 +9170,7 @@ def main():
         new_entries[key] = {"sig": sig, "row": row}
         n_build += 1
 
-    rows = [e["row"] for e in new_entries.values()
-            if args.include_empty or not e["row"].get("empty")]
+    rows = _index_rows(new_entries, args.include_empty)
     show_account = len({r.get("account", "") for r in rows}) > 1
 
     # 產生「有 memory/ 的 Claude 專案」的 memory 頁。
@@ -7198,6 +9242,30 @@ def main():
 
     if want_html:
         (out / "index.html").write_text(render_index_html(rows, show_account, has_report, has_codex_report), encoding="utf-8")
+        # 書籤管理頁與設定頁（第 3 期）。⚠ 放 `out/sessions/` **底下**，不是 `out/` 根：
+        # 和寫入者（session 頁）同一棵子樹，把「目錄層級」這個變數整個消掉。
+        # ⚠ 兩份和 index.html 一樣**每次都無條件重產**，不受 manifest 的版本閘管。
+        # ⚠ 下面清孤兒檔那一段只掃 `rel.parts[0] in scanned_source_dirs`（來源夾），
+        #   這兩個檔在 `sessions/` 的**第一層**、`parts[0]` 就是檔名本身 ⇒ 掃不到、不會被誤刪。
+        #   守它的是 `test_bookmark_manage_pages` 的「重建兩次仍在」那一格。
+        # ⚠⚠ fallback 讀的是**磁碟上那份舊 manifest**（`save_manifest` 這時還沒跑），
+        #    所以它必須走**同一條對帳規則**——否則上面 `new_entries` 對掉的那幾筆會從
+        #    這裡再被烤回反查表，同一個缺陷換一條路徑進來（跨模型 Medium#5）。
+        #    守它的是 `test_bookmark_deleted_source_pruned`。
+        bx_fallback, _ = prune_gone_sources(load_manifest_paths(out), scanned_roots)
+        (sess_dir / "bookmarks.html").write_text(
+            render_bookmarks_html(rows, bx_fallback, sess_dir), encoding="utf-8")
+        (sess_dir / "settings.html").write_text(render_settings_html(), encoding="utf-8")
+    elif want_md:
+        # ⚠ 純 md 建置**不重產**這兩頁，留著就是一份**過期的 `BX_SESS`**：
+        #   之後某場的檔名變了（專案改名）而該次是純 md 全量建置時，孤兒清理會刪掉舊
+        #   `.html`、又不會產新的 ⇒ 管理頁生出一條指向**已刪檔案**的連結，
+        #   而不是誠實的「⚠ 對不到檔案」。比照 `cache-report.*` 那段：不重產就刪掉。
+        for stale in (sess_dir / "bookmarks.html", sess_dir / "settings.html"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
     if want_md:
         (out / "index.md").write_text(render_index_md(rows, show_account, has_report, has_codex_report), encoding="utf-8")
 

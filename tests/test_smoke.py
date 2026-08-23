@@ -25,6 +25,33 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "ai_session_viewer.py"
 
 
+def _session_pages(out):
+    """`out/sessions/` 底下的**對話頁**（不含管理頁／設定頁）。
+
+    ⚠ 書籤第 3 期起，`out/sessions/` 的**第一層**多了兩個不是對話頁的檔：
+    `bookmarks.html`（書籤管理頁）與 `settings.html`（設定頁）。
+    舊寫法 `rglob("*.html")[0]` 會隨機挑到它們——形狀斷言就對著一個空殼在跑，
+    而且**錯得很安靜**（那兩頁沒有 `.turn`，所有 `in html` 斷言一起變假）。
+    對話頁一律落在 `<source>/<account>/` 底下 ⇒ 相對路徑至少三段。
+    排序是為了讓 `[0]` 在多頁時是決定性的。
+    """
+    return sorted(p for p in (out / "sessions").rglob("*.html")
+                  if len(p.relative_to(out / "sessions").parts) >= 3)
+
+
+def _page_body(html):
+    """把 `script`／`style` 的內容整段拿掉，只留真正的標記與可見文字。
+
+    ⚠ **凡是「某個字串在頁面上的位置」這類斷言，都要先過這一層。**
+    書籤第 2 期起，session 標題會**再出現一次**——內嵌成頁尾 JS 的 `BK_TITLE`。
+    於是 `html.rindex(<標題裡的字>)` 會指到整頁最後面，
+    `test_acct_separator_and_step_time` 那條「最後一則 INCRONE 在分隔線之前」就此永遠假。
+    那不是產品缺陷，是**斷言掃到了不該掃的區域**。
+
+    `script`／`style` 在 HTML 裡是 raw-text 元素，內容本來就不是標記。"""
+    return re.sub(r"<(script|style)\b[^>]*>.*?</\1\s*>", "", html, flags=re.S | re.I)
+
+
 def _page_dup_ids(html):
     """整頁重複的 HTML `id`（**最高不變量**：重複的話 getElementById 會靜默取第一個）。
 
@@ -35,10 +62,16 @@ def _page_dup_ids(html):
     瀏覽器 `querySelectorAll('[id=FAKEDUP]')` 卻是 0 個——**假陽性**。
     `[^<>]*?` 保證只在同一個標籤開頭之內配對。
 
-    守它的是 `test_durable_anchor` 的素材：那則 assistant 訊息刻意帶兩個
-    `id="IDSCANFAKE"`，**換回純文字掃描這條就會紅**。
+    ⚠ **第二類假陽性：`script`／`style` 是 raw-text 元素。** 頁面 JS 會用字串組 HTML
+    （書籤對話窗整塊都是），於是原始碼裡的 `'<h3 id="bkTitle">'` 長得就像一個標籤開頭，
+    而它在 `bkOpen` 與 `bkPanel` 各出現一次 ⇒ 被判成重複的 id。**那兩處根本不是標籤**，
+    掃之前要先把這兩種元素的內容整段拿掉。
+
+    兩類都各有素材在守：純文字那類是 `test_durable_anchor` 的 `id="IDSCANFAKE"`，
+    raw-text 那類是 `test_bookmark_ui`（那一頁的 JS 真的組了兩次 `id="bkTitle"`）。
+    **換回任何一個舊版，對應那一支就會紅。**
     """
-    ids = re.findall(r'<[a-zA-Z][^<>]*?\sid="([^"]*)"', html)
+    ids = re.findall(r'<[a-zA-Z][^<>]*?\sid="([^"]*)"', _page_body(html))
     return sorted({i for i in ids if ids.count(i) > 1})
 
 
@@ -110,7 +143,7 @@ def test_smoke(tmp_path=None):
     assert "idx_filter_v1" in index and "restoreF" in index, "索引應有篩選狀態記憶（localStorage 還原）"
     assert 'onclick="clearF()"' in index, "索引應有清除篩選按鈕"
 
-    htmls = list((out / "sessions").rglob("*.html"))
+    htmls = list(_session_pages(out))
     assert htmls, "應產生 session HTML"
     assert htmls[0].relative_to(out / "sessions").parts[:2] == ("claude-code", "demo")
     html = htmls[0].read_text(encoding="utf-8")
@@ -230,7 +263,7 @@ def test_search(tmp_path=None):
     assert _conv(out3).returncode == 0
     _append_event("追加訊息MARKA。", "u8", "2026-06-01T01:00:20.000Z")
     assert _conv(out3, "--format", "md").returncode == 0
-    assert list((out3 / "sessions").rglob("*.html")), "過期 .html 應仍在磁碟上（前提）"
+    assert list(_session_pages(out3)), "過期 .html 應仍在磁碟上（前提）"
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "--out", str(out3), "--search", "比較表格"],
         capture_output=True, text=True, encoding="utf-8")
@@ -321,7 +354,7 @@ def test_subagent_inline(tmp_path=None):
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
 
-    html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+    html = [p for p in _session_pages(out)][0].read_text(encoding="utf-8")
     assert "SUBAGENTMARKER" in html, "子代理對話內容應出現在父 session 頁"
     assert 'class="sidechain-wrap"' in html, "應有子代理摺疊區"
     assert "子代理 Explore" in html and "盤點任務" in html, "摺疊標題應含子代理類型與描述"
@@ -337,7 +370,10 @@ def test_subagent_inline(tmp_path=None):
     assert f'id="{ "sub-" + TOOLU }"' in html, "就地子代理框應有對應錨點 id"
 
     index = (out / "index.html").read_text(encoding="utf-8")
-    rows = index.count('<tr data-source')
+    # ⚠ 用 `data-sid=` 當計數依據，不要綁「`<tr` 後面第一個屬性是什麼」——
+    #   書籤第 2 期在 `<tr>` 最前面插了 `data-sid`，原本寫 `'<tr data-source'` 的計數
+    #   當場變成 0（實測）。每一列都有 `data-sid`，而它只出現在資料列上。
+    rows = index.count("<tr data-sid=")
     assert rows == 1, f"子代理不應另列索引，應只有 1 列，實得 {rows}"
     assert "🧩 ×1" in index, "索引標題後應有子代理數量標示 🧩 ×1"
 
@@ -378,7 +414,7 @@ def test_day_divider(tmp_path=None):
          "--no-codex", "--out", str(out)],
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
-    html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+    html = [p for p in _session_pages(out)][0].read_text(encoding="utf-8")
     assert 'class="day-sep"' in html, "跨日應有日期分隔線"
     # 兩天 -> 至少兩條分隔線（起始日 + 換日）
     assert html.count('class="day-sep"') >= 2, "起始日與換日各應有一條分隔線"
@@ -420,7 +456,7 @@ def test_compact_marker(tmp_path=None):
          "--no-codex", "--out", str(out)],
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
-    html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+    html = [p for p in _session_pages(out)][0].read_text(encoding="utf-8")
     assert 'class="compact-sep"' in html, "應在 compact 點插入分隔線"
     assert "手動 /compact" in html, "分隔線應標示手動/自動（此例為手動）"
     assert "→" in html and "tokens" in html, "分隔線應顯示壓縮前→後 token"
@@ -608,7 +644,7 @@ def test_codex_step_badges(tmp_path=None):
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
 
-    htmls = list((out / "sessions").rglob("*.html"))
+    htmls = list(_session_pages(out))
     assert htmls, "應產生 Codex session HTML"
     html = htmls[0].read_text(encoding="utf-8")
     assert "CODEXQMARK" in html and "CODEXDONE" in html, "對話內容應照常呈現"
@@ -680,7 +716,7 @@ def test_session_kind_tags(tmp_path=None):
     assert 'class="chip kind"' in index and ">review</span>" in index, "review 標題旁應有型態徽章"
     assert "r.dataset.kind===k" in index and "k:FK?FK.value:''" in index, "篩選 JS 應納入型態並記憶狀態"
 
-    htmls = {p.name: p.read_text(encoding="utf-8") for p in (out / "sessions").rglob("*.html")}
+    htmls = {p.name: p.read_text(encoding="utf-8") for p in _session_pages(out)}
     page_a = next(v for v in htmls.values() if "REVIEWKINDMARK" in v)
     page_b = next(v for v in htmls.values() if "CHATKINDMARK" in v)
     assert 'class="chip kind"' in page_a and ">review</span>" in page_a, "review session 頁應有型態 chip"
@@ -921,7 +957,7 @@ def test_cold_cause_badges(tmp_path=None):
          "--no-codex", "--out", str(out)],
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
-    html = list((out / "sessions").rglob("*.html"))[0].read_text(encoding="utf-8")
+    html = list(_session_pages(out))[0].read_text(encoding="utf-8")
 
     assert 'class="meter m-cache coldx"' in html, "首呼叫冷啟應為中性灰 coldx（非快取失效）"
     assert 'class="meter m-cache cold"' in html, "提早逐出冷啟應為醒目紅 cold（真失效）"
@@ -1157,7 +1193,7 @@ def test_api_miss_reason(tmp_path=None):
          "--no-codex", "--out", str(out)],
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
-    html = list((out / "sessions").rglob("*.html"))[0].read_text(encoding="utf-8")
+    html = list(_session_pages(out))[0].read_text(encoding="utf-8")
     mdtxt = list((out / "sessions").rglob("*.md"))[0].read_text(encoding="utf-8")
     for needle, msg in {
         'class="meter m-miss"': "應有 API 自報失效徽章",
@@ -1609,7 +1645,7 @@ def test_codex_ai_label(tmp_path=None):
          "--no-claude", "--out", str(out)],
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
-    html = list((out / "sessions").rglob("*.html"))[0].read_text(encoding="utf-8")
+    html = list(_session_pages(out))[0].read_text(encoding="utf-8")
     md = list((out / "sessions").rglob("*.md"))[0].read_text(encoding="utf-8")
     assert "🤖 Codex" in html and "🤖 Claude" not in html, "Codex session HTML 的 AI 應標 Codex 而非 Claude"
     assert "### 🤖 Codex ·" in md, "Codex session MD 回合標頭應標 Codex"
@@ -2063,7 +2099,7 @@ def test_codex_item_completed_user(tmp_path=None):
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
 
-    pages = {p.name: p.read_text(encoding="utf-8") for p in (out / "sessions").rglob("*.html")}
+    pages = {p.name: p.read_text(encoding="utf-8") for p in _session_pages(out)}
     mds = {p.name: p.read_text(encoding="utf-8") for p in (out / "sessions").rglob("*.md")}
 
     def md_of(sid):
@@ -2924,7 +2960,7 @@ def test_acct_separator_and_step_time(tmp_path=None):
              "--no-codex", "--out", str(out)],
             capture_output=True, text=True, encoding="utf-8", env=env)
         assert r.returncode == 0, "非零退出\nSTDOUT:" + r.stdout + "\nSTDERR:" + r.stderr
-        html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+        html = [p for p in _session_pages(out)][0].read_text(encoding="utf-8")
         md = [p for p in (out / "sessions").rglob("*.md")][0].read_text(encoding="utf-8")
         return html, md
 
@@ -3282,8 +3318,11 @@ def test_acct_separator_and_step_time(tmp_path=None):
              "--no-codex", "--out", str(out11)],
             capture_output=True, text=True, encoding="utf-8", env=env11)
         assert r.returncode == 0, "非零退出\nSTDOUT:" + r.stdout + "\nSTDERR:" + r.stderr
-        page = [q for q in (out11 / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
-        return (r.stdout + r.stderr), page
+        page = [q for q in _session_pages(out11)][0].read_text(encoding="utf-8")
+        # ⚠ 一定要去掉 script／style 再做位置比較：session 標題（＝第一則使用者訊息，
+        #   本測試的素材就是「第一則INCRONE。」）自書籤第 2 期起會**再出現一次**在頁尾的
+        #   `BK_TITLE`，`rindex` 會指到那裡，下面三條就永遠是假的。見 `_page_body`。
+        return (r.stdout + r.stderr), _page_body(page)
 
     _, h11a = build11("2026-05-28T10:00:00.700Z")
     assert h11a.index("INCRTWO") < h11a.index('class="acct-sep"') < h11a.index("INCRTHREE"), (
@@ -3896,7 +3935,7 @@ def test_durable_anchor(tmp_path=None):
          "--no-codex", "--out", str(out), "--format", "both"],
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
-    html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+    html = [p for p in _session_pages(out)][0].read_text(encoding="utf-8")
     md = [p for p in (out / "sessions").rglob("*.md")][0].read_text(encoding="utf-8")
 
     base = "k20260723T151411497Z"
@@ -4053,7 +4092,7 @@ def test_anchor_tiebreak_main_vs_side(tmp_path=None):
          "--no-codex", "--out", str(out)],
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
-    html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+    html = [p for p in _session_pages(out)][0].read_text(encoding="utf-8")
 
     def _turn_tag_id(mark):
         pos = -1
@@ -4150,7 +4189,7 @@ def test_anchor_tiebreak_sort_is_load_bearing(tmp_path=None):
          "--no-codex", "--out", str(out)],
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
-    html = [p for p in (out / "sessions").rglob("*.html")][0].read_text(encoding="utf-8")
+    html = [p for p in _session_pages(out)][0].read_text(encoding="utf-8")
 
     def _turn_tag_id(mark):
         pos = -1
@@ -4176,6 +4215,867 @@ def test_anchor_tiebreak_sort_is_load_bearing(tmp_path=None):
     dup = _page_dup_ids(html)
     assert not dup, f"同一頁出現重複的 id：{dup}"
     print("OK: anchor tiebreak sort-is-load-bearing test passed")
+
+
+def test_bookmark_ui(tmp_path=None):
+    """書籤（第 2 期）在**產出的頁面上**的形狀，以及內嵌資料的跳脫。
+
+    ⚠ **這一支只驗形狀，不驗行為。** 真正的行為（存／讀／匯出遮蔽／匯入合併／⏰ 篩選）
+    要用 `python scripts/probe_bookmarks.py --page <某頁>.html` ——那支跑**真 Chrome**，
+    因為書籤這塊踩滿了假 DOM 造不出來的東西（`innerHTML`、`localStorage`、`Blob`、
+    `FileReader`）。⚠ `tests/` 會投影到公開 dist repo，所以這裡不引入 node／Chrome 依賴。
+
+    ⚠⚠ 這裡最重要的一格是 **`</script>` 破出**。標題要內嵌進 `<script>` 當 `BK_TITLE`，
+    不跳脫 `<` 的話一句 `</script>` 就能把整段 JS 截斷——底下所有書籤功能連同錨點跳轉
+    一起死掉，而且**畫面上完全看不出來**。守它的是 `js_embed()`。
+
+    ⚠ **素材必須用 `/rename`，不能用第一則使用者訊息。** 自動標題那條路
+    `first_user_text()` 有一行 `re.sub(r"<[^>]+>", "", txt)` 會先把標籤剝掉，
+    拿它當素材的話 `js_embed()` 根本沒被執行到——**測試會綠，但綠得毫無意義**
+    （第一版就是這樣寫的）。`extract_rename()` **不剝標籤**，那才是真正沒有上游防護的路徑。
+    """
+    sys.path.insert(0, str(ROOT))
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-0000000000bk"
+    hostile = '破出測試</script><script>window.PWNED=1;</script>'
+    evs = [
+        {"type": "user", "uuid": "b1", "parentUuid": None,
+         "timestamp": "2026-08-09T04:05:06.700Z", "cwd": "/x/Proj", "gitBranch": "main",
+         "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": "第一則BKFIRST。"}},
+        # ⚠ /rename 的名稱**不經過剝標籤**（`extract_rename` 只 strip 引號與空白），
+        #   所以它是真正會把敵意字串送進 <script> 的那條路。
+        {"type": "system", "subtype": "local_command", "uuid": "b0r", "parentUuid": "b1",
+         "timestamp": "2026-08-09T04:05:07.000Z", "sessionId": sid,
+         "content": f'Session renamed to: {hostile}'},
+        {"type": "assistant", "uuid": "b2", "parentUuid": "b1",
+         "timestamp": "2026-08-09T04:05:10.000Z", "sessionId": sid,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "mb2",
+                     "usage": {"input_tokens": 80, "output_tokens": 12},
+                     "content": [{"type": "text", "text": "回覆BKSECOND。"}]}},
+        # ⚠ 沒有 timestamp ⇒ 沒有耐久錨點 ⇒ **不該有加書籤鈕**（給了也存不回來）
+        {"type": "user", "uuid": "b3", "parentUuid": "b2", "sessionId": sid,
+         "message": {"role": "user", "content": "沒有時間的一則BKNOTIME。"}},
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={proj.parent}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    page = [p for p in _session_pages(out)][0]
+    html = page.read_text(encoding="utf-8")
+
+    # --- 1. `</script>` 不可以破出 -----------------------------------------
+    # 內嵌處必須是跳脫過的 \u003c/script\u003e，而不是真的 `</script>`。
+    m = re.search(r"BK_TITLE=(.*?), BK_TOWN=", html, re.S)
+    assert m, "頁面裡找不到 BK_TITLE"
+    assert "</script>" not in m.group(1), \
+        f"標題把 </script> 原樣寫進 <script> 了（js_embed 沒生效）：{m.group(1)[:120]}"
+    assert "\\u003c" in m.group(1), f"BK_TITLE 應把 < 跳成 \\u003c，實得 {m.group(1)[:120]}"
+    # 前置：素材真的把敵意字串送到了 BK_TITLE（否則下面兩條在守空氣）
+    assert "PWNED" in m.group(1),         f"素材沒送進 BK_TITLE，這一格在守空氣——實得 {m.group(1)[:120]}"
+    # ⚠ 不能斷言「整頁沒有 window.PWNED」——標題也會被渲染進 <h1>／<title>，
+    #   那裡是 HTML-escape 過的**文字**（`&lt;/script&gt;`），出現是正常的。
+    #   要驗的是那串**未跳脫**的序列在整頁任何地方都不存在。
+    assert "</script><script>window.PWNED" not in html,         "敵意序列以未跳脫的原樣出現在頁面上（＝真的破出了）"
+    # 整份頁面的 <script> 開闔要成對——破出會多出一個關閉標籤
+    assert html.count("<script>") == html.count("</script>"), \
+        f"<script> 開闔不成對：{html.count('<script>')} vs {html.count('</script>')}"
+
+    # --- 2. 每輪標頭的加書籤鈕 ---------------------------------------------
+    def _head_of(mark):
+        pos = html.index(mark)
+        j = html.rfind('<div class="turn', 0, pos)
+        assert j >= 0, f"{mark} 不在任何 .turn 裡"
+        return html[j:html.index('<div class="body"', j)]
+
+    for mark in ("BKFIRST", "BKSECOND"):
+        head = _head_of(mark)
+        assert 'class="bmk"' in head, f"{mark} 這一輪的標頭應有加書籤鈕"
+        assert "data-k=\"k" in head, f"{mark} 的加書籤鈕要帶 data-k（耐久錨點）"
+        assert "bkOpen(this.getAttribute(" in head, f"{mark} 的加書籤鈕要呼叫 bkOpen"
+    # ⚠ 沒有耐久錨點的那一輪**不可以**有加書籤鈕：身分是 sid+錨點，沒錨點就存不回來。
+    #   給了一顆按不出結果的鈕，比沒有鈕更糟。
+    assert 'class="bmk"' not in _head_of("BKNOTIME"), \
+        "沒有耐久錨點的回合不該有加書籤鈕（存了也找不回來）"
+    assert 'class="alink"' not in _head_of("BKNOTIME"), "同上：# 連結也不該有（既有規則）"
+
+    # --- 3. 對話窗骨架與內嵌身分 -------------------------------------------
+    for frag, why in (
+        ('<div class="bm-modal" id="bkModal"', "書籤對話窗外層"),
+        ('id="bkCard"', "對話窗內容容器（內容由 JS 填，建置期不可能知道書籤）"),
+        ('id="bkbtn"', "頂列的書籤鈕"),
+        ("var BK_KEY='asv_bm_v1'", "localStorage 的鍵"),
+        ("function bkExport(", "匯出（**必須和存檔鈕同一批出貨**）"),
+        ("function bkImport(", "匯入"),
+        ("function bkAddMonths(", "複查日期（月份不可溢位）"),
+        (".bmk{", "加書籤鈕的樣式"),
+        (".bm-chip{", "單選 chip 的樣式（⚠ 不是下拉：Will 2026-08-22）"),
+    ):
+        assert frag in html, f"缺少{why}：`{frag}`"
+    assert f'var BK_SID="{sid}"' in html, "BK_SID 應填成這一場的 session id"
+    assert "var BK_FALLBACK='6m'" in html, "提醒複查的預設值應為半年（Will 2026-08-22 裁決）"
+    # ⚠ 書籤記錄裡的 url 是**相對 out/ 的**：檔名含本地時間＋專案名，絕對路徑一旦寫進
+    #   匯出的 JSON 就會帶著 `C:\\Users\\<名字>\\` 出門。
+    mu = re.search(r'var BK_SID=.*?, BK_URL="([^"]*)"', html)
+    assert mu, "頁面裡找不到 BK_URL"
+    assert mu.group(1).startswith("sessions/"), f"BK_URL 應相對 out/，實得 {mu.group(1)!r}"
+    assert ":" not in mu.group(1) and not mu.group(1).startswith("/"), \
+        f"BK_URL 不可以是絕對路徑，實得 {mu.group(1)!r}"
+
+    # --- 3b. 索引頁的書籤圖示（Will 2026-08-22 追加）------------------------
+    # ⚠ 一樣**只驗形狀**。行為（有書籤才亮、⏰、篩選、不可注入）用
+    #   `python scripts/probe_bookmarks.py --index out/index.html`（真 Chrome，6 組 17 項）。
+    # ⚠ 這一段**不需要升 RENDERER_VERSION**：index.html 每次執行都無條件重產，
+    #   不受 manifest 版本閘管（那個閘只管 session 頁）。
+    idx = (out / "index.html").read_text(encoding="utf-8")
+    assert f'data-sid="{sid}"' in idx, "索引列要帶 session id（圖示唯一的依據）"
+    assert 'data-bm="0"' in idx, "索引列要有 data-bm 供「只看有書籤的」篩選用"
+    for frag, why in (
+        ("function bkIndexMark(", "索引頁的書籤標記函式"),
+        ('id="fb"', "「只看有書籤的」勾選框"),
+        ('id="fbwrap"', "那顆勾選框的外層（一場書籤都沒有時要藏起來）"),
+        (".bmflag{", "圖示的樣式"),
+        ("r.dataset.bm==='1'", "篩選要接進既有的 af()，不可以另做一套顯示邏輯"),
+    ):
+        assert frag in idx, f"索引頁缺少{why}：`{frag}`"
+    assert _page_dup_ids(idx) == [], f"索引頁出現重複的 id：{_page_dup_ids(idx)}"
+
+    # --- 4. 不可以打壞第 0＋1 期既有的東西（回歸）--------------------------
+    assert '<span class="tanchor" id="t1">' in html, "t{n} 錨點仍要在（全文搜尋靠它）"
+    assert 'class="alink"' in html and "這一輪的直達連結" in html, "# 直達連結仍要在"
+    dup = _page_dup_ids(html)
+    assert not dup, f"同一頁出現重複的 id：{dup}"
+    print("OK: bookmark UI (phase 2) shape test passed")
+
+def test_bookmark_manage_pages(tmp_path=None):
+    """書籤管理頁與設定頁（第 3 期）的**形狀**，以及三頁共用核心的契約。
+
+    ⚠ **這一支只驗形狀，不驗行為。** 行為（篩選／搜尋／排序／改名連動／刪除復原／
+    以 sid 重算檔名）要用真 Chrome：
+        python scripts/probe_bookmarks.py --manage out/sessions/bookmarks.html
+        python scripts/probe_bookmarks.py --settings out/sessions/settings.html
+    ⚠ `tests/` 會投影到公開 dist repo，所以這裡不引入 node／Chrome 依賴。
+
+    ⚠⚠ 這裡最重要的兩格：
+    1. **`</script>` 破出**——管理頁把**每一場的標題**烤進 `BX_SESS`。標題是對話內容，
+       一句 `</script>` 就能截斷整段 JS，而畫面上完全看不出來。守它的是 `js_embed()`。
+       （素材必須用 `/rename`：自動標題那條路 `first_user_text()` 會先剝標籤，
+       拿它當素材等於沒測到——第 2 期就是這樣寫錯過一次。）
+    2. **管理頁的相對路徑真的走得到**——`BK_MGR` 的層數算錯是無聲的：
+       頁面照樣產得出來，只是那個連結 404。這裡用 `Path.resolve()` 實際解一次，
+       不是比字串。
+    """
+    sys.path.insert(0, str(ROOT))
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-0000000000m3"
+    hostile = '管理頁破出</script><script>window.PWNED3=1;</script>'
+    evs = [
+        {"type": "user", "uuid": "m1", "parentUuid": None,
+         "timestamp": "2026-08-09T04:05:06.700Z", "cwd": "/x/Proj", "gitBranch": "main",
+         "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": "第一則MGFIRST。"}},
+        # ⚠ /rename 的名稱不經過剝標籤，是真正會把敵意字串送進 <script> 的那條路。
+        {"type": "system", "subtype": "local_command", "uuid": "m0r", "parentUuid": "m1",
+         "timestamp": "2026-08-09T04:05:07.000Z", "sessionId": sid,
+         "content": f'Session renamed to: {hostile}'},
+        {"type": "assistant", "uuid": "m2", "parentUuid": "m1",
+         "timestamp": "2026-08-09T04:05:10.000Z", "sessionId": sid,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "mm2",
+                     "usage": {"input_tokens": 80, "output_tokens": 12},
+                     "content": [{"type": "text", "text": "回覆MGSECOND。"}]}},
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+    argv = [sys.executable, str(SCRIPT), "--claude-source", f"demo={proj.parent}",
+            "--no-codex", "--out", str(out)]
+    r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+
+    mgr_p = out / "sessions" / "bookmarks.html"
+    set_p = out / "sessions" / "settings.html"
+
+    # --- 1. 位置：⚠ 一定要在 out/sessions/ 底下，不是 out/ 根 -----------------
+    # session 頁在 out/sessions/<source>/<account>/*.html，管理頁放根目錄就差三層
+    # ——那是全域最遠的一對，也是 file:// origin 規則最可能出問題的地方。
+    assert mgr_p.exists(), f"書籤管理頁應產在 {mgr_p}"
+    assert set_p.exists(), f"設定頁應產在 {set_p}"
+    assert not (out / "bookmarks.html").exists(), "⚠ 管理頁不可以放 out/ 根（見提案〈B〉）"
+    assert not (out / "settings.html").exists(), "⚠ 設定頁不可以放 out/ 根"
+    mgr = mgr_p.read_text(encoding="utf-8")
+    st = set_p.read_text(encoding="utf-8")
+    page_p = _session_pages(out)[0]
+    page = page_p.read_text(encoding="utf-8")
+    idx = (out / "index.html").read_text(encoding="utf-8")
+
+    # --- 2. 三頁共用核心的契約（缺一項那一頁就會壞，而且壞得很安靜）---------
+    # core 用到 lsGet/lsSet、BK_MGR，並要求各頁自己定義 bkRefresh。
+    for name, html, need_modal in (("session 頁", page, True), ("管理頁", mgr, True),
+                                   ("設定頁", st, False)):
+        assert "function lsGet(" in html and "function lsSet(" in html, \
+            f"{name}缺 lsGet/lsSet——core 全部的存取都靠它們"
+        assert "var BK_MGR=" in html, f"{name}缺 BK_MGR（bkFoot 的管理頁連結靠它）"
+        assert "function bkRefresh(" in html, f"{name}缺 bkRefresh——core 改完資料沒有人重畫"
+        assert "var BK_KEY='asv_bm_v1'" in html, f"{name}沒有內嵌書籤核心"
+        assert 'id="bkMsg"' in html, f"{name}缺訊息列（bkFoot 產的，bkSay 寫在那裡）"
+        # ⚠ 設定頁**刻意沒有**對話窗：它只整理類別、不編輯單筆書籤。
+        assert (('id="bkModal"' in html) is need_modal), \
+            f"{name}的對話窗有無不符預期（need_modal={need_modal}）"
+        assert _page_dup_ids(html) == [], f"{name}出現重複的 id：{_page_dup_ids(html)}"
+
+    # --- 3. ⚠⚠ `</script>` 不可以破出（管理頁把每一場的標題烤進 BX_SESS）-----
+    m = re.search(r"var BX_SESS=(.*)", mgr)
+    assert m, "管理頁裡找不到 BX_SESS"
+    baked = m.group(1)
+    assert "PWNED3" in baked, f"素材沒送進 BX_SESS，這一格在守空氣——{baked[:120]}"
+    assert "</script>" not in baked, f"標題把 </script> 原樣寫進 <script> 了：{baked[:160]}"
+    assert "\\u003c" in baked, f"BX_SESS 應把 < 跳成 \\u003c，實得 {baked[:160]}"
+    assert "</script><script>window.PWNED3" not in mgr, "敵意序列以未跳脫的原樣出現（＝真的破出了）"
+    assert mgr.count("<script>") == mgr.count("</script>"), \
+        f"管理頁 <script> 開闔不成對：{mgr.count('<script>')} vs {mgr.count('</script>')}"
+    assert st.count("<script>") == st.count("</script>"), "設定頁 <script> 開闔不成對"
+
+    # --- 4. 烤進去的反查表：相對 out/、不可以有絕對路徑 ----------------------
+    # ⚠ 這一頁**沒有** fetch 可用（file:// 下 Chrome 擋 XHR），所以反查表只能在建置期烤進來。
+    sess_map = json.loads(re.search(r"var BX_SESS=(\{.*?\});\s*$", mgr, re.M).group(1)
+                          .replace("\\u003c", "<").replace("\\u003e", ">"))
+    assert sid in sess_map, f"BX_SESS 應含這一場的 session id，實得 {list(sess_map)[:3]}"
+    u = sess_map[sid]["u"]
+    assert u.startswith("sessions/"), f"BX_SESS 的路徑應相對 out/，實得 {u!r}"
+    assert ":" not in u and not u.startswith("/"), f"不可以是絕對路徑，實得 {u!r}"
+    assert (out / u).exists(), f"BX_SESS 指的檔案要真的在：{out / u}"
+    assert "C:\\" not in mgr and "C:/" not in mgr, "管理頁不可以出現絕對路徑"
+
+    # --- 5. ⚠ 相對路徑真的走得到（層數算錯是無聲的：頁面照產，連結 404）------
+    mgr_href = re.search(r'var BK_MGR="([^"]*)"', page).group(1)
+    assert (page_p.parent / mgr_href).resolve() == mgr_p.resolve(), \
+        f"session 頁的 BK_MGR({mgr_href!r}) 解不到管理頁：{(page_p.parent / mgr_href).resolve()}"
+    assert (mgr_p.parent / "settings.html").resolve() == set_p.resolve()
+    assert 'href="../index.html"' in mgr, "管理頁要能回索引"
+    assert 'href="bookmarks.html"' in st, "設定頁要能回管理頁"
+    # 索引頁的入口：⚠ 無條件出現。書籤在 localStorage 裡，建置期不知道有沒有；
+    # 「有書籤才顯示」的話，第一次要找管理頁的人就永遠找不到。
+    assert 'href="sessions/bookmarks.html"' in idx, "索引頁要有書籤管理頁的入口"
+
+    # --- 6. 管理頁與設定頁的骨架 -------------------------------------------
+    for frag, why in (
+        ('id="bxList"', "書籤清單（內容由 JS 填，建置期不可能知道書籤）"),
+        ('id="bxDue"', "⚠ 「⏰ 只看該複查的」篩選（Will 明講一定要有）"),
+        ('id="bxCats"', "類別篩選 chip"),
+        ('id="bxQ"', "搜尋框"),
+        ('id="bxSorts"', "排序"),
+        ("function bxRender(", "重畫整份清單"),
+        ("function bkSafeRel(", "⚠ 匯入檔的怪路徑不可以變成連結"),
+    ):
+        assert frag in mgr, f"管理頁缺少{why}：`{frag}`"
+    for frag, why in (
+        ('id="bsSpans"', "「提醒我複查」的預設值（chip）"),
+        ('id="bsCats"', "類別管理清單"),
+        ("function bsRenCommit(", "⚠ 改名要連動所有用到它的書籤"),
+        ("function bsDel(", "刪除"),
+        ("function bsUndoCat(", "⚠ 刪除要可復原（不跳 confirm）"),
+        ("function bsMove(", "排序"),
+        ("function bkExport(", "⚠ 設定也要進匯出（只在 localStorage 裡＝清一次就沒了）"),
+    ):
+        assert frag in st, f"設定頁缺少{why}：`{frag}`"
+    assert "<select" not in mgr and "<select" not in st, \
+        "⚠ 不要下拉（Will：「下拉使用上比較不方便」）——單選一律用 chip"
+
+    # --- 7. session 頁的類別改成 chip（不可以還留著 datalist）---------------
+    assert 'id="bkCats"' in page, "加書籤對話窗的類別 chip 容器"
+    assert "bkCatNew(" in page and "＋ 新類別" in page.replace("\\uff0b", "＋"), \
+        "⚠ 要有「＋ 新類別」就地新增（不可以退化成只能從設定頁選）"
+    assert "list=\"bkCats\"" not in page and "<datalist" not in page, \
+        "⚠ 第 2 期的 datalist 要整個拿掉，不可以兩套控制項並存"
+
+    # --- 8. 再建一次：兩頁要還在，且既有 session 頁要沿用 -------------------
+    # ⚠⚠ **這一格證明的是「重建兩次之後兩頁還在」，不是「清孤兒檔那段不會吃掉它們」。**
+    #    清孤兒檔在 `if not filtering:` 裡面，而 `filtering` 只要有 `--claude-source`
+    #    或 `--no-codex` 任一個就是 True ⇒ **這裡它一次都不會執行**。
+    #    那個推論改由 `test_bookmark_link_durability` 第 3 節直接驗述詞。
+    #    （不寫清楚的話，下一個人會以為這一格涵蓋了孤兒清理——那是空心的。）
+    r2 = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
+    assert r2.returncode == 0, f"第二次建置非零退出\n{r2.stdout}\n{r2.stderr}"
+    assert mgr_p.exists() and set_p.exists(), "⚠ 重建之後管理頁／設定頁被清孤兒檔那一段吃掉了"
+    assert "沿用 1" in r2.stdout, f"第二次應沿用既有 session 頁：{r2.stdout}"
+
+    # --- 9. `--format md` 不該產這兩頁（它們是 HTML 專屬的）-----------------
+    out2 = tmp / "out-md"
+    r3 = subprocess.run(argv[:-1] + [str(out2), "--format", "md"],
+                        capture_output=True, text=True, encoding="utf-8")
+    assert r3.returncode == 0, f"md 模式非零退出\n{r3.stdout}\n{r3.stderr}"
+    assert not (out2 / "sessions" / "bookmarks.html").exists(), "--format md 不該產管理頁"
+    assert not (out2 / "sessions" / "settings.html").exists(), "--format md 不該產設定頁"
+    # --- 9b. ⚠ 既有目錄切成 md：**留著的兩頁會帶著過期的 BX_SESS** ------------
+    # 之後某場檔名變了而該次是純 md 全量建置時，孤兒清理會刪掉舊 .html、又不會產新的
+    # ⇒ 管理頁生出一條指向**已刪檔案**的連結，而不是誠實的「⚠ 對不到檔案」。
+    # 比照 cache-report.* 那段：不重產就刪掉。
+    assert mgr_p.exists() and set_p.exists(), "前提：這個 out 目錄本來有這兩頁"
+    r4 = subprocess.run(argv + ["--format", "md"],
+                        capture_output=True, text=True, encoding="utf-8")
+    assert r4.returncode == 0, f"md 模式非零退出\n{r4.stdout}\n{r4.stderr}"
+    assert not mgr_p.exists(), "⚠ 切成 md 之後不可以留著一份過期的管理頁"
+    assert not set_p.exists(), "⚠ 切成 md 之後不可以留著一份過期的設定頁"
+    print("OK: bookmark manage/settings pages (phase 3) shape test passed")
+
+
+def test_bookmark_link_durability(tmp_path=None):
+    """書籤管理頁**算得出檔名**的三個保證（整條線的核心主張）。
+
+    書籤的身分是 `session_id + 錨點`，記錄裡的 `url` 只是快取——因為輸出檔名是
+    **本地時間＋專案名＋帳號名**組出來的，專案改名或機器換時區就全變。
+    管理頁因此每次都拿 sid 重算檔名。這一支守的就是那個「重算」在三種情況下都還成立：
+
+    1. **改了專案名** → 同一個 sid 對到新檔名（沒有這一格，整套設計的理由就沒人在守）
+    2. **renderer 升版後跑縮範圍建置** → 不可以把沒涵蓋到的那些講成「不在這次的輸出裡」
+    3. **清孤兒檔那段掃不到這兩頁**（直接驗述詞，見下面的說明）
+    """
+    sys.path.insert(0, str(ROOT))
+    import ai_session_viewer as asv
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    root = tmp / "projects"
+    out = tmp / "out"
+    ids = {"Alpha": "00000000-0000-4000-8000-0000000aaaa1",
+           "Beta": "00000000-0000-4000-8000-0000000bbbb1"}
+
+    def mk(proj, sid, day):
+        p = root / proj
+        p.mkdir(parents=True, exist_ok=True)
+        evs = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "timestamp": f"2026-08-0{day}T04:05:06.700Z", "cwd": f"/x/{proj}",
+             "gitBranch": "main", "version": "2.1.150", "sessionId": sid,
+             "message": {"role": "user", "content": f"{proj} 的訊息內容夠長。" * 3}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "timestamp": f"2026-08-0{day}T04:05:10.000Z", "sessionId": sid,
+             "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "m1",
+                         "usage": {"input_tokens": 80, "output_tokens": 12},
+                         "content": [{"type": "text", "text": "回覆。"}]}}]
+        (p / f"{sid}.jsonl").write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+
+    def build(*extra):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--claude-source", f"demo={root}",
+             "--no-codex", "--out", str(out)] + list(extra),
+            capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, f"非零退出\n{r.stdout}\n{r.stderr}"
+        return r
+
+    def bx():
+        """讀管理頁烤進去的 sid → 檔名反查表。"""
+        mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+        m = re.search(r"var BX_SESS=(\{.*?\});\s*$", mgr, re.M)
+        assert m, "管理頁裡找不到 BX_SESS"
+        return json.loads(m.group(1).replace("\\u003c", "<").replace("\\u003e", ">"))
+
+    mk("Alpha", ids["Alpha"], 1)
+    mk("Beta", ids["Beta"], 2)
+    build()
+    first = bx()
+    assert set(first) == set(ids.values()), f"兩場都要在表裡，實得 {list(first)}"
+
+    # --- 1. ⭐ 改了專案名，同一個 sid 要對到**新的**檔名 --------------------
+    # 這是整條線最核心的那句話：「檔名會變，所以身分不綁檔名」。
+    # ⚠ 真正的「改專案名」是**夾名與 cwd 一起變**——顯示名是從 `cwd` 推出來的
+    #   （`build_project_names`），只改夾名的話檔名根本不會動，這一格就會在守空氣。
+    #   第一版就是那樣寫的，被下面那條「檔名真的變了嗎」擋下來。
+    (root / "Alpha").rename(root / "Alpha-renamed")
+    jf = root / "Alpha-renamed" / f"{ids['Alpha']}.jsonl"
+    jf.write_text(jf.read_text(encoding="utf-8").replace('"/x/Alpha"', '"/x/Alpha-renamed"'),
+                  encoding="utf-8")
+    build()
+    after = bx()
+    a = ids["Alpha"]
+    assert a in after, "改名之後那一場應該還在表裡（sid 沒變）"
+    # ⚠ 前提：檔名**真的**變了。不驗這一格的話，下一格可能是在守空氣。
+    assert after[a]["u"] != first[a]["u"], \
+        f"專案改名後檔名應該不同，兩次都是 {after[a]['u']}——這一格在守空氣"
+    assert "Alpha-renamed" in after[a]["u"], f"新檔名應含新專案名，實得 {after[a]['u']}"
+    assert (out / after[a]["u"]).exists(), f"新檔名要指到真的存在的檔：{after[a]['u']}"
+
+    # --- 2. ⚠⚠ renderer 升版 ＋ 縮範圍建置，不可以把還在的檔講成「不在輸出裡」---
+    # `load_manifest` 在版本不符時回空字典（那是對的：快取的 row 內容可能過時），
+    # 於是 `rows` 只剩本次掃到的那幾場。但**檔名與標題不隨 renderer 改變**，
+    # 所以管理頁另外走 `load_manifest_paths()` 把它們補回來。
+    mf = out / asv.MANIFEST_NAME
+    d = json.loads(mf.read_text(encoding="utf-8"))
+    d["renderer_version"] = -1                       # 模擬升版：manifest 一律被視為過期
+    mf.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    build("--project", "Beta")                       # 只涵蓋 Beta
+    scoped = bx()
+    assert set(scoped) == set(ids.values()), \
+        f"⚠ 縮範圍建置不可以把沒涵蓋到的 session 從表裡砍掉，實得 {list(scoped)}"
+    for sid, v in scoped.items():
+        assert (out / v["u"]).exists(), f"表裡的每一筆都要指到真的存在的檔：{v['u']}"
+
+    # --- 2b. 但檔案真的不見了就**不可以**還留在表裡（補進來的那批要對帳）------
+    gone = out / scoped[a]["u"]
+    gone.unlink()
+    build("--project", "Beta")
+    assert a not in bx(), "⚠ manifest 有紀錄但檔案已不在時，不可以把死連結烤進表裡"
+
+    # --- 3. 清孤兒檔那段掃不到這兩頁（**直接驗述詞**）------------------------
+    # ⚠⚠ 端到端測不到這件事：清孤兒檔在 `if not filtering:` 裡面，而 `filtering`
+    #    只要有 `--claude-source` / `--no-codex` 任一個就是 True ⇒ 測試裡它**一次都不會執行**
+    #    （要讓它跑就得不給任何來源旗標，那會去掃使用者真正的 ~/.claude，測試絕不可以）。
+    #    所以這裡驗的是那段程式的**述詞**：守衛是 `rel.parts[0] in scanned_source_dirs`，
+    #    而 `scanned_source_dirs` 只會是 `safe_name(<source_kind>, 24)`。
+    for name in ("bookmarks.html", "settings.html"):
+        p = out / "sessions" / name
+        assert p.exists(), f"{name} 應該在 out/sessions/ 底下"
+        parts = p.relative_to(out / "sessions").parts
+        assert len(parts) == 1, f"{name} 不在 sessions/ 第一層，parts={parts}"
+        for kind in (asv.SOURCE_CLAUDE, asv.SOURCE_CODEX):
+            assert parts[0] != asv.safe_name(kind, 24), \
+                f"⚠ {name} 和來源夾名撞名（{kind}）⇒ 會被清孤兒檔那段砍掉"
+    print("OK: bookmark link durability (rename / stale manifest / orphan sweep) test passed")
+
+
+def test_bookmark_codex_title_masked(tmp_path=None):
+    """⚠ **Codex 的標題一律當成「不是使用者取的」**（`BK_TOWN=0`）。
+
+    「只匯書籤」那份的遮蔽規則是：**使用者自己取的名字才留著**，其餘一律視為對話內容。
+    Claude 那條路的 `extract_rename` 讀的是 `/rename` 事件，那確實是使用者動作；
+    Codex 這邊 `s.rename` 來自 `session_index.jsonl` 的 `thread_name`——
+    那只是索引檔的一個欄位，**不是使用者動作的證據**。
+
+    實查本機語料（2026-08-22）：唯一一筆 `thread_name` 是
+    `Codex Companion Task: You are running a TOOLING PROBE, not a`
+    ——明顯是從對話內容截出來的 60 字。**遮蔽是隱私保證，證據不足時從嚴。**
+
+    ⚠ 這一支只驗 `BK_TOWN`（遮蔽用的旗標），**不驗 `s.rename`**：
+    後者還管畫面上的 ✎ 標記與索引頁，那部分行為刻意不動。
+    """
+    sys.path.insert(0, str(ROOT))
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    sroot = tmp / "codex" / "sessions" / "2026" / "08" / "01"
+    sroot.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-00000000cdx1"
+    # Codex 的 thread_name：形狀比照本機實查到的那一筆（從對話內容截出來的）
+    (tmp / "codex" / "session_index.jsonl").write_text(
+        json.dumps({"id": sid, "thread_name": "Codex Companion Task: 這是從對話內容截出來的"},
+                   ensure_ascii=False) + "\n", encoding="utf-8")
+    evs = [
+        {"timestamp": "2026-08-01T04:05:06.700Z",
+         "type": "session_meta",
+         "payload": {"id": sid, "cwd": "/x/Proj", "originator": "codex_cli_rs"}},
+        {"timestamp": "2026-08-01T04:05:07.000Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "CDXFIRST 第一則。"}},
+        {"timestamp": "2026-08-01T04:05:10.000Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "CDXSECOND 回覆。"}},
+    ]
+    (sroot / f"rollout-2026-08-01T04-05-06-{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--codex-source", f"cx={tmp / 'codex' / 'sessions'}",
+         "--no-claude", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\n{r.stdout}\n{r.stderr}"
+    pages = _session_pages(out)
+    assert pages, f"沒產出 Codex session 頁\n{r.stdout}\n{r.stderr}"
+    html = pages[0].read_text(encoding="utf-8")
+    # 前提：這一場真的被 thread_name 命名了（否則下面那格在守空氣）
+    assert "Codex Companion Task" in html, \
+        "素材沒讓 thread_name 生效，這一格在守空氣"
+    m = re.search(r"BK_TOWN=(\d)", html)
+    assert m, "頁面裡找不到 BK_TOWN"
+    assert m.group(1) == "0", \
+        f"⚠ Codex 的標題不可以被當成「使用者自己取的」（BK_TOWN={m.group(1)}）——" \
+        "「只匯書籤」那份會因此帶著由對話內容生成的標題出門"
+    print("OK: codex title is masked in redacted export test passed")
+
+
+def test_bookmark_deleted_source_pruned(tmp_path=None):
+    """⚠⚠ **明確來源裡被刪掉的 session，不可以永遠留在書籤管理頁的反查表裡。**
+
+    任何縮範圍旗標（這裡是 `--claude-source`）都會讓 `filtering=True`：整份舊 manifest
+    原封不動沿用、孤兒檔也不清 ⇒ 舊 HTML 還躺在磁碟上 ⇒ 管理頁的 fallback 每次都把
+    那一場再烤回 `BX_SESS`，對著一場**已經刪掉的對話**說「在這次的輸出裡」並給連結。
+
+    ⚠ 這一支要驗三件事，缺一件就會變成空心：
+      ①**素材真的生效過**（第一次建置時兩場都在表裡）——否則第二次「不在」毫無意義；
+      ②刪掉來源檔、用**同一個來源**重建之後，那一場從 `BX_SESS` 消失；
+      ③**沒被刪的那一場還在**（不然「整張表都清掉」也會通過）。
+    ⚠ 還要驗**範圍外的來源不受影響**：`prune_gone_sources` 只對本次掃過的根動手，
+      這是它保守的那一半，沒有測就等於沒有那個限制。
+    """
+    sys.path.insert(0, str(ROOT))
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+
+    def _mk(sid, mark, ts):
+        evs = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "timestamp": ts, "cwd": "/x/Proj", "gitBranch": "main",
+             "version": "2.1.150", "sessionId": sid,
+             "message": {"role": "user", "content": f"{mark} 第一則。"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "timestamp": ts, "sessionId": sid,
+             "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "m1",
+                         "usage": {"input_tokens": 10, "output_tokens": 5},
+                         "content": [{"type": "text", "text": f"{mark} 回覆。"}]}},
+        ]
+        f = proj / f"{sid}.jsonl"
+        f.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in evs),
+                     encoding="utf-8")
+        return f
+
+    sid_a = "00000000-0000-4000-8000-0000000000a1"
+    sid_b = "00000000-0000-4000-8000-0000000000b1"
+    fa = _mk(sid_a, "ALPHA", "2026-08-01T01:00:00.000Z")
+    _mk(sid_b, "BETA", "2026-08-01T02:00:00.000Z")
+    out = tmp / "out"
+    cmd = [sys.executable, str(SCRIPT), "--claude-source", f"demo={proj.parent}",
+           "--no-codex", "--out", str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"第一次建置非零退出\n{r.stdout}\n{r.stderr}"
+    mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+    # ① 前置：兩場都真的進了反查表（不然下面在守空氣）
+    assert sid_a in mgr and sid_b in mgr, \
+        f"素材沒生效：第一次建置的 BX_SESS 就沒有兩場，這一格在守空氣"
+
+    fa.unlink()                       # 來源被刪掉（使用者清掉了那場對話）
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"第二次建置非零退出\n{r.stdout}\n{r.stderr}"
+    mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+    # ② 被刪掉的那一場不可以還在表裡
+    assert sid_a not in mgr, \
+        "⚠ 來源已刪除的 session 仍留在 BX_SESS——管理頁會對著一場不存在的對話給連結"
+    # ③ 沒被刪的那一場還在（否則「整張表清空」也會通過）
+    assert sid_b in mgr, "把還在的那一場也清掉了——對帳對過頭了"
+
+    # ④ 範圍外的來源不受影響：換一個**沒有被掃到**的來源根重建，
+    #    manifest 裡屬於 demo 那個根的紀錄要原封不動留著。
+    # ⚠⚠ **這一格原本是空心的**（`bookmarks-fix1-fam` 突變檢驗抓到）：
+    #    `sid_b` 的 JSONL 本來就還在磁碟上，所以就算 `prune_gone_sources` 完全不管
+    #    `roots`（＝只要檔案不在就對掉），它照樣留得下來 ⇒ 把那個保守限制整個拿掉
+    #    測試仍然全綠。要讓它承重，範圍外那一場的來源檔**必須也是不在的**——
+    #    這樣「留著」就只可能來自「不在本次掃過的根底下」這條規則。
+    fb_path = proj / f"{sid_b}.jsonl"
+    fb_path.unlink()                  # 模擬那顆磁碟沒掛上／那個來源這次不可見
+    other = tmp / "other" / "projects" / "p"
+    other.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"oth={other.parent}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"第三次建置非零退出\n{r.stdout}\n{r.stderr}"
+    mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+    assert sid_b in mgr, \
+        "⚠ 掃了別的來源根，卻把範圍外那一場對掉了——`prune` 只該碰本次掃過的根"
+    print("OK: deleted source pruned from BX_SESS test passed")
+
+
+def test_bookmark_account_label_rebuild(tmp_path=None):
+    """⚠⚠ **帳號標籤變了就一定要重建**——`BX_SESS` 不可以繼續指到舊帳號目錄。
+
+    輸出路徑是 `<來源>/<帳號>/<檔名>`，而 `reusable` 用的 `sig` **只看檔案內容**。
+    同一份 JSONL 換一個 `--claude-source 標籤=路徑` 重跑時，若 `reusable` 不比帳號標籤，
+    舊 row 會被整個沿用 ⇒ 頁面留在**舊的帳號目錄**下，書籤管理頁的反查表與索引頁
+    也跟著指到那裡（跨模型 `bookmarks-codex` Medium#5 的 [推論] 那半）。
+
+    ⚠ 這一支的存在理由：`bookmarks-fix1-fam` 那一輪證明過 `reusable` 裡
+    `row.get("account","") == (acc_name or "")` **真的在做事**（拿掉它 `BX_SESS` 會指到
+    舊帳號目錄），但當時**整份 `test_smoke.py` 拿掉它仍然全綠**——那是一條確定存在的空心。
+
+    ⚠ 兩件都要驗，缺一件就沒有承重：
+      ①**素材真的生效過**（第一次建置時反查表指的是 `demo/`）；
+      ②換標籤重建後指到 `other/`。只驗②的話，「反查表永遠指到最後一次的標籤」
+        這種假象（例如整份重建）也會通過，但那不是這裡要守的東西——
+        所以①要明確寫出「第一次是 demo」。
+    ⚠ **舊的 `demo/` 那一頁還留在磁碟上**（縮範圍建置不清孤兒檔，
+      `SCOPE-BOOKMARK-PRUNED-ORPHAN-FILES`）⇒ 不可以用「檔案在不在」當斷言，
+      那一格恆真。要看的是 `BX_SESS` 裡的 `u`。
+    """
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-0000000000d1"
+    evs = [
+        {"type": "user", "uuid": "u1", "parentUuid": None,
+         "timestamp": "2026-08-01T01:00:00.000Z", "cwd": "/x/Proj", "gitBranch": "main",
+         "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": "DELTA 第一則。"}},
+        {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+         "timestamp": "2026-08-01T01:00:00.000Z", "sessionId": sid,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "m1",
+                     "usage": {"input_tokens": 10, "output_tokens": 5},
+                     "content": [{"type": "text", "text": "DELTA 回覆。"}]}},
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+
+    def _u(label):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--claude-source", f"{label}={proj.parent}",
+             "--no-codex", "--out", str(out)],
+            capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, f"`{label}` 建置非零退出\n{r.stdout}\n{r.stderr}"
+        mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+        m = re.search(r"var BX_SESS=(\{.*?\});", mgr, re.S)
+        assert m, "管理頁裡讀不到 BX_SESS（渲染器的形狀變了？）"
+        table = json.loads(m.group(1))
+        assert sid in table, f"素材沒生效：`{label}` 建置後 BX_SESS 裡沒有這一場"
+        return table[sid]["u"]
+
+    # ① 素材真的生效過：第一次的反查表指的是 demo/
+    u1 = _u("demo")
+    assert "/demo/" in u1, f"素材沒生效：第一次建置就不在 demo/ 底下（u={u1}）"
+    # ② 換標籤重建 → 指到 other/
+    u2 = _u("other")
+    assert "/other/" in u2, \
+        ("⚠ 換了 `--claude-source` 的帳號標籤，BX_SESS 還指著舊帳號目錄"
+         f"（u={u2}）——`reusable` 沒有把帳號標籤算進去")
+    print("OK: account label change rebuilds and BX_SESS follows test passed")
+
+
+def test_bookmark_all_sources_deleted(tmp_path=None):
+    """⚠⚠ **來源被刪到「一場都不剩」時也要對帳。**
+
+    `main()` 裡的 `if not files: … return` 位在 `prune_gone_sources()` **之前**，
+    所以最極端的那一格反而不會執行：舊 manifest、書籤管理頁的 `BX_SESS`、索引頁
+    全部原封不動留著，連結指向已經不存在的檔。
+    （`bookmarks-fix1` Medium#6；`test_bookmark_deleted_source_pruned` 只做
+    「兩場刪成一場」，2→0 那一格一直沒有素材走到 ⇒ 教訓 29。）
+
+    ⚠ 同時要驗**反過來的保守面**：一個來源根都沒掃到時（`--no-claude --no-codex`）
+    **什麼都不要動**——那不是「東西被刪了」，是「這次沒有去看」。
+    """
+    sys.path.insert(0, str(ROOT))
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "demo-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-0000000000c1"
+    evs = [
+        {"type": "user", "uuid": "u1", "parentUuid": None,
+         "timestamp": "2026-08-01T01:00:00.000Z", "cwd": "/x/Proj", "gitBranch": "main",
+         "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": "GAMMA 第一則。"}},
+        {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+         "timestamp": "2026-08-01T01:00:00.000Z", "sessionId": sid,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "m1",
+                     "usage": {"input_tokens": 10, "output_tokens": 5},
+                     "content": [{"type": "text", "text": "GAMMA 回覆。"}]}},
+    ]
+    f = proj / f"{sid}.jsonl"
+    f.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+    cmd = [sys.executable, str(SCRIPT), "--claude-source", f"demo={proj.parent}",
+           "--no-codex", "--out", str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"第一次建置非零退出\n{r.stdout}\n{r.stderr}"
+    mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+    # ① 素材真的生效過
+    assert sid in mgr, "素材沒生效：第一次建置就沒進 BX_SESS，這一支在守空氣"
+
+    # ② 刪到一場不剩，用**同一個來源**重建 → 反查表要清乾淨
+    f.unlink()
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"零場建置非零退出\n{r.stdout}\n{r.stderr}"
+    mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+    assert sid not in mgr, \
+        "⚠ 來源掉到零場時 BX_SESS 沒有對帳——管理頁會對著一場不存在的對話給連結"
+
+    # ③ 保守面：一個來源根都沒掃到時什麼都不要動
+    f.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0
+    mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+    assert sid in mgr, "重建之後那一場應該回來了"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--no-claude", "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"no-source 建置非零退出\n{r.stdout}\n{r.stderr}"
+    mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+    assert sid in mgr, \
+        "⚠ 一個來源根都沒掃到就把紀錄清掉了——那不是『東西被刪了』，是『這次沒有去看』"
+    print("OK: all sources deleted reconciles BX_SESS test passed")
+
+
+def test_zero_scan_keeps_out_of_scope_index(tmp_path=None):
+    """⚠⚠ **零場對帳那條路不可以把 `index.html` 寫成空表。**
+
+    「零場也要對帳」那個分支把 manifest 對帳做對了（範圍外的 row 留著、`BX_SESS`
+    的 fallback 也留著），但索引頁寫的是 `render_index_html([], …)`——**寫死的空 rows**。
+    正常路徑用的是 `new_entries` 算出來的 rows，縮範圍時本來就會把範圍外那些一起畫。
+    兩條路不一致的結果是：manifest 說有一場、`BX_SESS` 還指著它、HTML 檔還在磁碟上，
+    **只有索引頁說一場都沒有**（收斂確認輪 High）。
+    ⚠ 改之前這裡是直接 `return`、索引不會被動到，所以這是「零場也要對帳」那批**新造出來的**。
+
+    ⚠ 三件都要驗：
+      ①**素材真的生效過**（A＋B 兩場都在索引裡）；
+      ②B 的來源刪光、用**同一個 B**重建（走零場那條路）之後，A 還在索引裡；
+      ③B 不在了（不然「整份原封不動」也會通過）。
+    """
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+
+    def _mk(root, sid, mark, ts):
+        root.mkdir(parents=True, exist_ok=True)
+        evs = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "timestamp": ts, "cwd": "/x/Proj", "gitBranch": "main",
+             "version": "2.1.150", "sessionId": sid,
+             "message": {"role": "user", "content": f"{mark} 第一則。"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "timestamp": ts, "sessionId": sid,
+             "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "m1",
+                         "usage": {"input_tokens": 10, "output_tokens": 5},
+                         "content": [{"type": "text", "text": f"{mark} 回覆。"}]}},
+        ]
+        f = root / f"{sid}.jsonl"
+        f.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in evs),
+                     encoding="utf-8")
+        return f
+
+    proj_a = tmp / "srcA" / "projects" / "pa"
+    proj_b = tmp / "srcB" / "projects" / "pb"
+    _mk(proj_a, "00000000-0000-4000-8000-0000000000e1", "EPSILON", "2026-08-01T01:00:00.000Z")
+    fb = _mk(proj_b, "00000000-0000-4000-8000-0000000000e2", "ZETA", "2026-08-01T02:00:00.000Z")
+    out = tmp / "out"
+
+    def _build(label, root):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--claude-source", f"{label}={root}",
+             "--no-codex", "--out", str(out)],
+            capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, f"`{label}` 建置非零退出\n{r.stdout}\n{r.stderr}"
+        return r
+
+    _build("a", proj_a.parent)
+    _build("b", proj_b.parent)
+    idx = (out / "index.html").read_text(encoding="utf-8")
+    # ① 素材真的生效過
+    assert "EPSILON" in idx and "ZETA" in idx, \
+        "素材沒生效：兩場建完索引裡就沒有兩場，這一支在守空氣"
+
+    fb.unlink()                       # B 的來源刪光 → 下一次 B 的建置會走「零場」那條路
+    r = _build("b", proj_b.parent)
+    assert "沒有找到任何 session 檔" in r.stdout, \
+        f"沒有走到零場那條路，這一支測到的不是要測的東西\n{r.stdout}"
+    idx = (out / "index.html").read_text(encoding="utf-8")
+    # ② 範圍外那一場還在索引裡
+    assert "EPSILON" in idx, \
+        ("⚠ 零場建置把索引寫成空表——範圍外、檔案還在、manifest 還記著的 session "
+         "從索引消失了（manifest 與 BX_SESS 都還指著它）")
+    # ③ 被刪掉的那一場不在（否則「整份原封不動」也會通過）
+    assert "ZETA" not in idx, "來源已刪除的那一場還留在索引裡"
+    print("OK: zero-scan build keeps out-of-scope rows in index test passed")
+
+
+def test_zero_scan_keeps_cache_report_links(tmp_path=None):
+    """⚠⚠ **零場對帳那條路也不可以寫死 `cache_report=False, codex_report=False`。**
+
+    上一條（`test_zero_scan_keeps_out_of_scope_index`）修好的是同一個呼叫的**第一個**參數
+    （rows 改從 `new_entries` 算）；第三、四個參數當時還是寫死的 `False, False`
+    ⇒ 零場建置之後 `cache-report.html` / `cache-hypotheses.html` **檔案都還在磁碟上**，
+    索引頁卻不再連到它們。**和上一條是同一個形狀**（用寫死的值取代對帳出來的狀態），
+    只是換到隔壁兩個參數（`bookmarks-fix2-fam-r2` 驗收找到的）。
+
+    ⚠ 這一支只守「連結還在」這一件事（教訓 37：一格只守一件事）。
+    ⚠ 前置要驗：素材真的產得出報告，否則兩次都是 False 也會通過。
+    """
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    projects = _build_fixture(tmp / "srcA")          # 這份假語料會產出快取報告
+    proj_b = tmp / "srcB" / "projects" / "pb"
+    proj_b.mkdir(parents=True, exist_ok=True)
+    sid_b = "00000000-0000-4000-8000-0000000000f2"
+    evs = [
+        {"type": "user", "uuid": "u1", "parentUuid": None,
+         "timestamp": "2026-08-01T02:00:00.000Z", "cwd": "/x/Proj", "gitBranch": "main",
+         "version": "2.1.150", "sessionId": sid_b,
+         "message": {"role": "user", "content": "ETA 第一則。"}},
+        {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+         "timestamp": "2026-08-01T02:00:00.000Z", "sessionId": sid_b,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "m1",
+                     "usage": {"input_tokens": 10, "output_tokens": 5},
+                     "content": [{"type": "text", "text": "ETA 回覆。"}]}},
+    ]
+    fb = proj_b / f"{sid_b}.jsonl"
+    fb.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+
+    def _build(label, root):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--claude-source", f"{label}={root}",
+             "--no-codex", "--out", str(out)],
+            capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, f"`{label}` 建置非零退出\n{r.stdout}\n{r.stderr}"
+        return r
+
+    _build("a", projects)
+    _build("b", proj_b.parent)
+    idx = (out / "index.html").read_text(encoding="utf-8")
+    # 前置：素材真的產得出報告，而且索引真的連著它
+    assert (out / "cache-report.html").exists(), "素材沒生效：這份假語料沒產出快取報告"
+    assert "cache-report.html" in idx, "素材沒生效：兩場建完索引就沒連到報告，這一支在守空氣"
+
+    fb.unlink()
+    r = _build("b", proj_b.parent)
+    assert "沒有找到任何 session 檔" in r.stdout, \
+        f"沒有走到零場那條路，這一支測到的不是要測的東西\n{r.stdout}"
+    idx = (out / "index.html").read_text(encoding="utf-8")
+    assert (out / "cache-report.html").exists(), \
+        "報告檔被零場建置刪掉了（這一支要驗的是連結，不是檔案；檔案沒了代表另有問題）"
+    assert "cache-report.html" in idx, \
+        ("⚠ 零場建置把快取報告的連結拿掉了——檔案還在磁碟上，索引頁卻不連它了"
+         "（`render_index_html` 的第三、四個參數被寫死成 False）")
+    print("OK: zero-scan build keeps cache-report links test passed")
+
+
+def test_no_uppercase_unicode_escape_in_js(tmp_path=None):
+    """⚠⚠ **JS 沒有大寫 U 的跳脫語法**——寫了會原樣顯示在畫面上。
+
+    那四大段書籤 JS 是 Python 的 `r'''...'''` 常數，裡面寫的東西**原樣進 `<script>`**。
+    Python 的 `chr(92)+"U0001f516"` 在非 raw 字串裡是 🔖，在 raw 字串裡卻是十個字元；
+    而 JS 看到它會把反斜線丟掉，於是頁面上出現的是那串**字面**，不是圖示。
+    實際踩到：管理頁連結、頂列書籤鈕、設定頁刪除鈕、索引頁書籤圖示，**四處全中**，
+    而且四支形狀測試與四個模式的探針**沒有一個會紅**（它們比對的是 id 與類別名）。
+
+    ⚠ 這一支掃的是**產出來的頁面**，不是原始碼：真正會被使用者看到的是前者。
+    ⚠ 掃描器要找的字面不可以出現在它自己掃的內容裡 ⇒ 這裡用 `chr(92)` 組出 pattern，
+      而那幾段 JS 的註解也一律寫「大寫 U 的跳脫」、不寫那個字面。
+    """
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    projects = _build_fixture(tmp)
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={projects}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\n{r.stdout}\n{r.stderr}"
+    pat = re.compile(chr(92) * 2 + "U[0-9a-fA-F]{8}")
+    pages = _session_pages(out) + [out / "index.html",
+                                   out / "sessions" / "bookmarks.html",
+                                   out / "sessions" / "settings.html"]
+    # 前置：這幾頁真的都產出來了（少一頁就等於少掃一頁，而那很安靜）
+    assert all(p.exists() for p in pages), \
+        f"少了頁面，掃描範圍不完整：{[str(p) for p in pages if not p.exists()]}"
+    bad = []
+    for p in pages:
+        html = p.read_text(encoding="utf-8")
+        for block in re.findall(r"<script>(.*?)</script>", html, re.S):
+            for hit in pat.findall(block):
+                bad.append(f"{p.name}: {hit}")
+    assert not bad, \
+        "⚠ <script> 裡出現了 JS 不認得的大寫 U 跳脫，畫面上會顯示成那串字面：" + str(bad[:6])
+    # 對照組：那四個圖示要真的以圖示的樣子出現（不然「整段刪掉」也會通過）
+    idx = (out / "index.html").read_text(encoding="utf-8")
+    mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+    assert "\U0001f516" in idx or chr(0x1f516) in idx, "索引頁的書籤圖示不見了"
+    assert chr(0x1f516) in mgr, "管理頁的書籤圖示不見了"
+    print("OK: no uppercase-U escapes inside generated <script> test passed")
 
 
 if __name__ == "__main__":
@@ -4211,3 +5111,13 @@ if __name__ == "__main__":
     test_durable_anchor()
     test_anchor_tiebreak_main_vs_side()
     test_anchor_tiebreak_sort_is_load_bearing()
+    test_bookmark_ui()
+    test_bookmark_manage_pages()
+    test_bookmark_link_durability()
+    test_bookmark_codex_title_masked()
+    test_bookmark_deleted_source_pruned()
+    test_bookmark_account_label_rebuild()
+    test_bookmark_all_sources_deleted()
+    test_zero_scan_keeps_out_of_scope_index()
+    test_zero_scan_keeps_cache_report_links()
+    test_no_uppercase_unicode_escape_in_js()

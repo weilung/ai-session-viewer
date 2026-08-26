@@ -286,7 +286,87 @@ def test_collect_sources_dedupes_same_realpath():
     assert len(viewer.collect_sources([f"real={proj}", f"sym={link}"], "")) == 1
 
 
+def test_command_and_notify_are_escaped():
+    """指令輸出／通知原文／指令名／插話——這批新開的四個注入面都要逸出。
+
+    ⚠⚠ 這一格是 `utf-fam` Medium 補的：逸出**當時就是對的**，
+    但**沒有任何斷言在守**。「現在是對的」和「壞了會被抓到」是兩件事。
+
+    ⚠ 這四個來源都不是使用者打的字，很容易被當成「自己人」而漏掉逸出：
+      · 指令輸出 ＝ 終端文字（`/status`、`/context` 的 stdout）
+      · 通知原文 ＝ 系統注入的 XML
+      · 指令名／參數 ＝ CLI 寫的
+      · 插話 ＝ 走佇列、不是一般 user 事件
+    """
+    XSS = '</script><script>alert(1)</script><img src=x onerror=alert(2)>"'
+    NTAG = "task-" + "notification"
+    tmp = new_tmp()
+    proj = tmp / "projects" / "p"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-4000-8000-0000000000xs".replace("x", "e")
+    base = dict(cwd="/x/P", gitBranch="main", version="2.1.240", sessionId=sid)
+    evs = [
+        dict(type="user", uuid="u1", timestamp="2026-07-26T01:00:00.000Z",
+             message={"role": "user", "content": "正常提問"}, **base),
+        dict(type="assistant", uuid="a1", timestamp="2026-07-26T01:00:05.000Z",
+             message={"role": "assistant", "model": "claude-opus-4-7", "id": "m1",
+                      "usage": {"input_tokens": 5, "output_tokens": 5},
+                      "content": [{"type": "text", "text": "回覆"}]}, **base),
+        # ① 指令名／參數
+        dict(type="user", uuid="u2", timestamp="2026-07-26T01:00:10.000Z",
+             message={"role": "user", "content":
+                      f"<command-name>/{XSS}</command-name>\n"
+                      f"<command-args>{XSS}</command-args>"}, **base),
+        # ② 指令輸出（同一時刻的下一則）
+        dict(type="user", uuid="u3", timestamp="2026-07-26T01:00:10.000Z",
+             message={"role": "user", "content":
+                      f"<local-command-stdout>{XSS}</local-command-stdout>"}, **base),
+        # ③ 通知原文（裸的，會自成一列）
+        dict(type="user", uuid="u4", timestamp="2026-07-26T01:00:20.000Z",
+             message={"role": "user", "content":
+                      f"<{NTAG}>\n<task-id>{XSS}</task-id>\n"
+                      f"<summary>{XSS}</summary>\n<status>completed</status>\n"
+                      f"</{NTAG}>"}, **base),
+        # ④ 中途插話（走佇列）
+        dict(type="attachment", uuid="u5", timestamp="2026-07-26T01:00:06.000Z",
+             attachment={"type": "queued_command", "prompt": XSS,
+                         "commandMode": "prompt", "origin": {"kind": "human"},
+                         "timestamp": "2026-07-26T01:00:06.000Z"}, **base),
+        dict(type="queue-operation", operation="enqueue",
+             timestamp="2026-07-26T01:00:06.000Z", sessionId=sid, content=XSS),
+        dict(type="queue-operation", operation="remove",
+             timestamp="2026-07-26T01:00:07.000Z", sessionId=sid, content=XSS),
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"d={proj.parent}",
+         "--no-codex", "--out", str(out), "--format", "html"],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, r.stdout + r.stderr
+    page = [p for p in (out / "sessions").rglob("*.html")
+            if p.parent.name != "sessions"][0]
+    html = page.read_text(encoding="utf-8")
+    # 這四個注入面都要在頁面上出現（不然這一格什麼都沒驗到），但一律是逸出後的形式
+    # ⚠ 涵蓋率先驗：素材真的走到頁面上了嗎？沒有的話下面每一格都是空的。
+    assert html.count("alert(1)") >= 4, (
+        f"四個注入面沒有都走到頁面上（只出現 {html.count('alert(1)')} 次）"
+        "——這一格什麼都沒驗到")
+    # ⚠⚠ **要驗「危險的形狀」，不是「危險的字面」。**
+    # 逸出之後 `onerror=alert(2)` 這幾個字**照樣會出現**（`&lt;img src=x onerror=alert(2)&gt;`），
+    # 那是無害的文字。第一版斷言寫成「字面不可以出現」，於是**逸出正確也會紅**。
+    assert "<script>alert(1)</script>" not in html, "裸的 <script> 進到頁面了"
+    assert "<img src=x onerror=" not in html, "裸的 <img onerror= 進到頁面了"
+    assert "</script><script>" not in html, "可以截斷內嵌 <script> 區段"
+    # 反面：逸出後的形式必須在（證明上面三格不是因為素材消失才通過）
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html, (
+        "逸出後的形式不見了——素材被整段丟掉的話，上面三格會是假綠")
+    print("OK: command/notify/interject escaping test passed")
+
+
 def main():
+    test_command_and_notify_are_escaped()
     test_md_link_href_is_attribute_escaped()
     test_image_data_uri_is_validated()
     test_missing_text_fields_do_not_crash_grouping()

@@ -58,9 +58,10 @@ HTML 把工具呼叫、思考、子代理對話都做成**可摺疊**區塊，�
 | `--out <路徑>` | 輸出資料夾（預設 `./out`） |
 | `--format html\|md\|both` | 輸出格式（預設 `both`） |
 | `--project <字串>` | 只轉名稱含此字串的專案，例如 `--project Obts` |
-| `--include-empty` | 連同只有 `/指令`、無實際對話的空 session 一起輸出 |
+| `--include-empty` | 連同**完全沒有回合**的空 session 一起輸出。⚠ 只有指令、沒有對話的 session **不算空**（指令現在會畫出來），要處理那種請看 `--archive-command-only` |
 | `--force` | 忽略快取，全部重新產生 |
 | `--open` | 完成後自動打開 `index.html` |
+| `--archive-command-only <目錄>` | 把**只有指令、沒有對話**的 Claude session 的 JSONL **搬到**該目錄（檔名＝`<munged cwd>__<原檔名>`），並刪掉它產生的頁。⚠ **會動到 `~/.claude/projects/`**，詳見〈整理只有指令的 session〉 |
 | `--search "詞…"` | 全文搜尋既有輸出的**對話內容**，產生可點擊跳轉的結果頁（見〈全文搜尋〉）；搭 `--open` 直接打開 |
 
 ## 多帳號 / 多工具來源
@@ -101,6 +102,33 @@ python3 ai_session_viewer.py --no-claude --out ~/codex-logs --open
 
 - 要強制全部重來：加 `--force`。
 - 局部重產（`--project` / `--account` / `--claude-source`）時，不會動到也不會誤刪其他範圍的既有輸出。
+
+## 整理只有指令的 session
+
+開了視窗、設一下 `/model` 或 `/effort`、看個 `/context` 就離開——這種 session 沒有任何對話，
+但指令現在會畫出來，所以它們**不算空**、會出現在索引頁上。
+
+要把它們挪開：
+
+```bash
+py ai_session_viewer.py --archive-command-only D:\path\to\封存目錄
+```
+
+它會把那些 session 的 JSONL **搬到**指定目錄，並刪掉它們產生的 HTML／MD。
+
+⚠⚠ **這是本工具唯一會動到 `out/` 以外檔案的功能，只有明確給了這個參數才會發生**
+（不給就連判定都不做）。動到的是 `~/.claude/projects/`，也就是 **Claude Code 自己**在讀的目錄
+——被搬走的 session **不會再出現在 `claude --resume` 的清單裡**。
+
+怎麼保證不會搬錯、以及搬錯了怎麼救：
+
+- **判準直接讀渲染管線的產物**，所以「會被搬走」的定義就是**「頁面上除了指令列什麼都沒有」**。
+  只要有任何使用者發言、助手回覆、工具呼叫、貼圖，就算對話，不會被搬。
+- **每一筆都記進該目錄的 `_archived.jsonl`**，含**原始絕對路徑**、cwd、帳號、時間、判定理由。
+  還原不必靠人記得檔名怎麼組。
+- 檔名是 `<munged cwd>__<原檔名>.jsonl`（把 cwd 的 `:` `\` `/` 換成 `-`），一眼看得出它本來在哪。
+- 四道安全閘：封存目錄不可以在來源目錄裡面、不可以是來源的上層、不可以在 `out/` 裡面、
+  **絕不覆蓋**同名檔（撞名就略過並保留原檔）。子代理目錄跟著一起搬。
 
 ## 輸出結構
 

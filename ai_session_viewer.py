@@ -1727,8 +1727,21 @@ def first_user_text(events):
     return ""
 
 
-def extract_user_text(ev):
-    content = (ev.get("message") or {}).get("content")
+def content_text(content):
+    """`content`（字串**或 block 陣列**）取純文字：**只收 `type:"text"` 的 block**。
+
+    ⚠⚠ 非文字的 block（圖片）**直接丟掉**，不可以像 `normalize_result()` 那樣
+    `json.dumps` 出來——那會把一坨 base64 當成使用者說的話拿去比對與呈現。
+    CLI 自己就是這樣取的（它內部同一支 helper：挑出 `type=="text"` 的 block、
+    取 `text`、以換行接起來），user 訊息與 `queued_command` 附件共用那一套。
+
+    ⚠ 這一支是從 `extract_user_text()` 抽出來的，因為**同一套規則有第二個呼叫點**
+    （`synth_queued_user_events()` 的 `prompt`，見那支的註解）。各寫一份的話，
+    「哪些 block 算使用者說的話」遲早會分岔。
+
+    範圍限制 `SCOPE-QUEUED-PROMPT-IMAGES`：非文字 block 在這裡就被丟掉，
+    所以下游拿不到圖片。詳見 planning/scope-limits.md
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -1736,6 +1749,10 @@ def extract_user_text(ev):
                  if isinstance(b, dict) and b.get("type") == "text"]
         return "\n".join(p for p in parts if p)
     return ""
+
+
+def extract_user_text(ev):
+    return content_text((ev.get("message") or {}).get("content"))
 
 
 # =========================================================================
@@ -2225,7 +2242,15 @@ def synth_queued_user_events(events):
             continue
         if ((a.get("origin") or {}).get("kind")) != "human":
             continue
-        p = (a.get("prompt") or "").strip()
+        # ⚠⚠ **`prompt` 不一定是字串。** 排隊送出時**貼了圖片**的話，CLI 會把它改寫成
+        # block 陣列：`[{"type":"text","text":<打的字>}, {"type":"image",…}]`
+        # （CLI 只在 `pastedContents` 真的產得出圖片 block 時才走那條，所以本機語料
+        # 588 則 `queued_command` 全是字串、這一格一則都沒驗到——**量到 0 講的是
+        # 這份語料，不是這個欄位的形狀**，教訓 44）。
+        # 舊寫法 `(a.get("prompt") or "").strip()` 遇到 list 直接 `AttributeError`，
+        # 而 `analyze()` 那一層**沒有接** ⇒ 整支工具當場崩掉、**一個頁面都產不出來**
+        # （2026-09-01 同事回報：321 個 session 檔全滅）。
+        p = content_text(a.get("prompt")).strip()
         if p:
             # ⚠⚠ **鍵要帶來源檔。** 只用 prompt 的話，附件在子代理轉錄檔、`remove`
             # 在主檔時會**跨來源配對**，於是主檔憑空多出一句話
@@ -2279,6 +2304,9 @@ def synth_queued_user_events(events):
         # 每個 `remove` 事件就是一次真的送出，一次一則。
         out.append({
             "type": "user",
+            # 範圍限制 `SCOPE-QUEUED-PROMPT-IMAGES`：這一則只帶文字。附件的 `prompt` 是
+            # block 陣列時（排隊送出時貼了圖），圖片 block 不進這裡；只貼圖沒打字的那種
+            # 取出來是空字串，上面就不會走到這裡。詳見 planning/scope-limits.md
             "message": {"role": "user", "content": c},
             "timestamp": e.get("timestamp"),
             "uuid": f"_queued:{e.get('_i')}",
@@ -10767,7 +10795,7 @@ def main():
         return mem_cache[k]
 
     proj_names = build_project_names(files)
-    n_build = n_reuse = n_empty = 0
+    n_build = n_reuse = n_empty = n_broken = 0      # n_broken：壞掉被跳過的來源檔
     for source_kind, acc_name, proj_name, sf in files:
         key = manifest_key(source_kind, sf)
         # Claude 的 transcript 檔名就是 sessionId，切帳號資料據此對應（Codex 無此資料）
@@ -10806,12 +10834,26 @@ def main():
                 s = load_session(sf, proj_name, acc_name, source_kind)
         except Exception as e:
             print(f"  ! 解析失敗 {sf.name}: {e}", file=sys.stderr)
+            n_broken += 1
             continue
         if source_kind == SOURCE_CODEX and not project_matches_filter(s, args.project):
             continue
         if not any(e.get("type") in ("user", "assistant") for e in s.events):
             continue
-        analyze(s, acct_switches)
+        # ⚠⚠ **一場壞掉不可以拖垮整批。** 這一層過去沒有接例外，於是任何一場分析出事
+        # （例：`queued_command.prompt` 是 block 陣列時的 `AttributeError`）就整支停在
+        # 那裡、**一個頁面都產不出來**——2026-09-01 同事回報時是 321 個來源檔全滅。
+        # 形狀刻意和上面那段「解析失敗」同款：印一行到 stderr、跳過這一場、其餘照產。
+        # ⚠ **不可以改成靜默**：這一行訊息加上收尾那個「壞掉跳過 N」是使用者唯一會知道
+        #   「有東西沒被畫出來」的管道；吞掉的話就變成看不見的資料遺失。
+        # ⚠ 例外類別也要印（`{type(e).__name__}`）：`AttributeError` 這種只印訊息時
+        #   （「'list' object has no attribute 'strip'」）看不出是什麼錯。
+        try:
+            analyze(s, acct_switches)
+        except Exception as e:
+            print(f"  ! 分析失敗 {sf.name}: {type(e).__name__}: {e}", file=sys.stderr)
+            n_broken += 1
+            continue
         if s.n_turns == 0 and not args.include_empty:
             n_empty += 1
             continue
@@ -10961,6 +11003,10 @@ def main():
     bits = [f"新建/更新 {n_build}", f"沿用 {n_reuse}"]
     if n_empty:
         bits.append(f"略過空 session {n_empty}")
+    if n_broken:
+        # ⚠ 這一格是**資料遺失的公告**，不是統計：上面每一筆都印過 `!` 訊息，
+        #   但那些會被幾百行輸出捲走，收尾這一行是使用者一定看得到的位置。
+        bits.append(f"壞掉跳過 {n_broken}（見上面的 ! 訊息）")
     if n_mem:
         bits.append(f"memory 頁 {n_mem}")
     if removed:

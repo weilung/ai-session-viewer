@@ -6161,6 +6161,42 @@ def test_user_turn_fidelity(tmp_path=None):
         "⚠⚠ 附件在子代理檔、remove 在主檔，卻在主對話合成出一句話——"
         "配對的鍵一定要帶來源檔")
 
+    # --- ①-f ⚠⚠ **`prompt` 是 block 陣列**：排隊送出時**貼了圖片**的那一種。
+    # 修之前這一格不是「畫錯」，是**整支工具當場崩掉**
+    # （`AttributeError: 'list' object has no attribute 'strip'`——2026-09-01 同事回報，
+    #  321 個 session 檔一個頁面都沒產出）。本機語料 588 則全是字串 ⇒ **只有合成素材守得到**。
+    # ⚠ `queue-operation` 那半**仍然是字串**：CLI 只在佇列項的值是字串時才記 `content`，
+    #   而貼上的圖片是另一欄帶的 ⇒ 文字對得上、這一句補得回來。
+    _IMG = "貼了圖片的排隊句QIMGBLOCK。"
+    _B64 = "iVBORw0KGgoAAAANSUhEUg"
+    _blocks = [
+        _qev(0, "", type="attachment", timestamp="2026-08-25T12:00:00.000Z",
+             attachment={"type": "queued_command",
+                         "prompt": [{"type": "text", "text": _IMG},
+                                    {"type": "image",
+                                     "source": {"type": "base64",
+                                                "media_type": "image/png", "data": _B64}}],
+                         "commandMode": "prompt", "origin": {"kind": "human"},
+                         "imagePasteIds": ["pasteid1"],
+                         "timestamp": "2026-08-25T12:00:00.000Z"}),
+        _qev(1, "", type="queue-operation", operation="remove", content=_IMG,
+             timestamp="2026-08-25T12:00:04.000Z"),
+    ]
+    _gotb = v.synth_queued_user_events(_blocks)
+    assert len(_gotb) == 1, (
+        "⚠⚠ `prompt` 是 block 陣列的排隊句沒有被補回來（實得 "
+        f"{len(_gotb)} 則）——修之前這裡是 AttributeError，整支工具崩在這一行")
+    assert _gotb[0]["message"]["content"] == _IMG, (
+        f"補回來的內容不是使用者打的那句話：{_gotb[0]['message']['content']!r}")
+    assert _gotb[0]["_queued_at"] == "2026-08-25T12:00:00.000Z", (
+        "block 陣列那一則的按 Enter 時刻沒有被記到——`human` 裡根本沒收到它")
+    # ⚠⚠ 取文字**只收 `type:"text"` 的 block**：把非文字 block 也吐出來的話，
+    # 一坨 base64 會被當成使用者說的話拿去比對（配不到）與呈現（畫出亂碼）。
+    assert v.content_text(_blocks[0]["attachment"]["prompt"]) == _IMG, (
+        "⚠⚠ `content_text()` 把非文字 block 也吐出來了——"
+        f"實得 {v.content_text(_blocks[0]['attachment']['prompt'])[:60]!r}")
+    assert _B64 not in _gotb[0]["message"]["content"], "圖片的 base64 漏進了對話內容"
+
     # --- ② 通知文字裡含 `<command-name>`：一定要判成通知，不是指令 --------------
     assert "NOTIFYWINS" in html, "這一則通知沒有被畫出來，下面的斷言就沒有素材"
     _wrong = [b for g in s.main_groups for b in g["blocks"]
@@ -6170,6 +6206,92 @@ def test_user_turn_fidelity(tmp_path=None):
         "`user_special_blocks()` 必須先判通知")
 
     print("OK: user turn fidelity (queued / notify / command) test passed")
+
+
+def test_one_bad_session_does_not_kill_batch(tmp_path=None):
+    """⚠⚠ **一場壞掉不可以拖垮整批**：那一場跳過、其餘照產，而且要出聲。
+
+    2026-09-01 同事回報的真實形狀：`queued_command.prompt` 是 block 陣列時
+    `synth_queued_user_events()` 丟 `AttributeError`，而 `main()` 那一層**沒有接**
+    ⇒ **321 個來源檔一個頁面都沒產出**、退出碼非 0。
+    那個崩潰本身已經修掉（`test_user_turn_fidelity` ①-f 在守），
+    **這一格守的是下一個還沒被發現的崩潰**。
+
+    ⚠⚠ **刻意用「注入例外」而不是找一筆真的會崩的素材**：真素材一旦被修好，
+    這一格就會安靜地不再驗到任何東西、而測試照樣全綠——那正是這個 repo 反覆踩到的
+    假綠形狀。注入的例外不會被修掉。
+
+    三件事一起驗（少一件就不算守住）：
+    ① 退出碼 0、好的那場**真的有產出**；② 壞的那場**沒有**留下半截頁面；
+    ③ **有出聲**——stderr 一行 `! 分析失敗`，收尾一格「壞掉跳過 1」。
+    ⚠ ③ 不是裝飾：把例外整個吞掉也會讓 ①② 全綠，那時使用者拿到的是一份
+      **安靜少一場**的輸出，而他不會知道。
+    """
+    tmp = new_tmp(tmp_path)
+    projects = tmp / "projects" / "demo-proj"
+    projects.mkdir(parents=True, exist_ok=True)
+    out = tmp / "out"
+
+    # ⚠ 兩個 sid 的**前 8 碼必須不同**：頁面檔名只帶前 8 碼，同碼就分不出誰產出了
+    GOOD = "9a11ffff-1111-4111-8111-111111111111"
+    BAD = "9b22ffff-2222-4222-8222-222222222222"
+
+    def write(sid, marker):
+        evs = [
+            {"type": "user", "uuid": "u1", "parentUuid": None, "sessionId": sid,
+             "timestamp": "2026-09-01T05:00:00.000Z", "cwd": "/x/Proj",
+             "gitBranch": "main", "version": "2.1.251",
+             "message": {"role": "user", "content": f"提問{marker}。"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1", "sessionId": sid,
+             "timestamp": "2026-09-01T05:00:05.000Z",
+             "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "m1",
+                         "usage": {"input_tokens": 100, "output_tokens": 10},
+                         "content": [{"type": "text", "text": f"回覆{marker}。"}]}},
+        ]
+        (projects / f"{sid}.jsonl").write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+
+    write(GOOD, "GOODSESSION")
+    write(BAD, "BADSESSION")
+
+    # 在子行程裡把 `analyze` 換成「遇到那一場就丟例外」，其餘照原本走。
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "sys.argv = ['ai_session_viewer.py', '--claude-source', "
+        f"'demo=' + {str(projects.parent)!r}, '--no-codex', '--out', {str(out)!r}]\n"
+        "import ai_session_viewer as v\n"
+        "_orig = v.analyze\n"
+        "def _boom(s, acct=None):\n"
+        f"    if getattr(s, 'session_id', '') == {BAD!r}:\n"
+        "        raise AttributeError(\"'list' object has no attribute 'strip'\")\n"
+        "    return _orig(s, acct)\n"
+        "v.analyze = _boom\n"
+        "v.main()\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+
+    # ① 整批不可以停下來，好的那一場要真的產出
+    assert r.returncode == 0, (
+        "⚠⚠ 一場分析失敗把整支工具帶走了（退出碼 "
+        f"{r.returncode}）——這正是同事回報的形狀。\n{r.stderr[-800:]}")
+    pages = list((out / "sessions").rglob("*.html"))
+    good = [p for p in pages if GOOD[:8] in p.name]
+    bad = [p for p in pages if BAD[:8] in p.name]
+    assert good and "GOODSESSION" in good[0].read_text(encoding="utf-8"), (
+        f"好的那一場沒有產出（實得頁面：{[p.name for p in pages]}）")
+    # ② 壞的那一場不可以留下半截頁面
+    assert not bad, f"壞掉的那一場留下了頁面：{[p.name for p in bad]}"
+
+    # ③ ⚠⚠ 一定要出聲——這一格才是「靜默少一場」與「跳過並告知」的分界
+    assert "分析失敗" in r.stderr and BAD[:8] in r.stderr, (
+        f"壞掉的那一場沒有在 stderr 出聲，實得：{r.stderr[-500:]!r}")
+    assert "壞掉跳過 1" in r.stdout, (
+        "收尾那行沒有公告「壞掉跳過 N」——`!` 訊息會被幾百行輸出捲走，"
+        f"那一格是使用者一定看得到的位置。實得：{r.stdout[-500:]!r}")
+
+    print("OK: one bad session does not kill the batch test passed")
 
 
 def test_archive_command_only(tmp_path=None):
@@ -6671,4 +6793,5 @@ if __name__ == "__main__":
     test_zero_scan_keeps_cache_report_links()
     test_no_uppercase_unicode_escape_in_js()
     test_user_turn_fidelity()
+    test_one_bad_session_does_not_kill_batch()
     test_archive_command_only()

@@ -5594,6 +5594,10 @@ def test_user_turn_fidelity(tmp_path=None):
                "<summary>NOTIFYWINS &lt;command-name&gt;/fake&lt;/command-name&gt;</summary>\n"
                f"<status>completed</status>\n</{NTAG}>")
     T_CMD = "2026-07-24T03:10:00.100Z"      # 指令與其結果**同一時刻**（實測就是如此）
+    # ⚠ 一定要是**真的解得開**的 base64：解不開會畫成「資料無效」佔位，
+    #   而下面那些斷言只看有沒有 `<img>`，會靜靜地驗到另一件事。
+    PNG1X1 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+              "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
     evs = [
         # ③ **第一則就是指令**：`first_user_text()` 必須跳過它去找真正的提問
         {"type": "user", "uuid": "f0", "parentUuid": None,
@@ -5619,9 +5623,19 @@ def test_user_turn_fidelity(tmp_path=None):
                      "usage": {"input_tokens": 100, "output_tokens": 20},
                      "content": [{"type": "text", "text": "正常回覆NORMALREPLY。"}]}},
         # --- ① 排隊送出：真的被 remove 取走 ⇒ 必須畫出來 -----------------------
+        # ⚠⚠ 這一則**帶圖片**（排隊時貼上的），所以 `prompt` 是 block 陣列——真實資料
+        # 就是這個形狀（CLI 只在那則帶得出圖片 block 時才從字串換成陣列）。
+        # ⚠ `queue-operation` 那半仍是字串：CLI 只在佇列項的值是字串時才寫 `content`。
+        # ⚠⚠ 選它當帶圖的那一則是刻意的：**下面「插話沒有推移其他區塊錨點」那一格
+        #    比對的就是這一輪**，圖片走錯路（當成獨立 block）會在那裡變紅。
         {"type": "attachment", "uuid": "f3", "timestamp": "2026-07-24T03:00:07.000Z",
          "sessionId": sid,
-         "attachment": {"type": "queued_command", "prompt": SENT, "commandMode": "prompt",
+         "attachment": {"type": "queued_command",
+                        "prompt": [{"type": "text", "text": SENT},
+                                   {"type": "image", "source": {
+                                       "type": "base64", "media_type": "image/png",
+                                       "data": PNG1X1}}],
+                        "imagePasteIds": ["paste-a"], "commandMode": "prompt",
                         "origin": {"kind": "human"},
                         "timestamp": "2026-07-24T03:00:07.000Z"}},
         {"type": "queue-operation", "operation": "enqueue",
@@ -5828,6 +5842,27 @@ def test_user_turn_fidelity(tmp_path=None):
          "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "mf18",
                      "usage": {"input_tokens": 40, "output_tokens": 10},
                      "content": [{"type": "text", "text": "回第二輪那一句AFTERMID2。"}]}},
+
+        # --- ①-g ⚠⚠ **只貼了圖、一個字都沒打**的排隊句 -------------------------
+        # 修之前它**整則不出現**：文字是空字串 ⇒ 兩道守衛各擋一次（`if p:` 與
+        # `if not c:`）⇒ 使用者真的送出去的東西在頁面上完全沒有痕跡。
+        # CLI 寫的 `prompt` 是「空的 text block ＋ 圖片」，`remove.content` 是**空字串**
+        # （⚠ 不是整欄不見——那是另一回事，配對規則見產品碼註解）。
+        # ⚠⚠ **位置刻意排在整場最後**：放進「插話 → 第一段 → 再下一段」那段素材中間，
+        #   會讓突變 ⑱（B 改成 A）兩種畫法同形 ⇒ 那一格從「抓到」變「漏掉」。
+        #   素材決定走到哪（`notes/突變檢驗.md` §2）。
+        {"type": "attachment", "uuid": "f19", "timestamp": "2026-07-24T03:16:30.000Z",
+         "sessionId": sid,
+         "attachment": {"type": "queued_command",
+                        "prompt": [{"type": "text", "text": ""},
+                                   {"type": "image", "source": {
+                                       "type": "base64", "media_type": "image/png",
+                                       "data": PNG1X1}}],
+                        "imagePasteIds": ["paste-b"], "commandMode": "prompt",
+                        "origin": {"kind": "human"},
+                        "timestamp": "2026-07-24T03:16:30.000Z"}},
+        {"type": "queue-operation", "operation": "remove",
+         "timestamp": "2026-07-24T03:16:35.000Z", "sessionId": sid, "content": ""},
     ]
     (proj / f"{sid}.jsonl").write_text(
         "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
@@ -5837,7 +5872,14 @@ def test_user_turn_fidelity(tmp_path=None):
          "--no-codex", "--out", str(out), "--format", "both"],
         capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
-    page = [p for p in _session_pages(out)][0]
+    # ⚠⚠ **不可以直接 `[0]`。** 分析這一場時丟了例外的話，現在的行為是「印一行、跳過
+    # 這一場」（退出碼仍是 0）⇒ 一個頁面都沒有 ⇒ 死在 `IndexError`，看不出發生什麼事。
+    # 突變檢驗實測過這個形狀：那種紅**不算守衛**（教訓 60）——紅的理由是產品崩了，
+    # 不是它宣稱守的那件事。把 stderr 帶進訊息裡，紅因才看得出來。
+    _pages = list(_session_pages(out))
+    assert _pages, ("這一場沒有產出任何頁面——多半是分析時丟了例外、那一場被跳過了。\n"
+                    f"STDOUT:{r.stdout}\nSTDERR:{r.stderr}")
+    page = _pages[0]
     html = page.read_text(encoding="utf-8")
     md = [p for p in (out / "sessions").rglob("*.md")][0].read_text(encoding="utf-8")
 
@@ -5941,6 +5983,38 @@ def test_user_turn_fidelity(tmp_path=None):
     assert _with == _without, (
         "插話讓其他區塊的錨點位移了——既有區塊書籤會指到別的內容\n"
         f"  有插話: {_with}\n  無插話: {_without}")
+
+    # ⚠⚠ 上面兩格**都驗不到圖片那條路**：拿掉的只有 `_interject` 本身，圖片若被當成
+    # 獨立區塊塞進同一輪，它在「有插話」與「無插話」兩邊都在 ⇒ 兩份錨點照樣相等。
+    # 所以這裡直接查來源：**排隊句貼的圖片不可以出現在這一輪的 `blocks` 裡**，
+    # 它必須待在 `_interject` 自己身上（`imgs`）。變成獨立區塊的話，同一步之後
+    # 每一個 `-b<n>` 都會 +1，既有的區塊書籤安靜指到別的內容。
+    assert not any(b.get("type") == "image" for b in _bl), (
+        "排隊送出時貼的圖片變成了這一輪的獨立區塊——"
+        "它會把同一步之後每個區塊的 -b<n> 往後推")
+    assert any((b.get("imgs") or []) for b in _bl if b.get("type") == "_interject"), (
+        "沒有任何一個插話子框帶著圖片——素材沒建起來，上面那一格什麼都沒驗到")
+
+    # --- ①-f/①-g 端到端：**排隊時貼的圖真的畫出來了**，而且畫在子框裡面 -------
+    # ⚠ 兩張：一張跟著有文字的那一句（f3），一張是只貼圖沒打字的那一則（f3b）。
+    assert html.count('img class="msg-img"') == 2, (
+        "排隊送出時貼的圖片沒有畫出來（或畫了不只兩張）——"
+        f"實得 {html.count('img class=' + chr(34) + 'msg-img' + chr(34))} 張。"
+        "若看到「資料無效／過大／格式不支援」佔位，那是素材的 base64 有問題")
+    # ⚠ 比對的是 `class="img-ph"` 不是 `img-ph`：頁面的 CSS 裡本來就有 `.img-ph` 規則，
+    #   只找後者的話這一格**永遠是紅的**（第一版就是這樣）。
+    assert 'class="img-ph"' not in html, (
+        "圖片畫成了佔位（資料無效／過大／格式不支援），不是真的內嵌——"
+        "這一格若鬆掉，上面那條 `<img>` 計數會驗到另一件事")
+    # ⚠⚠ **圖片必須在 `.ijbody` 之內**：跑到子框外面就代表它變成了獨立的可標記區塊，
+    # 那正是會把同一步後面每個 `-b<n>` 往後推的做法。
+    _ijb = html.find('class="ijbody"')
+    assert _ijb > 0 and 'img class="msg-img"' in html[_ijb:_ijb + 4000], (
+        "圖片沒有畫在插話子框裡面")
+    # MD 那半：`--search` 讀的是它，圖片至少要留下記號
+    assert md.count("_[圖片]_") >= 2, (
+        f"MD 沒有留下圖片記號（實得 {md.count('_[圖片]_')} 個）——"
+        "搜尋與 MD 匯出會看不出這一句帶了圖")
 
     # --- ①-b 真的跨輪的那一種：沒有開著的回合可掛 ⇒ 退回一般 user 回合＋徽章 --
     assert SENT2 in html, "跨輪送達的排隊提示詞一樣要畫出來"
@@ -6186,16 +6260,53 @@ def test_user_turn_fidelity(tmp_path=None):
     assert len(_gotb) == 1, (
         "⚠⚠ `prompt` 是 block 陣列的排隊句沒有被補回來（實得 "
         f"{len(_gotb)} 則）——修之前這裡是 AttributeError，整支工具崩在這一行")
-    assert _gotb[0]["message"]["content"] == _IMG, (
-        f"補回來的內容不是使用者打的那句話：{_gotb[0]['message']['content']!r}")
+    # ⚠ 補出來的內容＝「文字 block ＋ 圖片 block」，和真的 user 事件貼圖時同形。
+    _cb = _gotb[0]["message"]["content"]
+    assert isinstance(_cb, list) and [b.get("type") for b in _cb] == ["text", "image"], (
+        f"帶圖的排隊句應該補成 [文字, 圖片]，實得 {_cb!r}")
+    assert _cb[0]["text"] == _IMG, f"文字那半不對：{_cb[0]!r}"
+    assert _cb[1]["source"]["data"] == _B64, "貼上的圖片沒有被帶進來"
     assert _gotb[0]["_queued_at"] == "2026-08-25T12:00:00.000Z", (
         "block 陣列那一則的按 Enter 時刻沒有被記到——`human` 裡根本沒收到它")
-    # ⚠⚠ 取文字**只收 `type:"text"` 的 block**：把非文字 block 也吐出來的話，
-    # 一坨 base64 會被當成使用者說的話拿去比對（配不到）與呈現（畫出亂碼）。
+    # ⚠⚠ 取**文字**時只收 `type:"text"` 的 block：把非文字 block 也吐出來的話，
+    # 一坨 base64 會被當成使用者說的話拿去和 `remove.content` 比對（配不到）。
     assert v.content_text(_blocks[0]["attachment"]["prompt"]) == _IMG, (
         "⚠⚠ `content_text()` 把非文字 block 也吐出來了——"
         f"實得 {v.content_text(_blocks[0]['attachment']['prompt'])[:60]!r}")
-    assert _B64 not in _gotb[0]["message"]["content"], "圖片的 base64 漏進了對話內容"
+    assert _B64 not in v.content_text(_gotb[0]["message"]["content"]), (
+        "圖片的 base64 被當成文字了")
+
+    # --- ①-g ⚠⚠ **只貼圖、一個字都沒打**：文字是空字串，`remove.content` 也是空字串。
+    # 修之前這一則**整則不出現**（`if p:` 擋掉、`if not c:` 又擋掉一次）。
+    _only = [
+        _qev(0, "", type="attachment", timestamp="2026-08-25T13:00:00.000Z",
+             attachment={"type": "queued_command",
+                         "prompt": [{"type": "text", "text": ""},
+                                    {"type": "image",
+                                     "source": {"type": "base64",
+                                                "media_type": "image/png", "data": _B64}}],
+                         "commandMode": "prompt", "origin": {"kind": "human"},
+                         "imagePasteIds": ["pasteid2"],
+                         "timestamp": "2026-08-25T13:00:00.000Z"}),
+        _qev(1, "", type="queue-operation", operation="remove", content="",
+             timestamp="2026-08-25T13:00:03.000Z"),
+    ]
+    _goto = v.synth_queued_user_events(_only)
+    assert len(_goto) == 1 and [b.get("type") for b in _goto[0]["message"]["content"]] == ["image"], (
+        f"只貼圖沒打字的排隊句沒有被補回來（實得 {_goto!r}）——空文字不代表沒送出東西")
+
+    # ⚠⚠ **`content` 整欄不存在的 `remove` 不可以配上去。** 本機 574 個 `remove` 有
+    # 49 個是這樣（佇列項的值不是字串，CLI 整欄不寫），它們都不是人打的排隊句；
+    # 把「沒有 content」和「content 是空字串」當成同一件事，就會拿沒關係的 remove
+    # 去配一則帶圖的排隊句，憑空畫出一張圖。
+    _nocontent = [
+        _only[0],
+        _qev(1, "", type="queue-operation", operation="remove",
+             timestamp="2026-08-25T13:00:03.000Z"),
+    ]
+    assert v.synth_queued_user_events(_nocontent) == [], (
+        "⚠⚠ `remove` 連 `content` 欄都沒有，卻拿它配了一則排隊句——"
+        "「整欄不存在」和「空字串」是兩件事")
 
     # --- ② 通知文字裡含 `<command-name>`：一定要判成通知，不是指令 --------------
     assert "NOTIFYWINS" in html, "這一則通知沒有被畫出來，下面的斷言就沒有素材"

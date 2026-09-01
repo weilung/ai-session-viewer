@@ -162,7 +162,16 @@ MANIFEST_NAME = ".build-manifest.json"
 #       重複送出會拿到前一次的按 Enter 時刻。
 #    ⑧ `_CTRL_RE` 的範圍補到 `\x9f`（裸的 C1）；指令區塊多帶 `src`（哪一種存法），
 #       那是 `render` 探針的身分，避免兩種存法互相冒領。
-RENDERER_VERSION = 59
+# 59 → 60（2026-09-01）：**排隊送出時貼的圖片也畫出來**。
+#    先前補出來的那一則只帶文字、圖片 block 被丟掉 ⇒ 使用者貼的圖在頁面上不存在；
+#    「只貼圖、一個字都沒打」的那一則甚至**整則不出現**（文字是空的，配不到 `remove`）。
+#    ⚠⚠ **圖片畫在插話子框「裡面」，不另開可標記區塊。** `_interject` 之所以不佔
+#    `-b<n>` 序號，就是為了保住既有區塊書籤（範圍限制 SCOPE-INTERJECT-NO-BLOCK-ANCHOR）；
+#    把圖片當成獨立 block 塞進 `cur["blocks"]` 會讓**同一步之後每個區塊的序號 +1**。
+#    ⚠ 跨輪送達（自成一輪）的那一種走一般 user 回合：圖片是**那一輪自己的新區塊**，
+#    只往後長、不會動到別人的錨點。
+#    ⚠ HTML 與 MD 都變 ⇒ 一定要升（不升的話既有的 `out/` 會靜默沿用舊版）。
+RENDERER_VERSION = 60
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -1739,8 +1748,8 @@ def content_text(content):
     （`synth_queued_user_events()` 的 `prompt`，見那支的註解）。各寫一份的話，
     「哪些 block 算使用者說的話」遲早會分岔。
 
-    範圍限制 `SCOPE-QUEUED-PROMPT-IMAGES`：非文字 block 在這裡就被丟掉，
-    所以下游拿不到圖片。詳見 planning/scope-limits.md
+    ⚠ 這一支**只負責文字**。排隊句裡貼的圖片由 `synth_queued_user_events()`
+    另外從同一個 `prompt` 撈出來（`type:"image"` 的 block），不從這裡走。
     """
     if isinstance(content, str):
         return content
@@ -2233,7 +2242,8 @@ def synth_queued_user_events(events):
     # 132 個沒有對應的真 user 事件、**1 個有而且落在 remove 之後**、sidechain 裡 0 個。
     # ⇒ 重複那一格目前語料命中 0，但結構上會發生（教訓 44），照修；
     #   而「真 user 事件在 remove **之後**」正是那 1 個的形狀 ⇒ 消耗條件用它。
-    human = {}      # prompt -> [按下 Enter 的時刻…]（同一句可以排隊多次，順序保留）
+    # (來源檔, 文字) -> [(按下 Enter 的時刻, 貼上的圖片 blocks)…]（同一句可排多次，順序保留）
+    human = {}
     for e in events:
         if e.get("type") != "attachment":
             continue
@@ -2251,12 +2261,19 @@ def synth_queued_user_events(events):
         # 而 `analyze()` 那一層**沒有接** ⇒ 整支工具當場崩掉、**一個頁面都產不出來**
         # （2026-09-01 同事回報：321 個 session 檔全滅）。
         p = content_text(a.get("prompt")).strip()
-        if p:
+        # ⚠⚠ **圖片要一起帶走。** `prompt` 是 block 陣列時，除了文字還有使用者
+        # **貼上的圖片**（`type:"image"`，base64 就在裡面）。只取文字的話，那些圖在
+        # 頁面上等於不存在——而它們是使用者真的送出去的東西。
+        imgs = [b for b in a["prompt"] if isinstance(b, dict) and b.get("type") == "image"] \
+            if isinstance(a.get("prompt"), list) else []
+        # ⚠ **`or imgs`**：只貼了圖、一個字都沒打的那一則，文字是空字串。
+        #   沒有這一半的話它連進都進不來，整則靜靜消失（那正是這個功能要修的失效模式）。
+        if p or imgs:
             # ⚠⚠ **鍵要帶來源檔。** 只用 prompt 的話，附件在子代理轉錄檔、`remove`
             # 在主檔時會**跨來源配對**，於是主檔憑空多出一句話
             # （`utf-fix-codex-r2` 實測 `QUEUED cross_source: count=1 src=['main.jsonl']`）。
             human.setdefault((e.get("_srcf") or "", p), []).append(
-                a.get("timestamp") or e.get("timestamp"))
+                (a.get("timestamp") or e.get("timestamp"), imgs))
     if not human:
         return []
     # ⚠⚠ **比對前要先 `clean_user_text()`。** CLI 常在使用者訊息後面接
@@ -2273,16 +2290,23 @@ def synth_queued_user_events(events):
     for e in events:
         if e.get("type") != "queue-operation" or e.get("operation") != "remove":
             continue
-        c = e.get("content")
-        c = c.strip() if isinstance(c, str) else ""
+        raw_c = e.get("content")
+        c = raw_c.strip() if isinstance(raw_c, str) else ""
         hkey = (e.get("_srcf") or "", c)
-        if not c or hkey not in human:
+        # ⚠⚠ **`content` 整欄不存在 ≠ `content` 是空字串**，這兩件事一定要分開。
+        # CLI 寫的是 `typeof value === "string" ? value : undefined`：佇列項的值不是
+        # 字串時**整欄不寫**（本機 574 個 `remove` 有 49 個是這樣，而且都不是人打的
+        # 排隊句）。那些一律不配對——沒有可比的文字，配上去就是猜的。
+        # 空字串則相反：它是「只貼了圖、沒打字」那一則的正常長相，而且只有在
+        # `human` 裡真的有一筆同來源、空文字、**帶圖**的排隊句時才配得上（上面那段
+        # 只在 `p or imgs` 時才建鍵），所以放行的範圍是被結構卡住的。
+        if not isinstance(raw_c, str) or hkey not in human:
             continue
         # ⚠⚠ **每一個對得上的 `remove` 都要消耗一個 attachment 時刻**，
         # 不管它最後是由合成事件還是由真 user 事件呈現。舊版只在「真的合成」時才前進，
         # 於是「第一次被真 user 代表、第二次才合成」的那一句拿到**第一次**的按 Enter 時刻
         # （`utf-fix-codex-r2` 實測 `queued_at=['…10:00:01Z']`，實際是 `10:00:10`）。
-        queued_at = _take_queued_at(human, used, hkey)
+        queued_at, queued_imgs = _take_queued_at(human, used, hkey)
         # ⚠⚠ **只消耗「同一個來源檔、而且排在這個 remove 之後」的真 user 事件。**
         # 那是實測到的唯一形狀（撤回後又重送：真事件寫在 remove 後面）。
         # 用「整場有沒有出現過」的話，**排在前面的**那一次會把後面這次排隊句吃掉，
@@ -2304,10 +2328,11 @@ def synth_queued_user_events(events):
         # 每個 `remove` 事件就是一次真的送出，一次一則。
         out.append({
             "type": "user",
-            # 範圍限制 `SCOPE-QUEUED-PROMPT-IMAGES`：這一則只帶文字。附件的 `prompt` 是
-            # block 陣列時（排隊送出時貼了圖），圖片 block 不進這裡；只貼圖沒打字的那種
-            # 取出來是空字串，上面就不會走到這裡。詳見 planning/scope-limits.md
-            "message": {"role": "user", "content": c},
+            # ⚠⚠ **沒有圖片時維持字串**，不要一律包成 block 陣列：那會讓**所有**既有的
+            # 排隊句改走另一條呈現路徑，等於為了新功能動到已經審過的舊行為。
+            # 有圖片才換成 `[文字, 圖片…]`——那正是真的 user 事件貼圖時的長相，
+            # 下游（呈現、MD、搜尋、封存分類）本來就都認得它。
+            "message": {"role": "user", "content": _queued_content(c, queued_imgs)},
             "timestamp": e.get("timestamp"),
             "uuid": f"_queued:{e.get('_i')}",
             # ⚠⚠ **不可以硬寫 `False`。** 排隊句也可能發生在子代理的轉錄檔裡，
@@ -2325,8 +2350,22 @@ def synth_queued_user_events(events):
     return out
 
 
+def _queued_content(text, imgs):
+    """補出來的那一則 user 事件的 `message.content`。
+
+    ⚠ 沒有圖片時**回原本的字串**（不是只有一個 text block 的陣列）：
+    兩種在呈現上等價，但換掉的話**每一則既有的排隊句**都改走另一條路徑，
+    為了新功能動到舊行為是不划算的交換。
+    ⚠ 文字是空的（只貼圖沒打字）就不放空的 text block——空文字不是可呈現區塊，
+    留著只會在下游多一個要判空的東西。
+    """
+    if not imgs:
+        return text
+    return ([{"type": "text", "text": text}] if text else []) + list(imgs)
+
+
 def _take_queued_at(human, used, key):
-    """取這一句**這一次**送出所對應的「按下 Enter 的時刻」，逐次往後走。
+    """取這一句**這一次**送出的 `(按下 Enter 的時刻, 貼上的圖片 blocks)`，逐次往後走。
 
     `key` 是 `(來源檔, prompt)`——**來源檔一定要在鍵裡面**，否則子代理的附件會被
     主檔的 `remove` 配走。
@@ -2338,7 +2377,7 @@ def _take_queued_at(human, used, key):
     """
     ts = human.get(key) or []
     if not ts:
-        return None
+        return None, []
     i = used.get(key, 0)
     used[key] = i + 1
     return ts[i] if i < len(ts) else ts[-1]
@@ -2544,6 +2583,12 @@ def group_turns(events, per_step=True, step_by_usage=False):
                     "type": "_interject",
                     "text": "\n".join(str(b.get("text") or "") for b in blocks
                                       if b.get("type") == "text"),
+                    # ⚠⚠ **圖片掛在這個 block 自己身上，不另外進 `cur["blocks"]`。**
+                    # `_interject` 在 `block_is_renderable()` 回 False ＝ 不佔 `-b<n>`；
+                    # 圖片跟著它走才保得住那條保證。當成獨立 block 塞進去的話，
+                    # **同一步之後每一個區塊的序號 +1**，既有的區塊書籤會安靜指到別的內容
+                    # （`utf-fam` High#3 實測過的失敗方向）。
+                    "imgs": [b for b in blocks if b.get("type") == "image"],
                     "dt": e.get("_dt"),
                     "queued_at": e.get("_queued_at"),
                     # ⚠⚠ **這一句是在那一輪「結束之後」才被讀到的**（前面已經有
@@ -4215,6 +4260,8 @@ def render_interject_html(b):
     what = "這一輪結束後才讀到" if b.get("after_turn") else "中途插話"
     head = f"👤 你 · {what}" + (f" · {esc(qs)} 送出" if qs else "")
     body = md_to_html(clean_user_text(b.get("text") or ""))
+    # 貼在這一句裡的圖片：畫在子框**內**，和文字同一格（見 `group_turns` 那段註解）
+    body += "".join(render_image_block(im) for im in (b.get("imgs") or []))
     return (f'<div class="ijbox"><div class="ijhead">{esc(head)}'
             f'<span class="ijwhen" title="送出後排隊，這一刻才被讀到">{esc(when)} 讀到</span>'
             f'</div><div class="ijbody">{body}</div></div>')
@@ -6626,7 +6673,10 @@ def render_turn_md(group, tmap, ai="Claude"):
             _what = "這一輪結束後才讀到" if b.get("after_turn") else "中途插話"
             _lbl = f"👤 你 · {_what}" + (f"（{local_str(_q, '%H:%M:%S')} 送出）" if _q else "")
             _txt = clean_user_text(b.get("text") or "")
-            parts.append(f"> **{_lbl}**\n>\n" + "\n".join("> " + ln for ln in _txt.splitlines()))
+            # ⚠ 圖片在 MD 用和一般 image block 同一個記號 `_[圖片]_`：兩處各寫一種的話，
+            #   讀 MD 的人會以為那是兩種不同的東西。
+            _lines = _txt.splitlines() + ["_[圖片]_"] * len(b.get("imgs") or [])
+            parts.append(f"> **{_lbl}**\n>\n" + "\n".join("> " + ln for ln in _lines))
         elif t == "_notify":
             lead = b.get("summary") or ""
             st = _NOTIFY_STATUS_LABEL.get(b.get("status") or "", b.get("status") or "")

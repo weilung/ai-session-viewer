@@ -336,6 +336,21 @@ def test_command_and_notify_are_escaped():
              timestamp="2026-07-26T01:00:06.000Z", sessionId=sid, content=XSS),
         dict(type="queue-operation", operation="remove",
              timestamp="2026-07-26T01:00:07.000Z", sessionId=sid, content=XSS),
+        # ⑤ 排隊句裡**貼的圖片**：`media_type` 是新開的注入面——不支援的型別會被
+        #    原樣寫進「格式不支援內嵌」那句佔位文字裡。
+        dict(type="attachment", uuid="u6", timestamp="2026-07-26T01:00:30.000Z",
+             attachment={"type": "queued_command",
+                         "prompt": [{"type": "text", "text": "帶圖的排隊句IMGQ。"},
+                                    {"type": "image",
+                                     "source": {"type": "base64",
+                                                "media_type": f"image/{XSS}",
+                                                "data": "AAAA"}}],
+                         "imagePasteIds": ["pid1"], "commandMode": "prompt",
+                         "origin": {"kind": "human"},
+                         "timestamp": "2026-07-26T01:00:30.000Z"}, **base),
+        dict(type="queue-operation", operation="remove",
+             timestamp="2026-07-26T01:00:31.000Z", sessionId=sid,
+             content="帶圖的排隊句IMGQ。"),
     ]
     (proj / f"{sid}.jsonl").write_text(
         "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
@@ -348,10 +363,10 @@ def test_command_and_notify_are_escaped():
     page = [p for p in (out / "sessions").rglob("*.html")
             if p.parent.name != "sessions"][0]
     html = page.read_text(encoding="utf-8")
-    # 這四個注入面都要在頁面上出現（不然這一格什麼都沒驗到），但一律是逸出後的形式
+    # 這五個注入面都要在頁面上出現（不然這一格什麼都沒驗到），但一律是逸出後的形式
     # ⚠ 涵蓋率先驗：素材真的走到頁面上了嗎？沒有的話下面每一格都是空的。
-    assert html.count("alert(1)") >= 4, (
-        f"四個注入面沒有都走到頁面上（只出現 {html.count('alert(1)')} 次）"
+    assert html.count("alert(1)") >= 5, (
+        f"五個注入面沒有都走到頁面上（只出現 {html.count('alert(1)')} 次）"
         "——這一格什麼都沒驗到")
     # ⚠⚠ **要驗「危險的形狀」，不是「危險的字面」。**
     # 逸出之後 `onerror=alert(2)` 這幾個字**照樣會出現**（`&lt;img src=x onerror=alert(2)&gt;`），

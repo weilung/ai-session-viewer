@@ -6308,6 +6308,80 @@ def test_user_turn_fidelity(tmp_path=None):
         "⚠⚠ `remove` 連 `content` 欄都沒有，卻拿它配了一則排隊句——"
         "「整欄不存在」和「空字串」是兩件事")
 
+    # --- ①-h ⚠⚠ **崩潰不可以被換成靜默**：`prompt` 形狀認不得時要出聲 ---------
+    # 修掉 `AttributeError` 之後，`prompt` 漂成 dict／數字／list of str 時三條路都回空
+    # ⇒ 這一則排隊句連 `human` 都進不去、頁面上又變回「答案在、問題不在」。
+    # ⚠ Codex 那一側有 13 條這種漂移哨兵，Claude 這一側先前一條都沒有（`qimg-fam` Medium#4）。
+    import contextlib as _ctx
+    for _bad_prompt, _tag in (({"text": "hi"}, "dict"), (42, "int"), (["hi"], "list of str"),
+                              # ⚠ `type` 對得上、但 `text` 欄搬走了（`qimg-fix-codex` Medium#4）
+                              ([{"type": "text", "content": "lost"}], "text 欄搬走")):
+        _ev = [
+            _qev(0, "", type="attachment", timestamp="2026-08-25T14:00:00.000Z",
+                 attachment={"type": "queued_command", "prompt": _bad_prompt,
+                             "commandMode": "prompt", "origin": {"kind": "human"},
+                             "timestamp": "2026-08-25T14:00:00.000Z"}),
+            _qev(1, "", type="queue-operation", operation="remove", content="隨便",
+                 timestamp="2026-08-25T14:00:03.000Z"),
+        ]
+        _buf = io.StringIO()
+        with _ctx.redirect_stderr(_buf):
+            v.synth_queued_user_events(_ev, "fake.jsonl")
+        assert "形狀認不得" in _buf.getvalue(), (
+            f"`prompt` 是 {_tag} 時整則被靜默丟掉、沒有任何哨兵出聲——"
+            f"崩潰換成靜默是更糟的失效。實得：{_buf.getvalue()!r}")
+
+    # --- ①-i ⚠⚠ `remove` 比 attachment 多時：時刻可以沿用，**圖片不可以** ------
+    # 沿用是為了「不要整句不畫」；但那一筆帶著圖，照抄的話同一張使用者只貼過一次的圖
+    # 會被畫第二次——性質從「時間軸不準」變成「多畫了他沒送出的東西」（`qimg-fam` Low#8）。
+    _T2 = "沿用時刻QREUSE。"
+    _reuse2 = [
+        _qev(0, "", type="attachment", timestamp="2026-08-25T15:00:00.000Z",
+             attachment={"type": "queued_command",
+                         "prompt": [{"type": "text", "text": _T2},
+                                    {"type": "image",
+                                     "source": {"type": "base64",
+                                                "media_type": "image/png", "data": _B64}}],
+                         "commandMode": "prompt", "origin": {"kind": "human"},
+                         "timestamp": "2026-08-25T15:00:00.000Z"}),
+        _qev(1, "", type="queue-operation", operation="remove", content=_T2,
+             timestamp="2026-08-25T15:00:02.000Z"),
+        _qev(2, "", type="queue-operation", operation="remove", content=_T2,
+             timestamp="2026-08-25T15:00:04.000Z"),
+    ]
+    _got2 = v.synth_queued_user_events(_reuse2)
+    assert len(_got2) == 2, f"兩個 remove 應該各補一則，實得 {len(_got2)}"
+    assert isinstance(_got2[0]["message"]["content"], list), "第一則要帶圖"
+    assert _got2[1]["message"]["content"] == _T2, (
+        "⚠⚠ 第二個 `remove` 沿用了最後一筆的**圖片** ⇒ 同一張只貼過一次的圖被畫了兩次。"
+        f"時刻可以沿用，圖片不行。實得：{_got2[1]['message']['content']!r}")
+
+    # --- ①-j ⚠⚠ 指令包裝 ＋ 貼圖：**不可以因為那張圖就切輪** ------------------
+    # `qimg-fam` Low#5 實測：圖片進了 `rest` ⇒ `not rest` 失效 ⇒ 自成一輪 ⇒ 那一輪被切成
+    # 兩半、同一步後面的區塊錨點整批改指。可達性目前 0，但失敗方向是最壞的那一種。
+    def _cmdimg_groups(with_img):
+        _blocks = [{"type": "text", "text": "<command-name>/effort</command-name>\n"
+                                            "<command-args>high</command-args>"}]
+        if with_img:
+            _blocks.append({"type": "image", "source": {"type": "base64",
+                                                        "media_type": "image/png", "data": _B64}})
+        _evs = [
+            _qev(0, "", type="assistant", timestamp="2026-08-25T16:00:00.000Z",
+                 message={"role": "assistant", "model": "m", "id": "mm1",
+                          "content": [{"type": "text", "text": "第一段CMDIMGA。"}]}),
+            _qev(1, "", type="user", uuid="ci1", timestamp="2026-08-25T16:00:05.000Z",
+                 message={"role": "user", "content": _blocks}),
+            _qev(2, "", type="assistant", timestamp="2026-08-25T16:00:10.000Z",
+                 message={"role": "assistant", "model": "m", "id": "mm2",
+                          "content": [{"type": "text", "text": "第二段CMDIMGB。"}]}),
+        ]
+        return v.group_turns(_evs, per_step=True)
+
+    _g0, _g1 = _cmdimg_groups(False), _cmdimg_groups(True)
+    assert len(_g0) == len(_g1), (
+        "⚠⚠ 指令包裝那一則**多了一張圖就多切了一輪** ⇒ 那一輪被切成兩半、"
+        f"同一步後面的區塊錨點整批改指。無圖 {len(_g0)} 輪 vs 有圖 {len(_g1)} 輪")
+
     # --- ② 通知文字裡含 `<command-name>`：一定要判成通知，不是指令 --------------
     assert "NOTIFYWINS" in html, "這一則通知沒有被畫出來，下面的斷言就沒有素材"
     _wrong = [b for g in s.main_groups for b in g["blocks"]
@@ -6411,6 +6485,11 @@ def test_codex_sentinel_false_alarms(tmp_path=None):
     _n, err = run(compact_mid, "compact")
     assert "回合開始了卻沒收到" not in err, (
         f"自動壓縮那一輪是系統自己起的，沒有 prompt 是正常的。實得：{err!r}")
+    # ⚠ 同一件事的**收尾那次計數**：壓縮窗排在檔尾。兩處各改各的，只驗中間那格會漏一半
+    #   （突變檢驗實測：㉜b 從「抓到」變「漏掉」）。
+    _n, err = run(compact_mid[:-4], "compacttail")
+    assert "回合開始了卻沒收到" not in err, (
+        f"壓縮窗排在檔尾時，收尾那一次計數也要認得它。實得：{err!r}")
 
     # --- ④ 壓縮失敗：只留下一個 `error`，同樣不可以吵 -----------------------
     err_tail = turn(10) + [
@@ -6421,6 +6500,79 @@ def test_codex_sentinel_false_alarms(tmp_path=None):
     _n, err = run(err_tail, "errturn")
     assert "回合開始了卻沒收到" not in err, (
         f"那一輪失敗了（`error`），和被中止的回合同一類。實得：{err!r}")
+
+    # --- ⑥ 沒有 `type`、只有空白文字：抽取器**支援這個形狀且真的抽到了** ------
+    # ⚠ `_codex_content_text()` 有一支 `not item.get("type") and item.get("text")`，
+    #   `[{"text":"   "}]` 走的就是它 ⇒ 說「抽不出文字（型別可能改名了）」是假的。
+    typeless = turn(10) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"text": "   "}]}),
+    ]
+    _n, err = run(typeless, "typeless")
+    assert "抽不出文字" not in err, (
+        "⚠ 沒有 `type`、只有空白文字的 block 是抽取器**明確支援**的形狀，"
+        f"哨兵不該說它「型別可能改名了」。實得：{err!r}")
+
+    # --- ⑦（反向）內容被搬到別的欄位：型別沒改、`text` 還是字串 ⇒ **要出聲** --
+    # ⚠⚠ 這是兩個 reviewer 各自舉出的「會被新判準吞掉」的形狀。只看型別的話它完全靜默，
+    #    而那一則的文字**整批消失**。
+    moved = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "",
+                                                "content": "真正的回答SENTMOVED。"}]}),
+    ]
+    _n, err = run(moved, "moved")
+    assert "抽不出文字" in err, (
+        "⚠⚠ 內容被搬到別的欄位（`text` 空著、真文字在別欄）⇒ 那一則會整批消失，"
+        f"哨兵一定要出聲。實得：{err!r}")
+
+    # --- ⑧（反向）`error` 那一窗**有助理內容** ⇒ 是真的漏收，不可以豁免 -------
+    # ⚠⚠ 跨模型 reviewer 實測的形狀：prompt 事件改名（沒收到）→ 助理照常回答 → `error`。
+    #    第一版把任何 `error` 都當成「系統自己起的」，於是這種**真的漏收**完全靜默。
+    err_with_ai = turn(10) + [
+        line(30, "event_msg", {"type": "task_started", "turn_id": "t-30"}),
+        line(31, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text",
+                                                "text": "沒人問就答SENTERRAI。"}]}),
+        line(32, "event_msg", {"type": "error", "message": "stream disconnected"}),
+        line(33, "event_msg", {"type": "task_complete"}),
+    ]
+    _n, err = run(err_with_ai + turn(40), "errai")      # 空窗排在中間 ⇒ 迴圈裡那次計數
+    assert "回合開始了卻沒收到" in err, (
+        "⚠⚠ 這個窗有助理內容、卻零則 prompt ⇒ 是真的漏收（不是壓縮失敗），"
+        f"不可以被 `error` 豁免掉。實得：{err!r}")
+    # ⚠ 同一件事的**收尾那次計數**：空窗排在檔尾。兩處各改各的，只驗一邊等於漏一半。
+    _n, err = run(err_with_ai, "erraitail")
+    assert "回合開始了卻沒收到" in err, (
+        "⚠⚠ 同上，但這個窗**排在檔尾**——收尾那一次計數也要認得它。"
+        f"實得：{err!r}")
+
+    # --- ⑨ 空文字 ＋ **結構性 metadata**（`index: 0`）：不是內容搬家，不可以吵 --
+    # ⚠ 判準若寫成「任何非空欄位」，`0` 這種 metadata 會被當成「文字搬到別欄位」
+    #   （`qimg-fix-codex` Medium#3）。承載文字的欄位一定是字串。
+    meta_only = turn(10) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "",
+                                                "index": 0, "annotations": []}]}),
+    ]
+    _n, err = run(meta_only, "metaonly")
+    assert "抽不出文字" not in err, (
+        f"結構性 metadata（`index`/`annotations`）不是內容搬家，不可以誤報。實得：{err!r}")
+
+    # --- ⑩（反向）`error` 那一窗只有**工具呼叫**（沒有助理文字）⇒ 仍是真的漏收 --
+    # ⚠⚠ `turn_ai` 若只認 `message`，這個窗會被 `error` 錯誤豁免
+    #    （`qimg-fix-codex` Medium#5 讀碼抓到）。
+    err_tool = turn(10) + [
+        line(30, "event_msg", {"type": "task_started", "turn_id": "t-30"}),
+        line(31, "response_item", {"type": "function_call", "name": "sh",
+                                   "call_id": "c9", "arguments": "{}"}),
+        line(32, "event_msg", {"type": "error", "message": "stream disconnected"}),
+        line(33, "event_msg", {"type": "task_complete"}),
+    ]
+    _n, err = run(err_tool, "errtool")
+    assert "回合開始了卻沒收到" in err, (
+        "⚠⚠ 這個窗有**工具呼叫**（助理內容的一種）、卻零則 prompt ⇒ 是真的漏收，"
+        f"不可以被 `error` 豁免。實得：{err!r}")
 
     # --- ⑤（反向）真的漏收 prompt 的空窗，**照樣要出聲** --------------------
     # ⚠⚠ 少了這一格，③④ 可以用「整條哨兵關掉」來滿足。
@@ -6485,20 +6637,43 @@ def test_one_bad_session_does_not_kill_batch(tmp_path=None):
     write(BAD, "BADSESSION")
 
     # 在子行程裡把 `analyze` 換成「遇到那一場就丟例外」，其餘照原本走。
-    code = (
-        "import sys\n"
-        f"sys.path.insert(0, {str(ROOT)!r})\n"
-        "sys.argv = ['ai_session_viewer.py', '--claude-source', "
-        f"'demo=' + {str(projects.parent)!r}, '--no-codex', '--out', {str(out)!r}]\n"
-        "import ai_session_viewer as v\n"
-        "_orig = v.analyze\n"
-        "def _boom(s, acct=None):\n"
-        f"    if getattr(s, 'session_id', '') == {BAD!r}:\n"
-        "        raise AttributeError(\"'list' object has no attribute 'strip'\")\n"
-        "    return _orig(s, acct)\n"
-        "v.analyze = _boom\n"
-        "v.main()\n"
-    )
+    # ⚠⚠ **三個注入點各驗一次。** 壞掉的那一場有三條路會走到同一個處理器
+    #   （解析／分析／渲染），先前只有分析那一條被守著，於是「回填舊 row」只做了三分之一
+    #   ——`qimg-fix-codex` Medium#1／#8 讀碼各抓到一條。
+    def code_of(outdir, inject="analyze"):
+        head = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            "sys.argv = ['ai_session_viewer.py', '--claude-source', "
+            f"'demo=' + {str(projects.parent)!r}, '--no-codex', '--out', {str(outdir)!r}]\n"
+            "import ai_session_viewer as v\n")
+        BOOM = ("        raise AttributeError(\"'list' object has no attribute 'strip'\")\n")
+        if inject == "analyze":
+            boom = ("_orig = v.analyze\n"
+                    "def _boom(s, acct=None):\n"
+                    f"    if getattr(s, 'session_id', '') == {BAD!r}:\n"
+                    + BOOM +
+                    "    return _orig(s, acct)\n"
+                    "v.analyze = _boom\n")
+        elif inject == "load":
+            boom = ("_orig = v.load_session\n"
+                    "def _boom(path, *a, **k):\n"
+                    f"    if {BAD!r} in path.name:\n"
+                    + BOOM +
+                    "    return _orig(path, *a, **k)\n"
+                    "v.load_session = _boom\n")
+        elif inject == "render":
+            boom = ("_orig = v.render_session_html\n"
+                    "def _boom(s, *a, **k):\n"
+                    f"    if getattr(s, 'session_id', '') == {BAD!r}:\n"
+                    + BOOM +
+                    "    return _orig(s, *a, **k)\n"
+                    "v.render_session_html = _boom\n")
+        else:
+            boom = ""
+        return head + boom + "v.main()\n"
+
+    code = code_of(out, inject="analyze")
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
 
@@ -6520,6 +6695,88 @@ def test_one_bad_session_does_not_kill_batch(tmp_path=None):
     assert "壞掉跳過 1" in r.stdout, (
         "收尾那行沒有公告「壞掉跳過 N」——`!` 訊息會被幾百行輸出捲走，"
         f"那一格是使用者一定看得到的位置。實得：{r.stdout[-500:]!r}")
+
+    # --- ② ⚠⚠ **這一場先前建過**：分析失敗不可以把上一次的頁面刪掉 ------------
+    # `qimg-fam` Medium#1 實測到的形狀：`new_entries.pop()` 之後那一場不進 `rows`
+    # ⇒ 孤兒清理刪掉上一次建好的頁面；但同一次寫 `bookmarks.html` 讀的是磁碟上的**舊**
+    # manifest（`prune_gone_sources()` 只對掉「來源檔不見了」的，來源檔還在）⇒ 管理頁
+    # 留著一列**指向剛剛被自己刪掉的檔案**的書籤：點下去是找不到檔案，
+    # 而不是設計上要給的「⚠ 對不到檔案」。
+    out2 = tmp / "out2"
+    r1 = subprocess.run([sys.executable, "-c", code_of(out2, inject=None)],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert r1.returncode == 0, f"前提：第一次建置要成功\n{r1.stderr[-500:]}"
+    pages1 = {p.name for p in (out2 / "sessions").rglob("*.html")}
+    assert any(BAD[:8] in n for n in pages1), (
+        f"前提：第一次建置要產出壞掉那一場的頁面（實得 {sorted(pages1)}）")
+
+    # 來源檔改一個位元組 ⇒ 指紋變了 ⇒ 不 reusable ⇒ 這一次真的會走進 analyze
+    src_bad = projects / f"{BAD}.jsonl"
+    src_bad.write_text(src_bad.read_text(encoding="utf-8").replace(
+        "提問BADSESSION。", "提問BADSESSION！"), encoding="utf-8")
+
+    r2 = subprocess.run([sys.executable, "-c", code_of(out2, inject="analyze")],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert r2.returncode == 0, f"第二次建置非零退出\n{r2.stderr[-500:]}"
+    # ⚠⚠ **主要的守衛在 manifest 這一層**，不是檔案那一層：孤兒清理只在
+    #   `filtering=False`（完全不帶來源旗標的全量建置）時才跑，而測試一定要帶
+    #   `--claude-source` 指到假語料 ⇒ **這個測試環境永遠到不了那條刪檔路徑**。
+    #   根因是「那一場沒有留在 manifest 裡」，刪檔與書籤指錯都是它的下游。
+    _man = json.loads((out2 / ".build-manifest.json").read_text(encoding="utf-8"))
+    assert any(BAD in k for k in _man.get("entries", {})), (
+        "⚠⚠ 分析失敗的那一場沒有被放回 manifest ⇒ 它不進 `rows` ⇒ 全量建置時"
+        "**孤兒清理會刪掉上一次建好的頁面**，而書籤管理頁那一列還在（讀的是磁碟上的舊 manifest）"
+        f"⇒ 使用者點下去找不到檔案。manifest 現有 {len(_man.get('entries', {}))} 筆")
+    pages2 = {p.name for p in (out2 / "sessions").rglob("*.html")}
+    assert any(BAD[:8] in n for n in pages2), (
+        "⚠⚠ 分析失敗把**上一次建好的頁面**刪掉了——而書籤管理頁那一列還在，"
+        f"使用者點下去會找不到檔案。實得頁面：{sorted(pages2)}")
+    assert "沿用上一次的輸出" in r2.stdout, (
+        "收尾那行沒有講出「沿用上一次的輸出」——那一頁的內容是舊的，"
+        f"不講的話使用者會以為它是這一次產出的。實得：{r2.stdout[-400:]!r}")
+    bx = (out2 / "bookmarks.html")
+    if bx.exists():
+        assert BAD[:8] in bx.read_text(encoding="utf-8"), (
+            "書籤管理頁把這一場對掉了，但頁面還在 ⇒ 兩邊不一致（另一個方向的同一個缺陷）")
+
+    # --- ③ 另外兩個注入點：**解析失敗**與**渲染失敗**走同一支處理器 ------------
+    for _stage, _msg in (("load", "解析失敗"), ("render", "渲染失敗")):
+        _out = tmp / f"out_{_stage}"
+        _r1 = subprocess.run([sys.executable, "-c", code_of(_out, inject=None)],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace")
+        assert _r1.returncode == 0, f"前提：{_stage} 那一組的第一次建置要成功"
+        src_bad2 = projects / f"{BAD}.jsonl"
+        src_bad2.write_text(src_bad2.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        _r2 = subprocess.run([sys.executable, "-c", code_of(_out, inject=_stage)],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace")
+        assert _r2.returncode == 0, (
+            f"⚠⚠ {_msg}把整支工具帶走了（退出碼 {_r2.returncode}）"
+            f"——護欄只包住其中一條路\n{_r2.stderr[-500:]}")
+        assert _msg in _r2.stderr, f"{_msg}沒有在 stderr 出聲：{_r2.stderr[-300:]!r}"
+        _man2 = json.loads((_out / ".build-manifest.json").read_text(encoding="utf-8"))
+        assert any(BAD in k for k in _man2.get("entries", {})), (
+            f"⚠⚠ {_msg}時沒有把上一次的 row 放回 manifest ⇒ 全量建置會刪掉上一次的頁面、"
+            "而書籤那一列還在（同一個缺陷，只是換一條路進來）")
+
+    # --- ④ ⚠⚠ **舊輸出已經不在磁碟上時，不可以回填** ---------------------------
+    # 反方向的同一種傷害：無條件回填會讓索引多一條**指向不存在的檔**的連結
+    # （`qimg-fix-codex` Medium#1 的後半）。
+    out3 = tmp / "out3"
+    _r1 = subprocess.run([sys.executable, "-c", code_of(out3, inject=None)],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r1.returncode == 0, "前提：out3 的第一次建置要成功"
+    for _p in (out3 / "sessions").rglob("*"):
+        if _p.is_file() and BAD[:8] in _p.name:
+            _p.unlink()                      # 模擬「頁面被清掉／手動刪掉」
+    src_bad3 = projects / f"{BAD}.jsonl"
+    src_bad3.write_text(src_bad3.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    _r2 = subprocess.run([sys.executable, "-c", code_of(out3, inject="analyze")],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r2.returncode == 0, "第二次建置不該非零退出"
+    _man3 = json.loads((out3 / ".build-manifest.json").read_text(encoding="utf-8"))
+    assert not any(BAD in k for k in _man3.get("entries", {})), (
+        "⚠⚠ 舊輸出已經不在磁碟上了，卻還是把那一列放回 manifest ⇒ 索引會多一條"
+        "**指向不存在的檔**的連結。回填之前一定要確認那份輸出還在")
 
     print("OK: one bad session does not kill the batch test passed")
 

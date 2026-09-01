@@ -1295,6 +1295,8 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     #   ② 壓縮失敗 → `task_started` → `event_msg:error` → `task_complete`。
     # 兩種都會讓「回合開了卻沒收到 prompt」那條哨兵在**完全正常的資料**上出聲。
     turn_systemic = False
+    turn_error = False                       # 這個窗出現過 `event_msg:error`
+    turn_ai = False                          # 這個窗真的產出過助理內容
     # (v36-fam5 #2) `response_item` 的 payload.type 認不得的則數，與「content 元素型別漂掉、
     # 抽不出助理文字」的則數。兩者都是助理內容整批消失的入口，而容器那條哨兵只認 payload 不是
     # dict 的情形，接不到這兩種。
@@ -1349,8 +1351,17 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
         #   剛好也失敗」時這條哨兵不出聲**——那是很窄的一格，換到的是不再對正常資料吵。
         #   真正要擋的整批漂移會讓幾十個**沒有失敗**的窗一起變空，照樣看得見。
         if (e.get("type") == "compacted"
-                or (e.get("type") == "event_msg" and ptype in ("context_compacted", "error"))):
+                or (e.get("type") == "event_msg" and ptype == "context_compacted")):
             turn_systemic = True
+        # ⚠⚠ **`error` 不可以無條件豁免。** 第一版把任何 `error` 都當成「系統自己起的」，
+        # 而跨模型 reviewer 實測示範了它的代價：`task_started` → prompt 事件**改名（沒收到）**
+        # → 助理照常回答 → `error`，這個窗**真的漏收了一則 prompt**，哨兵卻完全靜默。
+        # 分界線在**這個窗有沒有產出助理內容**：
+        #   · 壓縮失敗那種只有 `task_started` → `error` → `task_complete`，**沒有助理內容**；
+        #   · 使用者真的送出了什麼、模型也回了，然後才失敗的那種**有**。
+        # ⇒ 只有前者豁免。這樣兩個 reviewer 的實測形狀同時成立，也不必去讀 error 的訊息文字。
+        if e.get("type") == "event_msg" and ptype == "error":
+            turn_error = True
 
         if e.get("type") == "session_meta":
             meta_id = (payload.get("id") or "").strip()
@@ -1375,10 +1386,11 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
 
         if e.get("type") == "event_msg":
             if ptype == "task_started":
-                if turn_open and not turn_aborted and not turn_systemic and not turn_prompts:
+                if (turn_open and not turn_aborted and not turn_prompts
+                        and not (turn_systemic or (turn_error and not turn_ai))):
                     n_empty_turns += 1           # 上一個窗開了卻一則都沒收到
                 turn_open, turn_prompts, turn_aborted = True, 0, False
-                turn_systemic = False
+                turn_systemic = turn_error = turn_ai = False
                 pending_user = None              # 新回合：上一則已不可能是「同一則」
                 continue
             if ptype == "turn_aborted":
@@ -1540,20 +1552,42 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             if not text.strip():
                 # (v36-fam5 #2) content **元素**型別改名（`output_text` → 別的名字）：型別白名單
                 # 接不到（`payload.type` 還是 `message`），這裡是唯一看得見的地方。
-                # ⚠⚠ **判準是「元素認不認得」，不是「list 空不空」。** 舊寫法只看 list 非空，
-                # 於是 `[{"type":"output_text","text":""}]`——型別沒改名、欄位也在、就是那一則
-                # 沒有話講——也被當成漂移報出去（同事 2026-09-01 的 rollout：三個檔各吵一次，
-                # 實測共 3 則，2 則 `phase=commentary`、1 則 `final_answer`；本機語料 0 則，
-                # 所以這個誤報從來沒有在這台機器上出現過）。
-                # **誤報會讓所有警告很快沒人讀**，而這幾條哨兵的全部價值就在「它一出聲就是真的」。
-                # ⇒ 只有「至少一個元素不是**認得的空文字**」時才算漂移；判準要和
-                #   `_codex_content_text()` 收文字的條件對齊（型別對得上、`text` 是字串）。
+                # ⚠⚠ **判準是「這個元素還有沒有沒被讀到的東西」**，不是「list 空不空」，
+                # 也不是「型別對不對」。三種形狀要同時處理好（前兩種都實測過）：
+                #   ① `[{"type":"output_text","text":""}]` ＝ 那一則**真的沒有話講**
+                #      ⇒ **不可以出聲**（同事 2026-09-01 的 rollout：三個檔各吵一次）。
+                #   ② `[{"text":"   "}]` ＝ 沒有 `type`、只有空白文字。`_codex_content_text()`
+                #      **明確支援這個形狀**（`not item.get("type") and item.get("text")` 那一支），
+                #      它真的抽到了東西 ⇒ 也不可以說「抽不出文字」。
+                #   ③ `[{"type":"output_text","text":"","content":"真正的文字"}]` ＝ 上游把內容
+                #      **搬到別的欄位**。型別沒改、`text` 也還是字串 ⇒ 只看型別的判準會**吞掉它**，
+                #      而那一則的文字整批消失。這種一定要出聲。
+                # ⇒ 判準：**這個 block 除了「型別認得的空文字」之外還帶著別的東西嗎**。
+                # ⚠ 全語料實測（本機 566 份 rollout ＋ 同事 4 份，12738 個 content block）：
+                #   **欄位集合 100% 是 `{text,type}`**，空文字的那 3 個也沒有任何其他非空欄位
+                #   ⇒ 「還帶著別的非空欄位」這一條在現有資料上**零誤報**。
+                def _carries_unread(b):
+                    if not isinstance(b, dict):
+                        return True
+                    # `_codex_content_text()` 收得下的兩種型別形狀之外 ⇒ 認不得
+                    if b.get("type") not in ("output_text", None):
+                        return True
+                    if not isinstance(b.get("text"), str):
+                        return True          # `text` 欄改名／型別不對
+                    if b["text"].strip():
+                        return True          # 有字卻沒被抽出來（型別對不上上面那支的 text_type）
+                    # 空文字：只有「除了 type/text 以外還有**帶字的字串欄位**」時才算漂移（③）。
+                    # ⚠⚠ **不可以看「任何非空值」**：`{"type":"output_text","text":"","index":0}`
+                    # 這種結構性 metadata 會被誤判成「內容搬到別欄位」而誤報
+                    # （`qimg-fix-codex` Medium#3）。承載文字的欄位一定是字串，
+                    # 用型別把 metadata 擋在外面，比列舉欄位名穩。
+                    return any(k not in ("type", "text") and isinstance(v, str) and v.strip()
+                               for k, v in b.items())
                 _c = payload.get("content")
-                if isinstance(_c, list) and _c and any(
-                        not (isinstance(b, dict) and b.get("type") == "output_text"
-                             and isinstance(b.get("text"), str)) for b in _c):
+                if isinstance(_c, list) and _c and any(_carries_unread(b) for b in _c):
                     n_empty_assistant_items += 1
                 continue
+            turn_ai = True          # 這個窗真的有助理內容（見上面 `error` 那段的分界線）
             ev = {
                 "type": "assistant",
                 "uuid": f"codex-assistant-{i}",
@@ -1582,6 +1616,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                     "message": {"role": "assistant", "id": f"codex-reason-{i}", "model": current_model,
                                 "content": [{"type": "thinking", "thinking": text}]},
                 }
+                turn_ai = True      # reasoning 也是助理內容（見 `error` 那段的分界線）
                 s.events.append(ev)
                 if step_first_event is None:
                     step_first_event = ev
@@ -1603,6 +1638,11 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                                          "name": _codex_tool_name(payload.get("name")),
                                          "input": _json_obj_maybe(inp)}]},
             }
+            # ⚠⚠ **工具呼叫也算助理內容。** 只認 `message` 的話，
+            # 「漏收 prompt → function_call → error」那個窗會被 `error` 錯誤豁免
+            # （`qimg-fix-codex` Medium#5）。判準是「這個窗有沒有產出助理事件」，
+            # 而不是「有沒有助理**文字**」。
+            turn_ai = True
             s.events.append(ev)
             if step_first_event is None:
                 step_first_event = ev
@@ -1673,7 +1713,8 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
         print(f"  ! {path.name}: {n_dual_shape} 則 prompt 出現緊鄰的跨格式同文——可能是同一則的兩種"
               f"表述，也可能是使用者連送兩次；**兩則都已保留**，請確認顯示是否出現重複",
               file=sys.stderr)
-    if turn_open and not turn_aborted and not turn_systemic and not turn_prompts:
+    if (turn_open and not turn_aborted and not turn_prompts
+            and not (turn_systemic or (turn_error and not turn_ai))):
         n_empty_turns += 1                       # 收尾：最後一個窗
     # 上面五個哨兵的判準同源：「型別名含 user，或自報 role=user」。上游若把型別改成不含 user 的
     # 名字（`Prompt`、`HumanTurn`…）又不帶 role，**五個會同時是 0**——而症狀正是 0.147 那次的
@@ -2244,7 +2285,7 @@ def _step_usage(msg, ev=None):
             "effort": str((ev or {}).get("effort") or "")}
 
 
-def synth_queued_user_events(events):
+def synth_queued_user_events(events, name=""):
     """把**排隊送出**的使用者提示詞補成可呈現的 user 事件，回傳新事件的 list。
 
     ⚠⚠ **這一段補的不是格式，是一整句話。** 助手還在跑工具時打的字會走佇列，
@@ -2279,6 +2320,7 @@ def synth_queued_user_events(events):
     #   而「真 user 事件在 remove **之後**」正是那 1 個的形狀 ⇒ 消耗條件用它。
     # (來源檔, 文字) -> [(按下 Enter 的時刻, 貼上的圖片 blocks)…]（同一句可排多次，順序保留）
     human = {}
+    n_bad_prompt = 0            # `prompt` 形狀認不得的則數（見下方哨兵）
     for e in events:
         if e.get("type") != "attachment":
             continue
@@ -2301,6 +2343,25 @@ def synth_queued_user_events(events):
         # 頁面上等於不存在——而它們是使用者真的送出去的東西。
         imgs = [b for b in a["prompt"] if isinstance(b, dict) and b.get("type") == "image"] \
             if isinstance(a.get("prompt"), list) else []
+        # ⚠⚠ **崩潰不可以被換成靜默。** 修掉 `AttributeError` 之後，`prompt` 若漂成
+        # 我們認不得的形狀（dict、數字、list of str…），`content_text()` 回 `""`、`imgs` 回 `[]`
+        # ⇒ 下面 `if p or imgs:` 兩邊都假 ⇒ 這一則排隊句**連進都進不來**，頁面上又變回
+        # 「答案在、問題不在」——而那正是這支函式存在的唯一理由。
+        # ⚠ Codex 那一側有 13 條這種漂移哨兵，Claude 這一側先前一條都沒有。
+        # 判準只認結構：`prompt` 不是 str 也不是 list，或 block 陣列裡出現既不是 `text`
+        # 也不是 `image` 的元素。
+        _pr = a.get("prompt")
+        if _pr is not None and not isinstance(_pr, (str, list)):
+            n_bad_prompt += 1
+        # ⚠ `type` 對得上還不夠：`[{"type":"text","content":"lost"}]`（`text` 欄搬走了）
+        #   在第一版是「認得的形狀」⇒ 取不出文字、又不出聲 ⇒ 整則靜默消失
+        #   （`qimg-fix-codex` Medium#4 實測 `synth=0, warned=False`）。
+        elif isinstance(_pr, list) and any(
+                not (isinstance(b, dict)
+                     and (b.get("type") == "image"
+                          or (b.get("type") == "text" and isinstance(b.get("text"), str))))
+                for b in _pr):
+            n_bad_prompt += 1
         # ⚠ **`or imgs`**：只貼了圖、一個字都沒打的那一則，文字是空字串。
         #   沒有這一半的話它連進都進不來，整則靜靜消失（那正是這個功能要修的失效模式）。
         if p or imgs:
@@ -2309,6 +2370,10 @@ def synth_queued_user_events(events):
             # （`utf-fix-codex-r2` 實測 `QUEUED cross_source: count=1 src=['main.jsonl']`）。
             human.setdefault((e.get("_srcf") or "", p), []).append(
                 (a.get("timestamp") or e.get("timestamp"), imgs))
+    if n_bad_prompt:
+        print(f"  ! {name or '(未命名來源)'}: {n_bad_prompt} 則排隊提示詞的 prompt 形狀認不得"
+              f"（不是字串也不是 text/image 的 block 陣列）——那幾則不會出現在輸出裡",
+              file=sys.stderr)
     if not human:
         return []
     # ⚠⚠ **比對前要先 `clean_user_text()`。** CLI 常在使用者訊息後面接
@@ -2415,7 +2480,12 @@ def _take_queued_at(human, used, key):
         return None, []
     i = used.get(key, 0)
     used[key] = i + 1
-    return ts[i] if i < len(ts) else ts[-1]
+    if i < len(ts):
+        return ts[i]
+    # ⚠⚠ **沿用的只有時刻，圖片不沿用。** `remove` 比 attachment 多是壞檔（docstring 上面
+    # 那段），沿用最後一筆是為了「不要整句不畫」；但那一筆現在帶著圖，照抄的話同一張
+    # 使用者只貼過一次的圖會被畫第二次——性質從「時間軸不準」變成「多畫了他沒送出的東西」。
+    return (ts[-1][0], [])
 
 
 def synth_local_command_events(events):
@@ -2499,11 +2569,27 @@ def group_turns(events, per_step=True, step_by_usage=False):
                 # 會永遠得到「有」，於是指令列與通知列照樣拿到耐久錨點，
                 # 上面那條「既有書籤逐字不變」的保證就整條失效（實測：旗標 0 次為真、
                 # 1512 個新回合全部拿到錨點）。
+                # ⚠⚠ **圖片不可以進 `rest`。** `not rest` 是「這一則除了包裝以外還有沒有東西」
+                # 的述詞，而下面那條路靠它決定**要不要切輪**：指令包裝的文字被
+                # `clean_user_text()` 清成空 ⇒ 舊資料一律 `rest == []` ⇒ 掛進回合內部、不切輪。
+                # 排隊句帶圖之後那個 image block 會讓 `rest` 變成非空 ⇒ 條件失效 ⇒ 自成一輪
+                # ⇒ **那一輪被切成兩半、同一步後面的區塊錨點整批改指**（`qimg-fam` Low#5 實測：
+                # 少掉 `-b3`／`-b4`，內容搬到新回合的 `-b1`／`-b2`）。那正是這個 repo
+                # 花最多力氣在擋的失敗方向。
+                # ⇒ 圖片改掛在特殊區塊自己身上（和 `_interject` 的 `imgs` 同一套做法），
+                #   照樣畫得出來，但**不參與切輪的判斷、也不佔區塊序號**。
+                # ⚠ 可達性目前是 0（要 CLI 把 `<command-name>` 這類包裝寫進佇列項的值，
+                #   它現在不會）——但失敗方向是「既有書籤安靜指到別的內容」，所以照修。
+                sp_imgs = [b for b in blocks if b.get("type") == "image"]
+                if sp_imgs:
+                    sp["imgs"] = (sp.get("imgs") or []) + sp_imgs
                 if sp["type"] == "_notify":
                     rest = []       # 通知整則就是通知，原文已收在 `_notify` 區塊裡
                 else:
                     rest = []
                     for b in blocks:
+                        if b.get("type") == "image":
+                            continue        # 見上面：圖片已經掛到 `sp` 上了
                         if b.get("type") != "text":
                             rest.append(b)
                             continue
@@ -2832,7 +2918,7 @@ def analyze(s, acct_switches=None):
     # 原始事件流，塞合成事件進去會讓「檔案裡有什麼」與「畫了什麼」變成同一份，之後
     # 任何歸因量測都分不出哪些是推出來的。
     if s.source_kind == SOURCE_CLAUDE:
-        msg = msg + synth_queued_user_events(s.events)
+        msg = msg + synth_queued_user_events(s.events, getattr(s.path, "name", ""))
         # 指令的**另一種存法**（`system/local_command`，全語料 345 則，含 `/rc`）
         msg = msg + synth_local_command_events(s.events)
     main = dedup(sorted([e for e in msg if not e.get("isSidechain")], key=ts_key))
@@ -4317,6 +4403,8 @@ def render_command_html(b):
         label = f'{esc(name)} {esc(args)}' if args else esc(name)
         head = f'<div class="cmdline"><span class="cmdmark">⬚</span> <code>{label}</code></div>'
     body = f'<pre class="cmdout">{esc(out)}</pre>' if out else ""
+    # 排隊句帶圖、而文字剛好是指令包裝時，圖掛在這個區塊上（見 `group_turns` 那段註解）
+    body += "".join(render_image_block(im) for im in (b.get("imgs") or []))
     if not head and body:
         # 只有結果、沒能併回指令（來源檔缺了指令那一則）：明講它是某個指令的輸出，
         # 不要讓它看起來像使用者打了一段文字。
@@ -4348,9 +4436,11 @@ def render_notify_html(b):
         bits.append(_NOTIFY_STATUS_LABEL.get(status, status))
     head = " · ".join(bits) + (f" · {lead}" if lead else "")
     detail = _strip_ansi(raw or event)
+    # 排隊句帶圖、而文字剛好是通知包裝時，圖掛在這個區塊上（見 `group_turns` 那段註解）
+    _imgs = "".join(render_image_block(im) for im in (b.get("imgs") or []))
     return ('<details class="notify"><summary>'
             f'<span class="cmdmark">⚙</span> {esc(head)}</summary>'
-            f'<div class="tbody"><pre class="cmdout">{esc(detail)}</pre></div></details>')
+            f'<div class="tbody"><pre class="cmdout">{esc(detail)}</pre></div>' + _imgs + '</details>')
 
 
 def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=None, rendered_sub=None, ai="Claude"):
@@ -6701,6 +6791,8 @@ def render_turn_md(group, tmap, ai="Claude"):
                 parts.append(f"`{nm}`")
             if b.get("out"):
                 parts.append(_md_fence(b["out"]))
+            # 掛在這個區塊上的圖（見 `group_turns`）：MD 用和一般 image block 同一個記號
+            parts += ["_[圖片]_"] * len(b.get("imgs") or [])
         elif t == "_interject":
             # ⚠ MD 也要有——`--search` 的全文索引讀的是這一份，插話的內容不可以搜不到。
             _q = parse_ts(b.get("queued_at")) if b.get("queued_at") else None
@@ -6729,6 +6821,8 @@ def render_turn_md(group, tmap, ai="Claude"):
             _detail = _strip_ansi(b.get("raw") or b.get("event") or "")
             if _detail.strip():
                 parts.append(_md_fence(_detail))
+            # 掛在這個區塊上的圖（見 `group_turns`）：MD 用和一般 image block 同一個記號
+            parts += ["_[圖片]_"] * len(b.get("imgs") or [])
     if not parts:
         return ""
     icon = "👤 You" if role == "user" else f"🤖 {ai}"
@@ -10881,6 +10975,7 @@ def main():
 
     proj_names = build_project_names(files)
     n_build = n_reuse = n_empty = n_broken = 0      # n_broken：壞掉被跳過的來源檔
+    n_broken_kept = 0                              # 其中「沿用上一次輸出」的（見下方 except）
     for source_kind, acc_name, proj_name, sf in files:
         key = manifest_key(source_kind, sf)
         # Claude 的 transcript 檔名就是 sessionId，切帳號資料據此對應（Codex 無此資料）
@@ -10912,14 +11007,28 @@ def main():
             n_reuse += 1
             continue
 
+        # ⚠⚠ **壞掉的那一場只有一個處理器。** 先前解析失敗與分析失敗各寫一份，於是
+        # 「把上一次的 row 放回去」只做在分析那一半 ⇒ **解析失敗照樣會刪掉舊頁面**
+        # （`qimg-fix-codex` Medium#1）。兩條路共用這一支，之後再長第三條也是。
+        def _broken(kind, exc):
+            nonlocal n_broken, n_broken_kept
+            print(f"  ! {kind} {sf.name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            n_broken += 1
+            # ⚠⚠ **要先確認上一次的輸出真的還在磁碟上**。無條件回填的話，舊 row 指向的
+            # 頁面若早就不見了（被清過、被手動刪過），索引就會多一條**指向不存在的檔**
+            # 的連結——那和這一條原本要修的缺陷是同一種傷害，只是方向相反。
+            row = (cached or {}).get("row") or {}
+            if any(row.get(k) and (sess_dir / row[k]).exists() for k in ("out_html", "out_md")):
+                new_entries[key] = cached
+                n_broken_kept += 1
+
         try:
             if source_kind == SOURCE_CODEX:
                 s = load_codex_session(sf, acc_name, codex_titles)
             else:
                 s = load_session(sf, proj_name, acc_name, source_kind)
         except Exception as e:
-            print(f"  ! 解析失敗 {sf.name}: {e}", file=sys.stderr)
-            n_broken += 1
+            _broken("解析失敗", e)
             continue
         if source_kind == SOURCE_CODEX and not project_matches_filter(s, args.project):
             continue
@@ -10933,11 +11042,17 @@ def main():
         #   「有東西沒被畫出來」的管道；吞掉的話就變成看不見的資料遺失。
         # ⚠ 例外類別也要印（`{type(e).__name__}`）：`AttributeError` 這種只印訊息時
         #   （「'list' object has no attribute 'strip'」）看不出是什麼錯。
+        # ⚠ 這一段**包到渲染完為止**，不是只包 `analyze()`：宣稱的性質是「一場壞掉不可以
+        #   拖垮整批」，而渲染層拿到的是同一份髒資料（本批新增的碼有一半在渲染層）。
+        # ⚠⚠ **不放回上一次的 row 的話**：這一場不進 `rows` ⇒ `allowed` 不含它 ⇒ **孤兒清理
+        # 會刪掉上一次建好的頁面**；而同一次執行寫 `bookmarks.html` 用的是磁碟上那份舊
+        # manifest（`prune_gone_sources()` 只對掉「來源檔不見了」的，來源檔還在）⇒ 管理頁
+        # 留下一列**指向剛剛被自己刪掉的檔案**的書籤：點下去是找不到檔案，而不是設計上
+        # 要給的「⚠ 對不到檔案」。⚠ 沿用的是**上一次**的內容，所以收尾那行要講出來。
         try:
             analyze(s, acct_switches)
         except Exception as e:
-            print(f"  ! 分析失敗 {sf.name}: {type(e).__name__}: {e}", file=sys.stderr)
-            n_broken += 1
+            _broken("分析失敗", e)
             continue
         if s.n_turns == 0 and not args.include_empty:
             n_empty += 1
@@ -10954,13 +11069,20 @@ def main():
         s.mem_href = ""
         if source_kind == SOURCE_CLAUDE and get_mem(s.account, s.proj_munged):
             s.mem_href = memory_rel_path(s.account, s.proj_munged)
-        if want_html:
-            mem_link = ("../" * len(PureWindowsPath(s.out_html).parts) + s.mem_href) if s.mem_href else ""
-            (sess_dir / s.out_html).write_text(
-                render_session_html(s, rel_index_href(s.out_html), mem_link), encoding="utf-8")
-        if want_md:
-            (sess_dir / s.out_md).write_text(render_session_md(s), encoding="utf-8")
-        row = session_to_row(s)
+        # ⚠⚠ **護欄要真的包到渲染。** 先前只包了 `analyze()`，而註解卻寫著「包到渲染完為止」
+        # ——那是**只修一半、而且註解在說謊**（`qimg-fix-codex` Medium#8 讀碼抓到）。
+        # 渲染層拿到的是同一份髒資料，而這條線新增的碼有一半在渲染層。
+        try:
+            if want_html:
+                mem_link = ("../" * len(PureWindowsPath(s.out_html).parts) + s.mem_href) if s.mem_href else ""
+                (sess_dir / s.out_html).write_text(
+                    render_session_html(s, rel_index_href(s.out_html), mem_link), encoding="utf-8")
+            if want_md:
+                (sess_dir / s.out_md).write_text(render_session_md(s), encoding="utf-8")
+            row = session_to_row(s)
+        except Exception as e:
+            _broken("渲染失敗", e)
+            continue
         # has_html/has_md＝該檔與本 row 的 sig+renderer 同步。縮格式建置（--format md/html）時，
         # 另一格式若在「同一 sig」下產過且檔仍在，旗標沿用；sig 變了就不可信（過期檔）。
         prev = cached.get("row") if cached.get("sig") == sig else None
@@ -11091,7 +11213,9 @@ def main():
     if n_broken:
         # ⚠ 這一格是**資料遺失的公告**，不是統計：上面每一筆都印過 `!` 訊息，
         #   但那些會被幾百行輸出捲走，收尾這一行是使用者一定看得到的位置。
-        bits.append(f"壞掉跳過 {n_broken}（見上面的 ! 訊息）")
+        # ⚠ 「沿用上一次的輸出」要講出來——那一頁的內容是舊的，而索引與書籤照樣指得到它。
+        _kept = f"，其中 {n_broken_kept} 沿用上一次的輸出" if n_broken_kept else ""
+        bits.append(f"壞掉跳過 {n_broken}{_kept}（見上面的 ! 訊息）")
     if n_mem:
         bits.append(f"memory 頁 {n_mem}")
     if removed:

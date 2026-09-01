@@ -315,27 +315,27 @@ def test_command_and_notify_are_escaped():
         # ① 指令名／參數
         dict(type="user", uuid="u2", timestamp="2026-07-26T01:00:10.000Z",
              message={"role": "user", "content":
-                      f"<command-name>/{XSS}</command-name>\n"
+                      f"<command-name>/{XSS}FACEONE</command-name>\n"
                       f"<command-args>{XSS}</command-args>"}, **base),
         # ② 指令輸出（同一時刻的下一則）
         dict(type="user", uuid="u3", timestamp="2026-07-26T01:00:10.000Z",
              message={"role": "user", "content":
-                      f"<local-command-stdout>{XSS}</local-command-stdout>"}, **base),
+                      f"<local-command-stdout>{XSS}FACETWO</local-command-stdout>"}, **base),
         # ③ 通知原文（裸的，會自成一列）
         dict(type="user", uuid="u4", timestamp="2026-07-26T01:00:20.000Z",
              message={"role": "user", "content":
-                      f"<{NTAG}>\n<task-id>{XSS}</task-id>\n"
+                      f"<{NTAG}>\n<task-id>{XSS}FACETHREE</task-id>\n"
                       f"<summary>{XSS}</summary>\n<status>completed</status>\n"
                       f"</{NTAG}>"}, **base),
         # ④ 中途插話（走佇列）
         dict(type="attachment", uuid="u5", timestamp="2026-07-26T01:00:06.000Z",
-             attachment={"type": "queued_command", "prompt": XSS,
+             attachment={"type": "queued_command", "prompt": XSS + "FACEFOUR",
                          "commandMode": "prompt", "origin": {"kind": "human"},
                          "timestamp": "2026-07-26T01:00:06.000Z"}, **base),
         dict(type="queue-operation", operation="enqueue",
-             timestamp="2026-07-26T01:00:06.000Z", sessionId=sid, content=XSS),
+             timestamp="2026-07-26T01:00:06.000Z", sessionId=sid, content=XSS + "FACEFOUR"),
         dict(type="queue-operation", operation="remove",
-             timestamp="2026-07-26T01:00:07.000Z", sessionId=sid, content=XSS),
+             timestamp="2026-07-26T01:00:07.000Z", sessionId=sid, content=XSS + "FACEFOUR"),
         # ⑤ 排隊句裡**貼的圖片**：`media_type` 是新開的注入面——不支援的型別會被
         #    原樣寫進「格式不支援內嵌」那句佔位文字裡。
         dict(type="attachment", uuid="u6", timestamp="2026-07-26T01:00:30.000Z",
@@ -343,7 +343,7 @@ def test_command_and_notify_are_escaped():
                          "prompt": [{"type": "text", "text": "帶圖的排隊句IMGQ。"},
                                     {"type": "image",
                                      "source": {"type": "base64",
-                                                "media_type": f"image/{XSS}",
+                                                "media_type": f"image/{XSS}facefive",
                                                 "data": "AAAA"}}],
                          "imagePasteIds": ["pid1"], "commandMode": "prompt",
                          "origin": {"kind": "human"},
@@ -364,7 +364,25 @@ def test_command_and_notify_are_escaped():
             if p.parent.name != "sessions"][0]
     html = page.read_text(encoding="utf-8")
     # 這五個注入面都要在頁面上出現（不然這一格什麼都沒驗到），但一律是逸出後的形式
-    # ⚠ 涵蓋率先驗：素材真的走到頁面上了嗎？沒有的話下面每一格都是空的。
+    # ⚠⚠ **涵蓋率先驗要對每個面各驗一次，不可以用一個總數。** 舊寫法是
+    # `html.count("alert(1)") >= 5`，而真實計數是 8 ⇒ 把第五個面（圖片的 `media_type`）
+    # 整個中和掉、甚至把那一則帶圖排隊句從素材裡刪掉，那一格**照樣通過**
+    # （`qimg-fam` Medium#2 實測：`ALERTCOUNT 8 → 7`，兩種破壞都仍然綠）。
+    # ⇒ 每個面用它自己的指紋，這樣素材沒走到那條路時才會紅在對的地方。
+    # ⚠⚠ **每個面要有自己的 marker，不可以共用 DOM class 當指紋。**
+    # 第一版用 `class="cmdline"`／`class="cmdout"` 之類，而「只有輸出、沒有指令名」的
+    # fallback 也會產出同樣的 class ⇒ 把指令名整個清空、那一格照樣綠
+    # （`qimg-fix-codex` Medium#2 實測）。marker 只會來自那一面自己的素材。
+    for _needle, _face in (
+            ("FACEONE", "① 指令名"),
+            ("FACETWO", "② 指令輸出"),
+            ("FACETHREE", "③ 通知原文"),
+            ("FACEFOUR", "④ 排隊插話"),
+            # ⚠ 這個 marker 是小寫的：`render_image_block()` 會把 media_type 轉小寫，
+            #   用大寫的話這一格永遠找不到（第一版就是這樣紅的）。
+            ("facefive", "⑤ 圖片的 media_type")):
+        assert _needle in html, (
+            f"{_face} 這個注入面沒有走到頁面上（找不到 marker {_needle}）——那一格什麼都沒驗到")
     assert html.count("alert(1)") >= 5, (
         f"五個注入面沒有都走到頁面上（只出現 {html.count('alert(1)')} 次）"
         "——這一格什麼都沒驗到")

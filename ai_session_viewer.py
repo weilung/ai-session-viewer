@@ -1288,6 +1288,13 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     turn_open = False                        # 目前在不在一個回合窗裡
     turn_prompts = 0                         # 這個窗收到幾則
     turn_aborted = False                     # 這個窗被中止了（沒有 prompt 是正常的）
+    # ⚠⚠ **壓縮／失敗的那一輪是系統自己起的**，沒有 prompt 同樣是正常的。
+    # 實測（同事 2026-09-01 的 rollout；本機 565 份、729 個窗裡 0 個）：
+    #   ① 自動壓縮 → `task_started` → 外層 `compacted` ＋ `event_msg:context_compacted`
+    #      → `task_complete`，整窗零則 prompt；
+    #   ② 壓縮失敗 → `task_started` → `event_msg:error` → `task_complete`。
+    # 兩種都會讓「回合開了卻沒收到 prompt」那條哨兵在**完全正常的資料**上出聲。
+    turn_systemic = False
     # (v36-fam5 #2) `response_item` 的 payload.type 認不得的則數，與「content 元素型別漂掉、
     # 抽不出助理文字」的則數。兩者都是助理內容整批消失的入口，而容器那條哨兵只認 payload 不是
     # dict 的情形，接不到這兩種。
@@ -1333,6 +1340,18 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
         ts = e.get("timestamp")
         dt = e.get("_dt")
 
+        # ⚠⚠ **這個窗是系統自己起的嗎**（壓縮／失敗）——只認結構欄位，不讀訊息內容。
+        # ⚠ 外層 `compacted` 的 payload 是 `{message, replacement_history}`、**沒有 `type`**，
+        #   所以只能認外層那個名字。
+        # ⚠ `error` 一併算進來的取捨：失敗的壓縮**只留下一個 `error`**（實測訊息是
+        #   「Error running remote compact task…」），結構上和「一般回合失敗」分不開，
+        #   而靠訊息文字去分是這份程式一貫拒絕的做法。代價是**「prompt 掉了、而且那一輪
+        #   剛好也失敗」時這條哨兵不出聲**——那是很窄的一格，換到的是不再對正常資料吵。
+        #   真正要擋的整批漂移會讓幾十個**沒有失敗**的窗一起變空，照樣看得見。
+        if (e.get("type") == "compacted"
+                or (e.get("type") == "event_msg" and ptype in ("context_compacted", "error"))):
+            turn_systemic = True
+
         if e.get("type") == "session_meta":
             meta_id = (payload.get("id") or "").strip()
             if meta_id:
@@ -1356,9 +1375,10 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
 
         if e.get("type") == "event_msg":
             if ptype == "task_started":
-                if turn_open and not turn_aborted and not turn_prompts:
+                if turn_open and not turn_aborted and not turn_systemic and not turn_prompts:
                     n_empty_turns += 1           # 上一個窗開了卻一則都沒收到
                 turn_open, turn_prompts, turn_aborted = True, 0, False
+                turn_systemic = False
                 pending_user = None              # 新回合：上一則已不可能是「同一則」
                 continue
             if ptype == "turn_aborted":
@@ -1520,8 +1540,18 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             if not text.strip():
                 # (v36-fam5 #2) content **元素**型別改名（`output_text` → 別的名字）：型別白名單
                 # 接不到（`payload.type` 還是 `message`），這裡是唯一看得見的地方。
-                # ⚠ 只在 content 本來就有東西時才數：真的空的助理訊息不是漂移。
-                if isinstance(payload.get("content"), list) and payload["content"]:
+                # ⚠⚠ **判準是「元素認不認得」，不是「list 空不空」。** 舊寫法只看 list 非空，
+                # 於是 `[{"type":"output_text","text":""}]`——型別沒改名、欄位也在、就是那一則
+                # 沒有話講——也被當成漂移報出去（同事 2026-09-01 的 rollout：三個檔各吵一次，
+                # 實測共 3 則，2 則 `phase=commentary`、1 則 `final_answer`；本機語料 0 則，
+                # 所以這個誤報從來沒有在這台機器上出現過）。
+                # **誤報會讓所有警告很快沒人讀**，而這幾條哨兵的全部價值就在「它一出聲就是真的」。
+                # ⇒ 只有「至少一個元素不是**認得的空文字**」時才算漂移；判準要和
+                #   `_codex_content_text()` 收文字的條件對齊（型別對得上、`text` 是字串）。
+                _c = payload.get("content")
+                if isinstance(_c, list) and _c and any(
+                        not (isinstance(b, dict) and b.get("type") == "output_text"
+                             and isinstance(b.get("text"), str)) for b in _c):
                     n_empty_assistant_items += 1
                 continue
             ev = {
@@ -1643,7 +1673,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
         print(f"  ! {path.name}: {n_dual_shape} 則 prompt 出現緊鄰的跨格式同文——可能是同一則的兩種"
               f"表述，也可能是使用者連送兩次；**兩則都已保留**，請確認顯示是否出現重複",
               file=sys.stderr)
-    if turn_open and not turn_aborted and not turn_prompts:
+    if turn_open and not turn_aborted and not turn_systemic and not turn_prompts:
         n_empty_turns += 1                       # 收尾：最後一個窗
     # 上面五個哨兵的判準同源：「型別名含 user，或自報 role=user」。上游若把型別改成不含 user 的
     # 名字（`Prompt`、`HumanTurn`…）又不帶 role，**五個會同時是 0**——而症狀正是 0.147 那次的
@@ -1654,7 +1684,12 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     #   「一場中途才漂移」——前半收得到、後半整窗空。
     # ⚠ 三種本來就沒有 prompt 的情形要排除，否則會在正常資料上吵：
     #   ① 被中止的回合（`turn_aborted`）；② 子代理執行緒（沒有人打字）；
-    #   ③ 完全沒有助理內容的空 session。本機 516 份 rollout 實測 0 誤報。
+    #   ③ 完全沒有助理內容的空 session；④ **系統自己起的那一輪**（自動壓縮、
+    #      壓縮失敗——`turn_systemic`，見迴圈裡那段）。
+    # ⚠⚠ ④ 是 2026-09-01 才補的，而且**不是靠本機語料發現的**：本機 565 份 rollout、
+    #   729 個回合窗裡**零個**空窗，所以「0 誤報」在這台機器上永遠成立。
+    #   同事的機器上一個檔就吵了兩次，兩次都是完全正常的資料（教訓 44 的又一次應驗：
+    #   **量到 0 講的是這份語料**）。
     # ⚠ 不可改用「`type == "user"` 的事件數」：工具結果也是以 `user` 存的（見上方
     #   `function_call_output` 那一支），一場有工具呼叫、prompt 卻全丟時它不會是 0。
     # ⚠ **範圍限制 SCOPE-PARTIAL-TURN-LOSS**：這一條只認「整窗零則」，窗內只要還收到一則就

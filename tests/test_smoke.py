@@ -6319,6 +6319,125 @@ def test_user_turn_fidelity(tmp_path=None):
     print("OK: user turn fidelity (queued / notify / command) test passed")
 
 
+def test_codex_sentinel_false_alarms(tmp_path=None):
+    """兩個哨兵**不可以對完全正常的資料出聲**，但真的漏收仍然要出聲。
+
+    來源：同事 2026-09-01 的四個 rollout。工具跑完了、頁面也產出了，但 stderr 吵了四行，
+    四行**全部是誤報**：
+
+    | 哨兵 | 它以為 | 實際上 |
+    |---|---|---|
+    | 「N 則助理訊息有 content 卻抽不出文字」×3 | 承載文字的元素型別改名了 | `[{"type":"output_text","text":""}]`——**型別沒改名、欄位也在，就是那一則沒有話講**（`phase=commentary`／`final_answer`）|
+    | 「N 個回合開始了卻沒收到任何使用者 prompt」×1 | 使用者那一側有東西沒解析出來 | 兩個窗都是**系統自己起的**：一個自動壓縮（外層 `compacted` ＋ `context_compacted`）、一個壓縮失敗（只留一個 `error`）|
+
+    ⚠⚠ **這兩格在本機語料上永遠是 0**（565 份 rollout、729 個回合窗裡零個空窗），
+    所以「實測 0 誤報」那句話在這台機器上是恆真的，什麼都沒證明——**教訓 44 的又一次應驗**。
+
+    ⚠ 誤報比漏報更貴：這幾條哨兵的全部價值在「它一出聲就是真的」，
+    對正常資料吵一次，下次真的漂移時就沒有人會讀那一行。
+    ⇒ 所以這一支同時驗**兩個方向**：正常資料要安靜，真的漏收要出聲。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+    tmp = new_tmp(tmp_path)
+    tmp.mkdir(parents=True, exist_ok=True)
+
+    def line(sec, typ, payload):
+        return json.dumps({"timestamp": f"2026-09-01T06:{sec // 60:02d}:{sec % 60:02d}.000Z",
+                           "type": typ, "payload": payload}, ensure_ascii=False)
+
+    HEAD = [line(0, "session_meta", {"id": "019f0090-0000-7000-8000-0000000000a1",
+                                     "cwd": "/x/Sentinel", "cli_version": "0.147.0"}),
+            line(1, "turn_context", {"cwd": "/x/Sentinel", "model": "gpt-5.6"})]
+
+    def run(rows, name):
+        f = tmp / f"rollout-2026-09-01T06-00-00-{name}.jsonl"
+        f.write_text("\n".join(HEAD + rows), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            s = v.load_codex_session(f)
+        n_ai = sum(1 for e in s.events if e.get("type") == "assistant")
+        return n_ai, buf.getvalue()
+
+    def turn(sec, prompt=True, text="助理回答SENTA。"):
+        rows = [line(sec, "event_msg", {"type": "task_started", "turn_id": f"t-{sec}"})]
+        if prompt:
+            rows.append(line(sec + 1, "event_msg",
+                             {"type": "user_message", "message": "使用者問句SENTQ。"}))
+        if text is not None:
+            rows.append(line(sec + 2, "response_item",
+                             {"type": "message", "role": "assistant", "phase": "final_answer",
+                              "content": [{"type": "output_text", "text": text}]}))
+        rows.append(line(sec + 3, "event_msg", {"type": "task_complete"}))
+        return rows
+
+    # --- ① 真的空的助理訊息：**不是漂移**，不可以出聲 -----------------------
+    empty_msg = HEAD and turn(10) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "phase": "commentary",
+                                   "content": [{"type": "output_text", "text": ""}]}),
+    ]
+    n_ai, err = run(empty_msg, "emptymsg")
+    assert n_ai == 1, f"前提：有話講的那一則要收得到（實得 {n_ai} 則助理內容）"
+    assert "抽不出文字" not in err, (
+        "⚠⚠ `[{\"type\":\"output_text\",\"text\":\"\"}]` 是**真的沒有話講**，不是型別改名——"
+        f"對正常資料出聲會讓這條哨兵失去全部價值。實得：{err!r}")
+
+    # --- ②（反向）元素型別真的改名時，**照樣要出聲** ------------------------
+    # ⚠ 少了這一格，上面那條可以用「整條哨兵拿掉」來滿足，而那不是修好，是關掉。
+    renamed = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "text_out", "text": "改名了SENTR。"}]}),
+    ]
+    _n, err = run(renamed, "renamed")
+    assert "抽不出文字" in err, (
+        f"content 元素型別改名時哨兵沒出聲——那正是它唯一看得見的地方。實得：{err!r}")
+
+    # --- ③ 自動壓縮那一輪：系統自己起的，沒有 prompt 是正常的 ---------------
+    # ⚠ 外層 `compacted` 的 payload **沒有 `type`**（是 `{message, replacement_history}`），
+    #   所以只能認外層那個名字。
+    # ⚠⚠ **這個窗刻意排在中間**（後面還有一個正常回合）：空窗有兩處計數——
+    #   下一個 `task_started` 到來時那一次（這裡走的）與收尾那一次（④ 走的）。
+    #   兩處都要有素材，只顧一邊的話另一邊改壞了不會有任何一格變紅。
+    compact_mid = turn(10) + [
+        line(30, "event_msg", {"type": "task_started", "turn_id": "t-30"}),
+        json.dumps({"timestamp": "2026-09-01T06:00:31.000Z", "type": "compacted",
+                    "payload": {"message": "（壓縮摘要）", "replacement_history": []}},
+                   ensure_ascii=False),
+        line(32, "event_msg", {"type": "context_compacted"}),
+        line(33, "event_msg", {"type": "task_complete"}),
+    ] + turn(40)
+    _n, err = run(compact_mid, "compact")
+    assert "回合開始了卻沒收到" not in err, (
+        f"自動壓縮那一輪是系統自己起的，沒有 prompt 是正常的。實得：{err!r}")
+
+    # --- ④ 壓縮失敗：只留下一個 `error`，同樣不可以吵 -----------------------
+    err_tail = turn(10) + [
+        line(30, "event_msg", {"type": "task_started", "turn_id": "t-30"}),
+        line(31, "event_msg", {"type": "error", "message": "Error running remote compact task"}),
+        line(32, "event_msg", {"type": "task_complete"}),
+    ]
+    _n, err = run(err_tail, "errturn")
+    assert "回合開始了卻沒收到" not in err, (
+        f"那一輪失敗了（`error`），和被中止的回合同一類。實得：{err!r}")
+
+    # --- ⑤（反向）真的漏收 prompt 的空窗，**照樣要出聲** --------------------
+    # ⚠⚠ 少了這一格，③④ 可以用「整條哨兵關掉」來滿足。
+    # ⚠ 這個空窗**不是最後一個**（後面還有一個窗），走的是迴圈裡那一次計數。
+    real_loss = turn(10) + [
+        line(30, "event_msg", {"type": "task_started", "turn_id": "t-30"}),
+        line(31, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "沒人問就答SENTX。"}]}),
+        line(32, "event_msg", {"type": "task_complete"}),
+    ] + turn(40)
+    _n, err = run(real_loss, "realloss")
+    assert "回合開始了卻沒收到" in err, (
+        f"⚠⚠ 真的有一個窗零則 prompt，哨兵卻沒出聲——這條哨兵等於被關掉了。實得：{err!r}")
+
+    print("OK: codex sentinel false alarms test passed")
+
+
 def test_one_bad_session_does_not_kill_batch(tmp_path=None):
     """⚠⚠ **一場壞掉不可以拖垮整批**：那一場跳過、其餘照產，而且要出聲。
 
@@ -6904,5 +7023,6 @@ if __name__ == "__main__":
     test_zero_scan_keeps_cache_report_links()
     test_no_uppercase_unicode_escape_in_js()
     test_user_turn_fidelity()
+    test_codex_sentinel_false_alarms()
     test_one_bad_session_does_not_kill_batch()
     test_archive_command_only()

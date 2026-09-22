@@ -171,7 +171,25 @@ MANIFEST_NAME = ".build-manifest.json"
 #    ⚠ 跨輪送達（自成一輪）的那一種走一般 user 回合：圖片是**那一輪自己的新區塊**，
 #    只往後長、不會動到別人的錨點。
 #    ⚠ HTML 與 MD 都變 ⇒ 一定要升（不升的話既有的 `out/` 會靜默沿用舊版）。
-RENDERER_VERSION = 60
+# 60 → 61（2026-09-22）：**寫入 TTL 的呈現**。逐步／單步回合多一個可勾選徽章「寫入 TTL 5m｜1h｜
+#    5m+1h」（預設關），切換檔次的那一步標成「1h→5m」並上警示色；session 表頭與 MD 表頭多一行
+#    「寫入 TTL：…（HH:MM 起 1h→5m）」，**全程 1h 就完全不顯示**（最常見的情形不佔版面）。
+#    ⚠ **徽章只描述本步的 `cache_creation`，不描述它讀到的快取**：實測（`515b05fa`、`b61dc0b7`）
+#    寫入已降成 5m 的那一步仍讀得到先前用 1h 寫入的幾十萬 token，所以文案一律是「寫入 TTL」。
+#    ⚠ 表頭摘要**只計主對話**：子代理預設寫 5m，混進來會讓每一場都掛上這行、
+#    也會把主對話真正的 1h→5m 切換洗掉。
+#    ⚠⚠ **5m 一律紅底白字，而且不受勾選開關控制**（`.t5` 被 `body.hide-ttl` 排除）。
+#    這一條是 Will 2026-09-22 的裁決，理由是查到 `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL`
+#    ／settings 的 `subagentPromptCacheTtl` 可以把子代理設成 `1h` ⇒ **子代理的 5m 不再是
+#    「本來就這樣」的中性事實**，而是「這段快取只能活 5 分鐘」的可行動訊號。
+#    1h 的徽章維持可勾選（預設關），`5m+1h` 混合步維持中性色。
+#    ⭐ **同一版另加：session 表頭的「花費組成」小表**（新輸入／寫入 5m／寫入 1h／讀取／產出，
+#    各給金額與佔比），MD 表頭同步。目的是讓「要不要為 TTL 改設定」有分母可看——
+#    實測 `7f471e0a` 快取相關佔 89.3%，但其中寫入只有 7.6%（$7.82），
+#    而 `c966f04d` 的子代理寫入佔 32.8%：同樣一句「快取很貴」，結論相反。
+#    ⚠ `call_cost` 改成 `call_cost_parts` 的加總，**兩處共用同一份公式**（測試釘住）。
+#    ⚠ HTML 與 MD 都變 ⇒ 一定要升（不升的話既有的 `out/` 會靜默沿用舊版）。
+RENDERER_VERSION = 61
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -615,19 +633,34 @@ def _ephemeral_split(u):
     return out[0], out[1]
 
 
-def call_cost(model, inp, cache_create, cache_read, out, cc_5m=0, cc_1h=0):
-    """單次 API 呼叫的估算成本（USD）；未知模型回 None。
-    快取寫入依 TTL 細分計價（5 分 1.25×、1 小時 2×）；細分未涵蓋的部分（舊資料）按 5 分計，會低估。"""
+COST_PARTS = ("in", "w5", "w1h", "read", "out")     # 花費組成的欄位順序（顯示端共用）
+COST_PART_LABELS = {"in": "新輸入", "w5": "快取寫入 5m", "w1h": "快取寫入 1h",
+                    "read": "快取讀取", "out": "產出"}
+
+
+def call_cost_parts(model, inp, cache_create, cache_read, out, cc_5m=0, cc_1h=0):
+    """單次呼叫的成本**拆解**（USD）；未知模型回 None。`call_cost` 就是它的加總——
+    兩者共用同一份公式，免得表頭那張組成表與總額各自算出一套數字。
+    舊資料沒有 TTL 細分的寫入量併進 `w5`（按 5 分計價，與 `call_cost` 的既有口徑一致）。"""
     p = model_price(model)
     if not p:
         return None
     pin, pout = p
     legacy = max(cache_create - cc_5m - cc_1h, 0)      # 無細分資訊的寫入量
-    write = (legacy + cc_5m) * CACHE_WRITE_MULT + cc_1h * CACHE_WRITE_MULT_1H
-    return (inp * pin
-            + write * pin
-            + cache_read * pin * CACHE_READ_MULT
-            + out * pout) / 1_000_000
+    return {
+        "in": inp * pin / 1_000_000,
+        "w5": (legacy + cc_5m) * CACHE_WRITE_MULT * pin / 1_000_000,
+        "w1h": cc_1h * CACHE_WRITE_MULT_1H * pin / 1_000_000,
+        "read": cache_read * pin * CACHE_READ_MULT / 1_000_000,
+        "out": out * pout / 1_000_000,
+    }
+
+
+def call_cost(model, inp, cache_create, cache_read, out, cc_5m=0, cc_1h=0):
+    """單次 API 呼叫的估算成本（USD）；未知模型回 None。
+    快取寫入依 TTL 細分計價（5 分 1.25×、1 小時 2×）；細分未涵蓋的部分（舊資料）按 5 分計，會低估。"""
+    parts = call_cost_parts(model, inp, cache_create, cache_read, out, cc_5m, cc_1h)
+    return None if parts is None else sum(parts.values())
 
 
 def cost_label(cost, partial):
@@ -2276,6 +2309,7 @@ def _step_usage(msg, ev=None):
     model = msg.get("model") or ""
     w = rewrite_waste_usd(model, mtok, c5, c1h, wrote=c1)
     return {"input": i, "cache_create": c1, "cache_read": c2, "total_in": total_in, "output": o,
+            "cc5": c5, "cc1h": c1h,     # 本步寫入的 TTL 細分（顯示端 `_ttl_meter`；讀取沒有 TTL 標記）
             "miss": reason, "miss_tok": mtok, "miss_usd": w,
             # 未知模型：有重寫量卻算不出錢 → 徽章要標 ?，靜默省略會被讀成「沒多付」。
             # 條件與 _acc_turn_usage／session 表頭／②-b 三處字面一致（w is None 也可能是被 wrote
@@ -3061,10 +3095,19 @@ def analyze(s, acct_switches=None):
     # 快取 TTL 是「距上次使用」在算的，這個數字才是判讀冷熱的直接依據（statusline 的 (Xs ago) 同義）。
     for groups in [s.main_groups] + list(s.subagent_map.values()):   # 子代理各自一條軸，不與主對話相混
         prev_t = None
+        prev_ttl = ""       # 這條軸上一個**有寫入**的步是哪個 TTL 檔次 → 切換的那一步才標得出來
         for g in groups:
             for b in g.get("blocks", []):
                 if b.get("type") != "_step":
                     continue
+                u = b.get("u")
+                tier = ttl_tier(u)
+                if tier:
+                    # 只有「有寫入」的步才更新基準：純讀取的步沒有 TTL 可言，拿它當基準會讓
+                    # 下一次寫入被誤標成切換。
+                    if prev_ttl and prev_ttl != tier:
+                        u["ttl_prev"] = prev_ttl
+                    prev_ttl = tier
                 t = b.get("t")
                 if t is None:
                     continue
@@ -3093,6 +3136,10 @@ def _collect_usage(s):
     miss_usd_partial = False     # 有前綴變動步是未知模型、金額估不出（表頭顯示 +?）
     miss_cold = 0           # 其中「整段沒命中」的次數（其餘為只掉一段的部分失效）
     efforts = []            # 出現過的 effort 等級（依序、去重）——中途改 effort 會影響快取
+    cost_mix = {k: 0.0 for k in COST_PARTS}   # 花費組成（全場，含子代理——與表頭的總額同一口徑）
+    ttl_n = {"1h": 0, "5m": 0, "both": 0}   # 主對話**有寫入**的步各用哪個 TTL 檔次（只計主對話）
+    ttl_switches = []       # 主對話上的檔次切換 [(當地時間字串, 前, 後)]——多半＝帳號額度狀態變了
+    ttl_prev = ""
     for e in s.events:
         if e.get("type") != "assistant":
             continue
@@ -3122,11 +3169,21 @@ def _collect_usage(s):
             resume_ctx = i + c1 + c2          # 主對話按時間在後者覆蓋前者 → 最終為最後一筆
             resume_model = mdl or resume_model
         c5, c1h = _ephemeral_split(u)
-        c = call_cost(mdl, i, c1, c2, o, c5, c1h)
-        if c is None:
+        if not e.get("isSidechain"):     # 子代理固定 5m（設計如此），混進來會把主對話的切換洗掉
+            tier = ttl_tier({"cc5": c5, "cc1h": c1h})
+            if tier:
+                ttl_n[tier] += 1
+                if ttl_prev and ttl_prev != tier:
+                    when_sw = local_str(e.get("_dt"), "%H:%M") if e.get("_dt") else ""
+                    ttl_switches.append((when_sw, ttl_prev, tier))
+                ttl_prev = tier
+        parts = call_cost_parts(mdl, i, c1, c2, o, c5, c1h)
+        if parts is None:
             unpriced = True
         else:
-            cost += c
+            cost += sum(parts.values())
+            for k in COST_PARTS:
+                cost_mix[k] += parts[k]
         eff = str(e.get("effort") or "")
         if eff and eff not in efforts:
             efforts.append(eff)
@@ -3156,6 +3213,9 @@ def _collect_usage(s):
     s.miss_usd_partial = miss_usd_partial
     s.miss_cold = miss_cold
     s.efforts = efforts
+    s.cost_mix = cost_mix
+    s.ttl_n = ttl_n
+    s.ttl_switches = ttl_switches
     s.cache_pct = round(100 * cr / total_in) if total_in else 0
     s.usage = {"input": inp, "cache_create": cc, "cache_read": cr, "output": out, "total_in": total_in}
 
@@ -3982,13 +4042,61 @@ def _miss_meter(reason, mtok, usd, partial=False, unpriced=False):
             f'⚠{tag}{esc(miss_label(reason))}{extra}</span>')
 
 
+def ttl_tier(u):
+    """這一步**寫入**的 TTL 檔次："1h" / "5m" / "both"（同一步兩種都寫）；沒有寫入或舊資料無細分回 ""。
+
+    ⚠ **只描述寫入，不描述這一步讀到的快取。** TTL 標記只掛在 `cache_creation` 上，`cache_read`
+    沒有這個欄位——實測（session `515b05fa`、`b61dc0b7`）寫入已經降成 5m 的那一步，照樣讀得到
+    先前用 1h 寫進去的幾十萬 token。所以徽章一律寫「寫入 TTL」，不可簡寫成「快取 5m」。
+    """
+    if not isinstance(u, dict):
+        return ""
+    c5, c1h = u.get("cc5") or 0, u.get("cc1h") or 0
+    if c5 and c1h:
+        return "both"
+    if c1h:
+        return "1h"
+    if c5:
+        return "5m"
+    return ""      # 純讀取／空步／Codex（無此欄）＝沒有 TTL 可言，不猜一個掛上去
+
+
+TTL_LABELS = {"1h": "1h", "5m": "5m", "both": "5m+1h"}
+_TTL_TIP = ("這一步**寫入**快取時用的 TTL（`usage.cache_creation` 的 5 分／1 小時細分）。"
+            "只描述寫入：同一步仍可能讀到先前用另一種 TTL 寫進去的前綴。"
+            "子代理預設寫 5m（可用 CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h 改掉）；"
+            "主對話中途由 1h 轉 5m 多半是帳號進入 usage overage")
+
+
+def _ttl_meter(u):
+    """本步寫入 TTL 的徽章。切換的那一步另標「1h→5m」。
+
+    ⚠⚠ **5m 一律紅底白字、而且不受勾選開關控制**（`.t5` 被 `body.hide-ttl` 的規則排除）。
+    理由：5m **不是**「子代理本來就這樣」的中性事實——`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL`
+    （或 settings 的 `subagentPromptCacheTtl`）可以把子代理設成 `1h`，所以看到 5m 一律代表
+    「這段快取只能活 5 分鐘、中斷回來就是整段重寫」，那是要當場看見的事，不是要勾才看得到的細節。
+    1h 的徽章維持可勾選（預設關），因為它是常態、每步都標只會變成噪音。
+    `5m+1h` 混合步維持中性：它不是純粹的 5m，紅字會誇大。"""
+    tier = ttl_tier(u)
+    if not tier:
+        return ""
+    prev = (u or {}).get("ttl_prev") or ""
+    hot = " t5" if tier == "5m" else ""     # 落點是純 5m 才紅（含 1h→5m 這種切換）
+    if prev and prev != tier:
+        return (f'<span class="meter m-ttl sw{hot}" title="{esc_attr(_TTL_TIP)}">'
+                f'寫入 TTL {esc(TTL_LABELS.get(prev, prev))}→{esc(TTL_LABELS.get(tier, tier))}</span>')
+    return (f'<span class="meter m-ttl{hot}" title="{esc_attr(_TTL_TIP)}">'
+            f'寫入 TTL {esc(TTL_LABELS.get(tier, tier))}</span>')
+
+
 def _extra_meters(u, gap=None):
-    """可勾選的補充徽章：距上一次 API 呼叫多久（TTL 是按「距上次使用」在算）、該步 effort 等級
-    （切 effort 會改變請求前綴 → 影響快取）。無資料的欄位不輸出。"""
+    """可勾選的補充徽章：距上一次 API 呼叫多久（TTL 是按「距上次使用」在算）、該步寫入的 TTL 檔次、
+    該步 effort 等級（切 effort 會改變請求前綴 → 影響快取）。無資料的欄位不輸出。"""
     out = ""
     if gap is not None:
         out += (f'<span class="meter m-gap" title="距上一次 API 呼叫（快取 TTL 以距上次使用計）">'
                 f'距上一步 {fmt_dur(gap)}</span>')
+    out += _ttl_meter(u)
     if u and u.get("effort"):
         out += (f'<span class="meter m-eff" title="這次呼叫的推理強度（effort）；中途改 effort 會變動請求、影響快取">'
                 f'effort {esc(u["effort"])}</span>')
@@ -4018,6 +4126,66 @@ def _miss_head(s):
     if cold and cold < n:
         head += f"（整段 {cold}、只掉一段 {n - cold}）"
     return f"{head}（{detail}）{cost}", "Claude API 自報的成因；「只掉一段」在 ⚡% 上看不出來"
+
+
+def cost_mix_rows(s):
+    """花費組成 → [(標籤, 金額, 佔比 0–1)]；沒有可計價的呼叫回 []。
+
+    ⚠ **分母是這一場的估算總額**（含子代理），與表頭 `💲~$X` 同一個數字——換別的分母，
+    兩個地方對同一場會給出兩套佔比。未知模型的呼叫兩邊都算不進去（表頭已用 `+?` 揭露）。"""
+    mix = getattr(s, "cost_mix", None) or {}
+    tot = sum(mix.get(k, 0.0) for k in COST_PARTS)
+    if tot <= 0:
+        return []
+    return [(COST_PART_LABELS[k], mix.get(k, 0.0), mix.get(k, 0.0) / tot) for k in COST_PARTS]
+
+
+def _cost_mix_html(s):
+    """表頭下方的花費組成表。⚠ 全是 0 的列也留著（例如「新輸入 0.0%」）——
+    那一格本身就是資訊：長對話幾乎沒有新輸入，看到 0 才知道錢花在哪裡。"""
+    rows = cost_mix_rows(s)
+    if not rows:
+        return ""
+    tds = "".join(
+        f'<tr><th>{esc(lbl)}</th><td class="mono">{esc(fmt_money(usd))}</td>'
+        f'<td class="mono">{pct * 100:.1f}%</td></tr>'
+        for lbl, usd, pct in rows)
+    tip = ("估算花費的組成；分母是本場估算總額。快取讀取是 0.1× 單價（快取在幫你省錢的那半），"
+           "快取寫入才是 TTL 選擇會動到的成本：5m 是 1.25×、1h 是 2×")
+    return (f'<table class="costmix" title="{esc_attr(tip)}">'
+            f'<caption>花費組成（估算）</caption>{tds}</table>')
+
+
+def _ttl_head(s):
+    """session 表頭的「寫入 TTL」摘要 → (文字, tip)；**全程 1h（最常見）就回 ("", "")**，不佔版面。
+
+    只計主對話：子代理固定寫 5m，混進來會讓每一場都掛上這行。**中途從 1h 轉 5m 值得看一眼**
+    ——本機實測兩場（`b61dc0b7`、`515b05fa`）都是帳號進入 usage overage 的那一刻，
+    之後每次閒置超過 5 分鐘回來就是整段重寫。"""
+    n = getattr(s, "ttl_n", None) or {}
+    tot = sum(n.values())
+    if not tot or (n.get("1h", 0) == tot and not getattr(s, "ttl_switches", None)):
+        return "", ""
+    parts = [f"{TTL_LABELS[k]} {n[k]} 步" for k in ("1h", "5m", "both") if n.get(k)]
+    text = "寫入 TTL：" + "／".join(parts)
+    sw = getattr(s, "ttl_switches", None) or []
+    if sw:
+        shown = "、".join(f"{t} 起 {TTL_LABELS.get(a, a)}→{TTL_LABELS.get(b, b)}" for t, a, b in sw[:2])
+        text += f"（{shown}{'…' if len(sw) > 2 else ''}）"
+    return text, ("只計主對話（子代理另計，預設寫 5m，可用 CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h 改）。"
+                  "主對話中途由 1h 轉 5m，本機實測對應帳號進入 usage overage；"
+                  "5m 期間閒置超過 5 分鐘回來就是整段重寫")
+
+
+def _ttl_summary_html(s):
+    """表頭的寫入 TTL 摘要；全程 1h 回 ""。"""
+    text, tip = _ttl_head(s)
+    if not text:
+        return ""
+    # 只要有 5m 就標警示色：5m 不是中性事實（子代理也能設成 1h），它代表「中斷回來就整段重寫」。
+    n = getattr(s, "ttl_n", None) or {}
+    cls = ' class="warn"' if ((getattr(s, "ttl_switches", None) or []) or n.get("5m")) else ""
+    return f' · <span{cls} title="{esc_attr(tip)}">{esc(text)}</span>'
 
 
 def _miss_summary_html(s):
@@ -6446,6 +6614,7 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
         peak_pct = f"（{round(100 * s.ctx_peak / peak_win)}% / {fmt_tokens(peak_win)}）" if peak_win and s.ctx_peak else ""
         usage += (f" · 💲~{cost} · ⚡快取 {s.cache_pct}%"
                   f" · 脈絡峰值 {fmt_tokens(s.ctx_peak)}{peak_pct} · 產出 {fmt_tokens(s.tok_out)}")
+    usage += _ttl_summary_html(s)
     usage += _miss_summary_html(s)
     rc = getattr(s, "resume_ctx", 0)
     if rc:
@@ -6507,12 +6676,14 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
     <label><input type="checkbox" id="cb_out" onchange="tm('out')">產出</label>
     <label><input type="checkbox" id="cb_gap" onchange="tm('gap')" title="距上一次 API 呼叫多久（快取 TTL 以距上次使用計）">距上一步</label>
     <label><input type="checkbox" id="cb_dur" onchange="tm('dur')" title="這個回合實際耗時（送出 → 答完）">⏱耗時</label>
+    <label><input type="checkbox" id="cb_ttl" onchange="tm('ttl')" title="這一步寫入快取用的 TTL；只描述寫入，不代表讀到的快取。⚠ 5m 一律紅底顯示，不受這個開關控制；這裡勾的是 1h 那些">寫入 TTL</label>
     <label><input type="checkbox" id="cb_eff" onchange="tm('eff')" title="該次呼叫的推理強度 effort">effort</label>
   </div>
   <h1>{h1}</h1>
   {sub}
   <div class="smeta">{meta}</div>
   <div class="smeta">{esc(when)} · {stats} · <span class="mono">{esc(s.session_id)}</span></div>
+  {_cost_mix_html(s)}
   {sub_toc}
   <div class="thread">{''.join(turns)}</div>
   {side_html}
@@ -6664,8 +6835,8 @@ setTimeout(bmGo,0);
    所以「網址列已經是 #k…、再點一次同一個我的最愛」完全靜默。頁內連結不受影響
    （走 onclick→openSub）。這是瀏覽器行為，靜態頁擋不到；不做假的修補。 */
 addEventListener('hashchange',bmGo);
-var MET=['cache','miss','cost','in','cw','cr','ctx','out','gap','dur','eff'],
-    DEF={{cache:1,miss:1,cost:1,in:0,cw:0,cr:0,ctx:0,out:0,gap:1,dur:0,eff:0}};
+var MET=['cache','miss','cost','in','cw','cr','ctx','out','gap','dur','ttl','eff'],
+    DEF={{cache:1,miss:1,cost:1,in:0,cw:0,cr:0,ctx:0,out:0,gap:1,dur:0,ttl:0,eff:0}};
 function lsGet(k){{try{{return localStorage.getItem(k);}}catch(e){{return null;}}}}
 function lsSet(k,v){{try{{localStorage.setItem(k,v);return true;}}catch(e){{return false;}}}}
 function applyMet(){{MET.forEach(function(k){{var v=lsGet('m_'+k);v=(v===null)?DEF[k]:(v==='1'?1:0);document.body.classList.toggle('hide-'+k,!v);var cb=document.getElementById('cb_'+k);if(cb)cb.checked=!!v;}});}}
@@ -6677,7 +6848,7 @@ var BK_MGR={bk_mgr};
 </script>
 """
     return html_page(s.title, body,
-                     body_class="hide-in hide-cw hide-cr hide-ctx hide-out hide-dur hide-eff")
+                     body_class="hide-in hide-cw hide-cr hide-ctx hide-out hide-dur hide-ttl hide-eff")
 
 
 # =========================================================================
@@ -6882,7 +7053,12 @@ def render_session_md(s: Session) -> str:
          if (s.usage.get("total_in") or s.tok_out) else None),
         (f"- 脈絡峰值：{fmt_tokens(s.ctx_peak)} · 產出 {fmt_tokens(s.tok_out)}"
          if (s.usage.get("total_in") or s.tok_out) else None),
+        (("- 花費組成（估算）："
+          + "、".join(f"{lbl} {fmt_money(usd)}（{pct * 100:.1f}%）"
+                      for lbl, usd, pct in cost_mix_rows(s)))
+         if cost_mix_rows(s) else None),
         (f"- effort：{'→'.join(s.efforts)}" if getattr(s, "efforts", None) else None),
+        (f"- {_ttl_head(s)[0]}（只計主對話）" if _ttl_head(s)[0] else None),
         (f"- {_miss_head(s)[0]}（API 自報）" if _miss_head(s)[0] else None),
         (f"- 型態：{KIND_LABELS.get(s.kind, s.kind)}" if s.kind != "chat" else None),
         f"- Session：`{s.session_id}` · v{s.version}",
@@ -9238,6 +9414,11 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 h1{font-size:22px;margin:.4em 0 .2em}
 .smeta{color:var(--muted);font-size:13px;margin:2px 0;word-break:break-all}
 .smeta .warn{color:#d29922}
+/* 花費組成表：窄表、靠左，別跟正文搶注意力。數字右對齊才比得出量級。 */
+.costmix{border-collapse:collapse;margin:6px 0 10px;font-size:12px;color:var(--muted)}
+.costmix caption{text-align:left;padding-bottom:2px;color:var(--muted)}
+.costmix th{text-align:left;font-weight:400;padding:1px 10px 1px 0}
+.costmix td{text-align:right;padding:1px 0 1px 10px}
 .mono,.nowrap{white-space:nowrap}.mono{font-family:ui-monospace,Consolas,monospace}
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
 .ctrl button,.back{background:var(--panel);border:1px solid var(--border);color:var(--text);
@@ -9263,8 +9444,11 @@ border-bottom:1px solid var(--border);font-size:13px;background:rgba(127,127,127
 .meter.coldx{background:rgba(127,127,127,.22);color:var(--muted);font-weight:600;text-decoration:underline dotted}
 .meter.m-miss{background:rgba(210,153,34,.18);color:#d29922;font-weight:600}
 .meter.m-miss.part{background:rgba(127,127,127,.14);color:var(--muted);font-weight:500}
-.meter.m-gap,.meter.m-dur,.meter.m-eff{color:var(--muted)}
-body.hide-cache .m-cache,body.hide-miss .m-miss,body.hide-cost .m-cost,body.hide-in .m-in,body.hide-cw .m-cw,body.hide-cr .m-cr,body.hide-ctx .m-ctx,body.hide-out .m-out,body.hide-gap .m-gap,body.hide-dur .m-dur,body.hide-eff .m-eff{display:none}
+.meter.m-gap,.meter.m-dur,.meter.m-eff,.meter.m-ttl{color:var(--muted)}
+/* 5m ＝ 這段快取只能活 5 分鐘 ⇒ 紅底白字（沿用 .cold 的樣式），而且不受勾選開關控制。
+   `5m+1h` 混合步不上紅：它不是純粹的 5m。 */
+.meter.m-ttl.t5{background:var(--err);color:#fff;font-weight:600}
+body.hide-cache .m-cache,body.hide-miss .m-miss,body.hide-cost .m-cost,body.hide-in .m-in,body.hide-cw .m-cw,body.hide-cr .m-cr,body.hide-ctx .m-ctx,body.hide-out .m-out,body.hide-gap .m-gap,body.hide-dur .m-dur,body.hide-ttl .m-ttl:not(.t5),body.hide-eff .m-eff{display:none}
 .step-sep{display:flex;align-items:center;flex-wrap:wrap;gap:0;margin:12px 0 4px;padding-top:7px;border-top:1px dashed var(--border)}
 .step-sep .meter{margin-left:6px}
 .step-n{font-size:11px;font-weight:600;color:var(--muted)}

@@ -1269,7 +1269,7 @@ def test_api_miss_reason(tmp_path=None):
         "effort max": "步驟徽章應顯示 effort",
         "⏱36秒": "多段耗時要累加（21s＋5s＋掛在無內容事件上的 10s），不是只留最後一段、也不得漏掉後者",
         "⚠ 快取被打斷 3 次": "session 表頭應彙總被打斷次數",
-        "hide-dur hide-eff": "耗時與 effort 應預設隱藏",
+        "hide-dur hide-ttl hide-eff": "耗時、寫入 TTL 與 effort 應預設隱藏",
         "%)": "脈絡徽章應附佔 context 視窗的 %",
     }.items():
         assert needle in html, f"{msg}（找不到 {needle!r}）"
@@ -1547,6 +1547,174 @@ def test_api_miss_reason(tmp_path=None):
     assert v._cause_key(1000, 0) == 1000 and v._cause_key(1000, 1) == (1000, 1)
 
     print("OK: api miss reason test passed")
+
+
+def test_write_ttl_badges(tmp_path=None):
+    """寫入 TTL 的呈現（RENDERER_VERSION 61）。
+
+    守三件事，三件都是**安靜**的失敗方向：
+    ① 徽章只描述本步寫入——沒有寫入的步不得標（否則會被讀成「這一步的快取只剩 5 分鐘」）；
+    ② 1h→5m 的切換要標得出來，而且**只在切換那一步**（每步都標＝噪音，等於看不見切換點）；
+    ③ 表頭摘要只計主對話——子代理固定寫 5m，混進來會讓每一場都掛上這行，
+       而且會把主對話真正的切換洗掉。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    # ── 單元：檔次判定 ──
+    assert v.ttl_tier({"cc5": 0, "cc1h": 900}) == "1h"
+    assert v.ttl_tier({"cc5": 900, "cc1h": 0}) == "5m"
+    assert v.ttl_tier({"cc5": 9, "cc1h": 9}) == "both"
+    assert v.ttl_tier({"cc5": 0, "cc1h": 0}) == "", "純讀取的步沒有 TTL 可言，不得猜一個"
+    assert v.ttl_tier({}) == "", "舊資料（無 cache_creation 細分）不得被當成 5m"
+
+    tmp = new_tmp(tmp_path)
+    sid = "11110000-0000-4000-8000-0000000011ff"     # 主對話 1h → 5m（中途切換）
+    sid2 = "22220000-0000-4000-8000-0000000022ff"    # 全程 1h（表頭不該出現這一行）
+    proj = tmp / "projects" / "ttl-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+
+    def a(sess, t, mid, cw, cr, uuid, ttl="1h", side=False):
+        cc = ({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": cw} if ttl == "1h"
+              else {"ephemeral_5m_input_tokens": cw, "ephemeral_1h_input_tokens": 0})
+        u = {"input_tokens": 2, "cache_creation_input_tokens": cw,
+             "cache_read_input_tokens": cr, "output_tokens": 30, "cache_creation": cc}
+        return {"type": "assistant", "uuid": uuid, "timestamp": t, "sessionId": sess,
+                "isSidechain": side, "message": {
+                    "role": "assistant", "model": "claude-opus-4-8", "id": mid, "usage": u,
+                    "content": [{"type": "text", "text": f"答{mid}"}]}}
+
+    def q(sess, t, uuid, text, side=False):
+        return {"type": "user", "uuid": uuid, "timestamp": t, "cwd": "/x/Proj",
+                "gitBranch": "main", "version": "2.1.278", "sessionId": sess, "isSidechain": side,
+                "message": {"role": "user", "content": text}}
+
+    ev = [
+        q(sid, "2026-09-22T01:00:00.000Z", "u1", "問題一TTLQ"),
+        a(sid, "2026-09-22T01:00:05.000Z", "t_1", 5000, 0, "a1"),
+        a(sid, "2026-09-22T01:00:09.000Z", "t_2", 900, 5000, "a2"),
+        q(sid, "2026-09-22T01:20:00.000Z", "u2", "問題二TTLQ"),
+        # 進入 overage：同一條主對話軸上，寫入從 1h 變成 5m（這一步要標 1h→5m）
+        a(sid, "2026-09-22T01:20:05.000Z", "t_3", 800, 5900, "a3", ttl="5m"),
+        # 之後仍是 5m，但**不是**切換點 → 只標「寫入 TTL 5m」
+        a(sid, "2026-09-22T01:20:09.000Z", "t_4", 700, 6700, "a4", ttl="5m"),
+        # 子代理：固定 5m，而且不得影響主對話的摘要與切換判定
+        q(sid, "2026-09-22T01:21:00.000Z", "s0", "子代理任務", side=True),
+        a(sid, "2026-09-22T01:21:05.000Z", "t_s1", 4000, 0, "s1", ttl="5m", side=True),
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in ev), encoding="utf-8")
+    ev2 = [
+        q(sid2, "2026-09-22T02:00:00.000Z", "v1", "全程一小時TTLQ"),
+        a(sid2, "2026-09-22T02:00:05.000Z", "z_1", 5000, 0, "b1"),
+        a(sid2, "2026-09-22T02:00:09.000Z", "z_2", 900, 5000, "b2"),
+    ]
+    (proj / f"{sid2}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in ev2), encoding="utf-8")
+
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={tmp / 'projects'}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    pages = {p.name: p.read_text(encoding="utf-8")
+             for p in list(_session_pages(out)) + list((out / "sessions").rglob("*.md"))}
+    html = next(t for n, t in pages.items() if sid[:8] in n and n.endswith(".html"))
+    plain = next(t for n, t in pages.items() if sid2[:8] in n and n.endswith(".html"))
+    mdtxt = next(t for n, t in pages.items() if sid[:8] in n and n.endswith(".md"))
+
+    assert 'id="cb_ttl"' in html, "應有『寫入 TTL』勾選框"
+    assert "寫入 TTL 1h</span>" in html, "1h 寫入的步應標 1h"
+    assert 'class="meter m-ttl sw t5"' in html and "寫入 TTL 1h→5m" in html, \
+        "1h→5m 的切換步應標出來，而且落點是 5m ⇒ 要帶 .t5"
+    # ⚠⚠ 5m 一律紅底白字、且**不受勾選開關控制**（Will 2026-09-22 裁決）：
+    # 子代理可用 CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h 改掉 ⇒ 5m 不是中性事實。
+    # 只驗 class 不夠——隱藏規則把它藏起來，紅色一樣沒人看得到，所以三格一起守。
+    assert 'class="meter m-ttl t5"' in html, "純 5m 的步要帶 .t5（紅底白字）"
+    assert ".meter.m-ttl.t5{background:var(--err);color:#fff" in html, "5m 應沿用 .cold 的紅底白字"
+    assert "body.hide-ttl .m-ttl:not(.t5)" in html, (
+        "隱藏規則必須排除 .t5，否則預設關的開關會把紅色 5m 一起藏掉")
+    assert html.count("寫入 TTL 1h→5m") == 1, \
+        f"切換只發生一次，卻標了 {html.count('寫入 TTL 1h→5m')} 次——每步都標等於看不見切換點"
+    # 表頭：只計主對話（1h 2 步、5m 2 步；子代理那一步不算）
+    assert "寫入 TTL：1h 2 步／5m 2 步" in html, "表頭應彙總主對話各檔次步數（不含子代理）"
+    assert "起 1h→5m" in html, "表頭應標出切換時刻"
+    assert "寫入 TTL" in mdtxt and "1h→5m" in mdtxt, "MD 表頭也要看得到"
+    # 全程 1h 的那一場：表頭不出現這一行（最常見的情形不佔版面），但逐步徽章仍在
+    assert "寫入 TTL：" not in plain, "全程 1h 的 session 表頭不應出現寫入 TTL 摘要"
+    assert "寫入 TTL 1h</span>" in plain, "逐步徽章與表頭摘要是兩件事，前者照常要有"
+    assert "m-ttl t5" not in plain, "全程 1h 的 session 不該出現紅色 5m 徽章"
+    # 子代理那一步也是 5m ⇒ 同樣要紅（那是可以改掉的預設，不是理所當然）
+    assert html.count("m-ttl t5") >= 2, "子代理的 5m 也要標紅，不得當成中性事實"
+
+    print("OK: write TTL badges test passed")
+
+
+def test_cost_mix_table(tmp_path=None):
+    """表頭的「花費組成」表（RENDERER_VERSION 61）。
+
+    守兩件事：
+    ① **組成的加總要等於表頭那個總額**——兩處各算一套是這種表最典型的安靜錯誤，
+       畫面上看起來都很合理，但讀者拿它做決策（「寫入佔多少、值不值得改 TTL」）會被誤導；
+    ② 0 的列要留著。長對話「新輸入 0.0%」本身就是資訊，省略會讓人以為漏算。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    # 單元：拆解的加總 == call_cost
+    args = ("claude-opus-4-8", 100, 5000, 400000, 800, 1200, 3800)
+    parts = v.call_cost_parts(*args)
+    assert parts is not None
+    assert abs(sum(parts.values()) - v.call_cost(*args)) < 1e-12, \
+        "組成的加總必須等於 call_cost，否則表與總額會各說各話"
+    assert v.call_cost_parts("claude-zzznew-9", 1, 1, 1, 1) is None, "未知模型要回 None"
+    # 舊資料（沒有 TTL 細分）的寫入量要併進 5m，不可憑空消失
+    legacy = v.call_cost_parts("claude-opus-4-8", 0, 1000, 0, 0)
+    assert legacy["w5"] > 0 and legacy["w1h"] == 0, "無細分的寫入按 5m 計，與 call_cost 口徑一致"
+
+    tmp = new_tmp(tmp_path)
+    sid = "33330000-0000-4000-8000-0000000033ff"
+    proj = tmp / "projects" / "mix-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    ev = [
+        {"type": "user", "uuid": "m1", "timestamp": "2026-09-22T03:00:00.000Z", "cwd": "/x/Proj",
+         "gitBranch": "main", "version": "2.1.278", "sessionId": sid, "isSidechain": False,
+         "message": {"role": "user", "content": "問題COSTMIXQ"}},
+        {"type": "assistant", "uuid": "m2", "timestamp": "2026-09-22T03:00:05.000Z",
+         "sessionId": sid, "isSidechain": False, "message": {
+             "role": "assistant", "model": "claude-opus-4-8", "id": "x_1",
+             "usage": {"input_tokens": 10, "cache_creation_input_tokens": 4000,
+                       "cache_read_input_tokens": 500000, "output_tokens": 900,
+                       "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                                          "ephemeral_1h_input_tokens": 4000}},
+             "content": [{"type": "text", "text": "答COSTMIX"}]}},
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in ev), encoding="utf-8")
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={tmp / 'projects'}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    html = list(_session_pages(out))[0].read_text(encoding="utf-8")
+    mdtxt = list((out / "sessions").rglob("*.md"))[0].read_text(encoding="utf-8")
+
+    assert 'class="costmix"' in html and "花費組成" in html, "表頭應有花費組成表"
+    for lbl in ("新輸入", "快取寫入 5m", "快取寫入 1h", "快取讀取", "產出"):
+        assert lbl in html, f"組成表應有「{lbl}」這一列（0 的列也要留）"
+    # 佔比加總要落在 100%（容忍逐列四捨五入）
+    pcts = [float(x) for x in re.findall(r'<td class="mono">([0-9.]+)%</td>', html)]
+    assert len(pcts) == 5, f"應有五列佔比，實際 {len(pcts)}"
+    assert abs(sum(pcts) - 100.0) < 0.3, f"佔比加總應為 100%，實際 {sum(pcts)}"
+    # 這筆素材：讀取 50 萬 × 0.1× 遠大於其他項 ⇒ 讀取必須是最大的一列
+    assert pcts[3] == max(pcts), f"讀取應佔最大宗，實際各列 {pcts}"
+    assert "花費組成（估算）：" in mdtxt and "快取讀取" in mdtxt, "MD 也要有同一份組成"
+
+    print("OK: cost mix table test passed")
 
 
 def test_ctx_window_and_coldest(tmp_path=None):
@@ -7249,6 +7417,8 @@ if __name__ == "__main__":
     test_classify_cache_causes()
     test_cold_cause_badges()
     test_api_miss_reason()
+    test_write_ttl_badges()
+    test_cost_mix_table()
     test_ctx_window_and_coldest()
     test_codex_ai_label()
     test_codex_item_completed_user()

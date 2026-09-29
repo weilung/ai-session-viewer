@@ -1595,6 +1595,9 @@ def test_write_ttl_badges(tmp_path=None):
         a(sid, "2026-09-22T01:00:05.000Z", "t_1", 5000, 0, "a1"),
         a(sid, "2026-09-22T01:00:09.000Z", "t_2", 900, 5000, "a2"),
         q(sid, "2026-09-22T01:20:00.000Z", "u2", "問題二TTLQ"),
+        # 純讀取的步夾在兩次寫入之間：它沒有 TTL 可言，**不可以**重設切換的基準——
+        # 否則下一步的 1h→5m 會因為「上一步沒有檔次」而標不出來
+        a(sid, "2026-09-22T01:20:03.000Z", "t_2r", 0, 5900, "a2r"),
         # 進入 overage：同一條主對話軸上，寫入從 1h 變成 5m（這一步要標 1h→5m）
         a(sid, "2026-09-22T01:20:05.000Z", "t_3", 800, 5900, "a3", ttl="5m"),
         # 之後仍是 5m，但**不是**切換點 → 只標「寫入 TTL 5m」
@@ -1649,6 +1652,171 @@ def test_write_ttl_badges(tmp_path=None):
     # 子代理那一步也是 5m ⇒ 同樣要紅（那是可以改掉的預設，不是理所當然）
     assert html.count("m-ttl t5") >= 2, "子代理的 5m 也要標紅，不得當成中性事實"
 
+    # ── 表頭與逐步徽章必須講同一件事（兩處若各算一次，行序≠時間序時就會分岔）──
+    # 檔案行序刻意打亂：時間上是 1h → 5m → 5m，行序卻是 5m、1h、5m。另夾一筆**沒有可呈現內容**的
+    # 5m 呼叫（不會有 `_step`、也就沒有徽章）——表頭不可以把它算成一步。
+    sid3 = "44440000-0000-4000-8000-0000000044ff"
+    ev3 = [
+        q(sid3, "2026-09-22T04:00:00.000Z", "w1", "亂序TTLQ"),
+        a(sid3, "2026-09-22T04:00:20.000Z", "o_3", 700, 5900, "c3", ttl="5m"),
+        a(sid3, "2026-09-22T04:00:05.000Z", "o_1", 5000, 0, "c1"),
+        a(sid3, "2026-09-22T04:00:10.000Z", "o_2", 800, 5000, "c2", ttl="5m"),
+    ]
+    blank = a(sid3, "2026-09-22T04:00:15.000Z", "o_x", 600, 5800, "cx", ttl="5m")
+    blank["message"]["content"] = []            # 有 usage、沒有任何可呈現的內容
+    ev3.insert(2, blank)
+    (proj / f"{sid3}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in ev3), encoding="utf-8")
+    s3 = v.load_session(proj / f"{sid3}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s3)
+    steps3 = [b for g in s3.main_groups for b in g.get("blocks", []) if b.get("type") == "_step"]
+    badge_tiers = [v.ttl_tier(b.get("u")) for b in steps3]
+    badge_sw = [(b["u"].get("ttl_prev"), v.ttl_tier(b["u"])) for b in steps3 if b["u"].get("ttl_prev")]
+    assert badge_tiers == ["1h", "5m", "5m"], f"逐步徽章應照時間序：{badge_tiers}"
+    assert badge_sw == [("1h", "5m")], f"徽章只該有一次 1h→5m：{badge_sw}"
+    assert s3.ttl_n == {"1h": 1, "5m": 2, "both": 0}, \
+        f"表頭步數要與徽章同一串步驟（沒有 `_step` 的呼叫不算）：{s3.ttl_n}"
+    assert [(a_, b_) for _, a_, b_ in s3.ttl_switches] == badge_sw, \
+        f"表頭的切換要與徽章一致，不可以照檔案行序另算出 5m→1h：{s3.ttl_switches}"
+    # 沒有 `_step` 的那次 5m 呼叫：不算步，但**要另列**——寫入照樣發生，只是畫不出來
+    assert s3.ttl_hidden == {"1h": 0, "5m": 1, "both": 0}, f"隱形呼叫的寫入要另計：{s3.ttl_hidden}"
+    assert "另有 1 次沒有可呈現內容的呼叫（5m ×1）" in v._ttl_head(s3)[0], v._ttl_head(s3)[0]
+
+    # 畫得出來的步全是 1h、唯一的 5m 寫入在隱形呼叫裡：表頭**不可以**因為「全程 1h」而整行不出現
+    sid5 = "77770000-0000-4000-8000-0000000077ff"
+    blank5 = a(sid5, "2026-09-22T06:00:10.000Z", "h_x", 600, 5000, "hx", ttl="5m")
+    blank5["message"]["content"] = []
+    (proj / f"{sid5}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        q(sid5, "2026-09-22T06:00:00.000Z", "y1", "隱形五分TTLQ"),
+        a(sid5, "2026-09-22T06:00:05.000Z", "h_1", 5000, 0, "h1"),
+        blank5,
+        a(sid5, "2026-09-22T06:00:20.000Z", "h_2", 700, 5600, "h2"),
+    ]), encoding="utf-8")
+    s5 = v.load_session(proj / f"{sid5}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s5)
+    head5 = v._ttl_summary_html(s5)
+    assert "另有 1 次沒有可呈現內容的呼叫（5m ×1）" in head5 and 'class="warn"' in head5, \
+        f"隱形的 5m 寫入要讓表頭出現並上警示色：{head5!r}"
+
+    # 隱形呼叫的兩種邊角：①沒有 message.id（每一筆各自是一次呼叫）；②同一個 id 的第一筆沒有
+    # usage、第二筆才有——usage 要取第一筆**帶 usage 的**，不是第一筆事件
+    sid7 = "99990000-0000-4000-8000-0000000099ff"
+    anon = a(sid7, "2026-09-22T08:00:10.000Z", "unused", 600, 5000, "an1", ttl="5m")
+    anon["message"].pop("id")
+    anon["message"]["content"] = []
+    split_a = a(sid7, "2026-09-22T08:00:12.000Z", "g_s", 0, 0, "sp1")
+    split_a["message"]["content"] = []
+    split_a["message"].pop("usage")
+    split_b = a(sid7, "2026-09-22T08:00:13.000Z", "g_s", 500, 5000, "sp2", ttl="5m")
+    split_b["message"]["content"] = []
+    (proj / f"{sid7}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        q(sid7, "2026-09-22T08:00:00.000Z", "w7", "隱形邊角TTLQ"),
+        a(sid7, "2026-09-22T08:00:05.000Z", "g_1", 5000, 0, "g1"),
+        anon, split_a, split_b,
+        a(sid7, "2026-09-22T08:00:20.000Z", "g_2", 700, 5600, "g2"),
+    ]), encoding="utf-8")
+    s7 = v.load_session(proj / f"{sid7}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s7)
+    assert s7.ttl_hidden == {"1h": 0, "5m": 2, "both": 0}, (
+        "沒有 id 的隱形呼叫、以及「第一筆沒有 usage」的隱形呼叫都要算進去："
+        f"{s7.ttl_hidden}")
+
+    # ── 沒有 TTL 細分的寫入（舊資料）：有其他檔次時要另列，否則「不顯示」會被讀成「全程 1h」──
+    def legacy_a(sess, t, mid, cw, uuid, blank=False):
+        e = a(sess, t, mid, cw, 0, uuid)
+        e["message"]["usage"].pop("cache_creation")          # 只剩 cache_creation_input_tokens
+        if blank:
+            e["message"]["content"] = []
+        return e
+    sid8 = "aaaa0000-0000-4000-8000-00000000aaff"
+    (proj / f"{sid8}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        q(sid8, "2026-09-22T09:00:00.000Z", "l1", "舊資料混用TTLQ"),
+        a(sid8, "2026-09-22T09:00:05.000Z", "l_1", 5000, 0, "la1"),
+        legacy_a(sid8, "2026-09-22T09:00:10.000Z", "l_2", 600, "la2"),              # 畫得出來的舊資料寫入
+        legacy_a(sid8, "2026-09-22T09:00:12.000Z", "l_3", 600, "la3", blank=True),  # 隱形的舊資料寫入
+    ]), encoding="utf-8")
+    s8 = v.load_session(proj / f"{sid8}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s8)
+    head8 = v._ttl_head(s8)[0]
+    assert "TTL 未知 1 步" in head8 and "TTL 未知 ×1" in head8, (
+        f"有 1h 又有沒有細分的寫入時，表頭不可以因為「全程 1h」而不顯示：{head8!r}")
+    # 整場都是舊資料：沒有任何檔次可講 ⇒ 照樣不顯示（花費組成表另有一列）
+    sid9 = "bbbb0000-0000-4000-8000-00000000bbff"
+    (proj / f"{sid9}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        q(sid9, "2026-09-22T10:00:00.000Z", "m1", "全是舊資料TTLQ"),
+        legacy_a(sid9, "2026-09-22T10:00:05.000Z", "o_1", 5000, "oa1"),
+    ]), encoding="utf-8")
+    s9 = v.load_session(proj / f"{sid9}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s9)
+    assert v._ttl_head(s9)[0] == "", f"整場都是舊資料時不顯示這一行：{v._ttl_head(s9)[0]!r}"
+
+    # ── 提示文字只講觀察到的寫入：不替資料推斷成因，也不保證未來一定重寫 ──
+    tip = v._ttl_head(s3)[1] + v._TTL_TIP
+    assert "資料本身不帶成因" in tip and "多半是帳號進入" not in tip, f"提示不可以推斷成因：{tip!r}"
+    assert "回來時要重寫" not in tip, f"提示不可以保證未來一定重寫：{tip!r}"
+
+    # ── 「距上一步」：中間夾一步沒有時間戳的，下一步仍量到**上一個有時間的步** ──
+    sid10 = "cccc0000-0000-4000-8000-00000000ccff"
+    notime = a(sid10, "2026-09-22T11:00:07.000Z", "n_2", 0, 5000, "nb2")
+    notime.pop("timestamp")
+    (proj / f"{sid10}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        q(sid10, "2026-09-22T11:00:00.000Z", "p1", "缺時間戳TTLQ"),
+        a(sid10, "2026-09-22T11:00:05.000Z", "n_1", 5000, 0, "nb1"),
+        notime,
+        a(sid10, "2026-09-22T11:00:15.000Z", "n_3", 0, 5000, "nb3"),
+    ]), encoding="utf-8")
+    s10 = v.load_session(proj / f"{sid10}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s10)
+    st10 = {b.get("mid"): b for g in s10.main_groups for b in g.get("blocks", []) if b.get("type") == "_step"}
+    assert st10["n_3"].get("gap") == 10, (
+        f"缺時間戳的步不可以打斷「距上一步」：n_3 應距 n_1 10 秒，實得 {st10['n_3'].get('gap')!r}")
+    assert st10["n_2"].get("gap") is None, "沒有時間戳的那一步自己不該有「距上一步」"
+
+    # ── 同一個檔裡的兩個子代理（檔內 sidechain、各帶 agentId、對不回父 Task）──
+    sid6 = "88880000-0000-4000-8000-0000000088ff"
+    ev6 = [q(sid6, "2026-09-22T07:00:00.000Z", "z1", "檔內兩代理TTLQ"),
+           a(sid6, "2026-09-22T07:00:05.000Z", "i_1", 5000, 0, "i1")]
+    for name, t0, ttl_, mid in (("agent-P", "07:01", "1h", "ip_1"), ("agent-Q", "07:03", "5m", "iq_1")):
+        for e in (q(sid6, f"2026-09-22T{t0}:00.000Z", f"{name}-u", f"任務{name}", side=True),
+                  a(sid6, f"2026-09-22T{t0}:05.000Z", mid, 3000, 0, f"{name}-a", ttl=ttl_, side=True)):
+            e["agentId"] = name
+            ev6.append(e)
+    (proj / f"{sid6}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in ev6), encoding="utf-8")
+    s6 = v.load_session(proj / f"{sid6}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s6)
+    side6 = [b for g in s6.subagent_map.get("", []) for b in g.get("blocks", []) if b.get("type") == "_step"]
+    q_step = next(b for b in side6 if b.get("mid") == "iq_1")
+    assert not q_step["u"].get("ttl_prev") and q_step.get("gap") is None, (
+        "同一個檔裡的兩個代理也要各自一條軸（身分靠 agentId）："
+        f"ttl_prev={q_step['u'].get('ttl_prev')!r} gap={q_step.get('gap')!r}")
+
+    # ── 子代理的軸以代理身分分：父 Task 對不上的兩個子代理會落進同一組，不可以串成一條軸 ──
+    sid4 = "55550000-0000-4000-8000-0000000055ff"
+    (proj / f"{sid4}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        q(sid4, "2026-09-22T05:00:00.000Z", "x1", "兩個子代理TTLQ"),
+        a(sid4, "2026-09-22T05:00:05.000Z", "p_1", 5000, 0, "d1"),
+    ]), encoding="utf-8")
+    subdir = proj / sid4 / "subagents"
+    subdir.mkdir(parents=True, exist_ok=True)
+    for name, t0, ttl_, mid in (("agent-A", "05:01", "1h", "sa_1"), ("agent-B", "05:03", "5m", "sb_1")):
+        side_ev = [q(sid4, f"2026-09-22T{t0}:00.000Z", f"{name}-u", f"任務{name}", side=True),
+                   a(sid4, f"2026-09-22T{t0}:05.000Z", mid, 3000, 0, f"{name}-a", ttl=ttl_, side=True)]
+        for e in side_ev:
+            e["agentId"] = name
+        # 刻意不放 `<name>.meta.json` ⇒ 對不回父 Task，兩個代理落進同一組
+        (subdir / f"{name}.jsonl").write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in side_ev), encoding="utf-8")
+    s4 = v.load_session(proj / f"{sid4}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s4)
+    assert list(s4.subagent_map) == [""], f"前提：兩個代理都落進同一組，實得 {list(s4.subagent_map)}"
+    side_steps = [b for g in s4.subagent_map[""] for b in g.get("blocks", []) if b.get("type") == "_step"]
+    b_step = next(b for b in side_steps if b.get("mid") == "sb_1")
+    assert not b_step["u"].get("ttl_prev"), \
+        f"代理 B 的第一次寫入不是切換，不可以接著代理 A 的 1h 標成 1h→5m：{b_step['u'].get('ttl_prev')!r}"
+    assert b_step.get("gap") is None, \
+        f"代理 B 的第一步沒有「上一步」，不可以量到代理 A 的最後一步：{b_step.get('gap')!r}"
+
     print("OK: write TTL badges test passed")
 
 
@@ -1671,9 +1839,38 @@ def test_cost_mix_table(tmp_path=None):
     assert abs(sum(parts.values()) - v.call_cost(*args)) < 1e-12, \
         "組成的加總必須等於 call_cost，否則表與總額會各說各話"
     assert v.call_cost_parts("claude-zzznew-9", 1, 1, 1, 1) is None, "未知模型要回 None"
-    # 舊資料（沒有 TTL 細分）的寫入量要併進 5m，不可憑空消失
+    # 舊資料（沒有 TTL 細分）的寫入量：按 5m 計價（與 call_cost 口徑一致），但**另放一格**——
+    # 記成「快取寫入 5m」就是在講資料沒說的事（那個 5m 是估價口徑，不是觀察到的 TTL）
     legacy = v.call_cost_parts("claude-opus-4-8", 0, 1000, 0, 0)
-    assert legacy["w5"] > 0 and legacy["w1h"] == 0, "無細分的寫入按 5m 計，與 call_cost 口徑一致"
+    assert legacy["wx"] > 0 and legacy["w5"] == 0 and legacy["w1h"] == 0, \
+        f"無細分的寫入要放進 TTL 未知那一格：{legacy}"
+    assert abs(legacy["wx"] - v.call_cost_parts("claude-opus-4-8", 0, 1000, 0, 0, 1000, 0)["w5"]) < 1e-15, \
+        "TTL 未知那一格按 5m 計價，金額要與真的 5m 寫入相同"
+    # ⚠⚠ 總額要與**最初那一條算式**逐位元相同：先把各項加起來、最後才除一次。
+    #   「各項各除一次再加」（不論用 `sum()` 或逐項 `+`）在大約四分之一的輸入上差最後一位，
+    #   恰好落在半分邊界時就顯示成不同的分——下面每一組都是實際會分岔的數字。
+    def _v60(model, inp, cc, cr, o, c5, c1h):
+        pin, pout = v.model_price(model)
+        legacy = max(cc - c5 - c1h, 0)
+        write = (legacy + c5) * v.CACHE_WRITE_MULT + c1h * v.CACHE_WRITE_MULT_1H
+        return (inp * pin + write * pin + cr * pin * v.CACHE_READ_MULT + o * pout) / 1_000_000
+    _m = "claude-sonnet-4-6"
+    assert v.model_price(_m), "前提：這個型號要有單價"
+    _pin, _pout = v.model_price(_m)
+    for _args in ((_m, 0, 4000, 0, 0, 2109, 0),                                # 部分細分的寫入
+                  ("claude-opus-4-8", 7, 4000, 12345, 321, 2501, 0),            # 「各項加總」會分岔
+                  ("claude-haiku-4-5-20251001", 10, 24718, 0, 145, 0, 24718),  # 「sum()」與逐項 + 會分岔
+                  ("claude-haiku-4-5", 1006, 7657, 5715, 690, 3800, 535)):     # 各除再加：$0.01 → $0.02
+        assert v.model_price(_args[0]), f"前提：{_args[0]} 要有單價"
+        assert v.call_cost(*_args) == _v60(*_args), (
+            f"總額要與最初的算式逐位元相同：{_args} → {v.call_cost(*_args)!r} vs {_v60(*_args)!r}")
+    assert v.cost_label(v.call_cost("claude-haiku-4-5", 1006, 7657, 5715, 690, 3800, 535), False) \
+        == v.cost_label(_v60("claude-haiku-4-5", 1006, 7657, 5715, 690, 3800, 535), False), "顯示的分也要相同"
+    # 「5m 那一列」要直接由已知的 5m 寫入量算：用「合併項減掉無細分項」會多出浮點尾數，
+    # 恰好在半分邊界時顯示成不同的分（4000 個已知 5m ＋ 4 個無細分：$0.01 → $0.02）
+    _p5 = v.call_cost_parts(_m, 0, 4004, 0, 0, 4000, 0)
+    assert _p5["w5"] == 4000 * v.CACHE_WRITE_MULT * _pin / 1_000_000, \
+        f"已知的 5m 寫入金額要直接算，不可以用減的：{_p5['w5']!r}"
 
     tmp = new_tmp(tmp_path)
     sid = "33330000-0000-4000-8000-0000000033ff"
@@ -1713,6 +1910,30 @@ def test_cost_mix_table(tmp_path=None):
     # 這筆素材：讀取 50 萬 × 0.1× 遠大於其他項 ⇒ 讀取必須是最大的一列
     assert pcts[3] == max(pcts), f"讀取應佔最大宗，實際各列 {pcts}"
     assert "花費組成（估算）：" in mdtxt and "快取讀取" in mdtxt, "MD 也要有同一份組成"
+    assert "TTL 未知" not in html, "有 TTL 細分的資料不該出現 TTL 未知那一列"
+
+    # ⚠ 佔比對「每一列同乘一個倍數」是不變的，只驗佔比等於沒驗金額。
+    # 金額要直接對表頭的總額（同一個 `s.cost`，未四捨五入）。
+    s = v.load_session(proj / f"{sid}.jsonl", "mix-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s)
+    assert s.cost > 0 and abs(sum(s.cost_mix.values()) - s.cost) < 1e-12, \
+        f"組成表各列金額加總必須等於表頭總額：{sum(s.cost_mix.values())!r} vs {s.cost!r}"
+
+    # 舊資料（沒有 TTL 細分）的一場：出現 TTL 未知那一列，而且「快取寫入 5m」那一列是 0
+    sid_l = "66660000-0000-4000-8000-0000000066ff"
+    ev_l = [dict(ev[0], sessionId=sid_l, uuid="L1"),
+            dict(ev[1], sessionId=sid_l, uuid="L2", message=dict(ev[1]["message"], id="x_L", usage={
+                "input_tokens": 10, "cache_creation_input_tokens": 4000,
+                "cache_read_input_tokens": 500000, "output_tokens": 900}))]
+    (proj / f"{sid_l}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in ev_l), encoding="utf-8")
+    s_l = v.load_session(proj / f"{sid_l}.jsonl", "mix-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s_l)
+    rows = {lbl: usd for lbl, usd, _ in v.cost_mix_rows(s_l)}
+    assert rows.get("快取寫入（TTL 未知，按 5m 計）", 0) > 0, f"舊資料要出現 TTL 未知那一列：{rows}"
+    assert rows.get("快取寫入 5m") == 0, f"舊資料的寫入不可記成 5m：{rows}"
+    assert abs(sum(s_l.cost_mix.values()) - s_l.cost) < 1e-12, "舊資料同樣要與表頭總額一致"
+    assert "TTL 未知" in v._cost_mix_html(s_l), "HTML 的組成表也要有那一列"
 
     print("OK: cost mix table test passed")
 
@@ -2635,6 +2856,16 @@ def test_account_switch_cause(tmp_path=None):
             encoding="utf-8")
     assert "str-sid" in v.load_account_switches([cfg_s1, cfg_s2]), \
         "timestamp 寫成數字字串時仍須認得，否則整份 history 靜默歸零"
+    # ①-a 一列**大到轉不成 float 的整數**（JSON 允許任意位數）只能算壞列，不可以中止整個建置
+    assert v._history_epoch_ms(10 ** 400) is None, "溢位的時間戳要當壞列，不可以丟例外"
+    cfg_o1 = cfg_a.parent / "cfgO1"
+    cfg_o1.mkdir(parents=True, exist_ok=True)
+    (cfg_o1 / "history.jsonl").write_text(
+        '{"display": "x", "timestamp": ' + "1" + "0" * 400 + ', "sessionId": "ovf-sid"}\n'
+        + json.dumps({"display": "y", "timestamp": base * 1000, "sessionId": "str-sid"}) + "\n",
+        encoding="utf-8")
+    assert "str-sid" in v.load_account_switches([cfg_o1, cfg_s2]), \
+        "一列溢位的時間戳不可以拖垮整份 history（其餘的列照收）"
     # ①-b 單位漂移：這一欄是 epoch **毫秒**。上游若改成秒，值仍轉得成 float、除以 1000 之後
     #     也還是合法浮點數 → 切帳號時刻靜默變成 1970 年，而壞列數是 0、完全沒有跡象。
     cfg_u1 = cfg_a.parent / "cfgU1"
@@ -3977,14 +4208,14 @@ def test_message_role_and_content_drift(tmp_path=None):
 
 
 def test_json_string_content(tmp_path=None):
-    """(v36-fam6 #3) content 被序列化成 JSON 字串時，不可把整包原文當成 prompt 收下。
+    """使用者 prompt 的**字串**一律原樣收下，看起來像 JSON 也不解析。
 
-    與 v36-fam3 F3 修掉的「`str()` 的 repr 被當 prompt」同一類，只是漂移點再往內一層，
-    F3 的修法沒涵蓋到，而且新舊兩種格式**都**中。這個形態不是憑空假設——
-    `_codex_container_user_like` 本來就特地涵蓋「被序列化成 JSON 字串的 dict」。
-
-    ⚠ 反方向同樣要釘住：使用者**真的把一段 JSON 貼進來當問題**時，不可以被解析掉——
-    那是比漏報更糟的竄改。
+    從字串內容分不出「上游把 content 序列化了」還是「使用者真的把一段 JSON 貼進來當問題」
+    （後者甚至可以長得和 content block 陣列一模一樣）。解析它就可能把使用者的原文換成
+    抽出來的片段——那是竄改，比顯示得難看更糟。所以：
+    ① 舊格式 `user_message.message`：字串是正常形狀 → 原樣、不出聲；
+    ② 新格式 `UserMessage.content`：正常形狀是 block 陣列，字串＝上游換了形狀 →
+       **原樣收下，但要出聲**（不管字串看起來像不像 JSON）。
     """
     import importlib
     sys.path.insert(0, str(ROOT))
@@ -4023,27 +4254,43 @@ def test_json_string_content(tmp_path=None):
                 texts += [b.get("text", "") for b in (c or []) if isinstance(b, dict)]
         return texts, buf.getvalue()
 
-    # ① 新格式：item.content 是 JSON 字串 → 要還原成真正的問句，並出聲
+    typed = json.dumps(blocks, ensure_ascii=False)     # 長得和 content block 陣列一模一樣的字串
+
+    # ① 新格式：item.content 是字串（看起來像 JSON）→ 原文一個字都不能動，但要出聲
     t, err = run(line(3, "event_msg", {"type": "item_completed", "item": {
-        "type": "UserMessage", "id": "i1",
-        "content": json.dumps(blocks, ensure_ascii=False)}}), "new")
-    assert any("真正的問句JSONQ" in x for x in t), f"應還原成真正的問句，實得 {t!r}"
-    assert not any(x.strip().startswith("[{") for x in t), f"不可把整包 JSON 原文當 prompt：{t!r}"
-    assert "序列化成 JSON 字串" in err, f"還原了也要出聲（上游換了形狀）：{err!r}"
+        "type": "UserMessage", "id": "i1", "content": typed}}), "new")
+    assert t == [typed], f"新格式的字串 content 要原樣收下、不可解析，實得 {t!r}"
+    assert "content 是字串" in err, f"新格式的 content 是字串＝上游換了形狀，要出聲：{err!r}"
 
-    # ② 舊格式：message 是 JSON 字串 → 兩側對稱
-    t, err = run(line(3, "event_msg", {"type": "user_message",
-                                       "message": json.dumps(blocks, ensure_ascii=False)}), "legacy")
-    assert any("真正的問句JSONQ" in x for x in t), f"舊格式也要還原，實得 {t!r}"
-    assert "序列化成 JSON 字串" in err, f"舊格式也要出聲：{err!r}"
+    # ② 新格式：一般字串 → 同樣原樣收下、同樣出聲（形狀不對，和像不像 JSON 無關）
+    t, err = run(line(3, "event_msg", {"type": "item_completed", "item": {
+        "type": "UserMessage", "id": "i2", "content": "新格式一般問句NEWSTR"}}), "newplain")
+    assert t == ["新格式一般問句NEWSTR"], f"實得 {t!r}"
+    assert "content 是字串" in err, f"形狀不對就要出聲：{err!r}"
 
-    # ③ ⚠ 反方向：使用者真的貼 JSON 陣列當問題 → 原文一個字都不能動
+    # ③ ⚠ 舊格式：字串本身是一段**含圖片 block** 的 JSON 陣列 → 原文一個字都不能動；
+    #   但若那真是上游序列化的內容，圖片就沒被畫出來——要出聲（講「可能」，不講「一定」）
+    t, err = run(line(3, "event_msg", {"type": "user_message", "message": typed}), "legacy")
+    assert t == [typed], f"使用者貼的 JSON 不可被解析掉（那是竄改），實得 {t!r}"
+    assert "非文字 block" in err, f"含非文字 block 的 JSON 字串要出聲（否則是看不見的遺失）：{err!r}"
+    # ③-b 只有文字 block 的 JSON 陣列：就算真是序列化的，也沒有東西沒畫出來 → 不出聲
+    text_only = json.dumps([{"type": "text", "text": "只有文字JSONT"}], ensure_ascii=False)
+    t, err = run(line(3, "event_msg", {"type": "user_message", "message": text_only}), "legacytext")
+    assert t == [text_only] and not err.strip(), f"只有文字的 JSON 字串不該出聲：{t!r} {err!r}"
+    # ③-c 新格式的空字串：實際上什麼都沒收下 ⇒ 不可以說「已原樣收下」
+    t, err = run(line(3, "event_msg", {"type": "item_completed", "item": {
+        "type": "UserMessage", "id": "i3", "content": ""}}), "newempty")
+    assert "content 是字串" not in err, f"空字串沒有被收下，警告不可以說「已原樣收下」：{err!r}"
+    assert "取不出文字" in err, f"空的 prompt 仍要由「取不出文字」那條出聲：{err!r}"
+    # 只有空白的字串同理（實際上同樣什麼都沒收下）
+    t, err = run(line(3, "event_msg", {"type": "item_completed", "item": {
+        "type": "UserMessage", "id": "i4", "content": "   "}}), "newblank")
+    assert "content 是字串" not in err, f"只有空白的字串沒有被收下，不可以說「已原樣收下」：{err!r}"
+
+    # ④ 舊格式：其他 JSON 與一般字串同樣不受影響
     raw = "[1, 2, 3]"
     t, err = run(line(3, "event_msg", {"type": "user_message", "message": raw}), "userjson")
-    assert t == [raw], f"使用者真的貼的 JSON 不可被解析掉（那是竄改），實得 {t!r}"
-    assert "序列化成 JSON 字串" not in err, f"這不是漂移，不該出聲：{err!r}"
-
-    # ④ 一般字串不受影響
+    assert t == [raw] and not err.strip(), f"實得 {t!r} {err!r}"
     t, err = run(line(3, "event_msg", {"type": "user_message", "message": "一般問句PLAIN"}), "plain")
     assert t == ["一般問句PLAIN"] and not err.strip(), f"一般字串不得受影響：{t!r} {err!r}"
 
@@ -6483,7 +6730,12 @@ def test_user_turn_fidelity(tmp_path=None):
     import contextlib as _ctx
     for _bad_prompt, _tag in (({"text": "hi"}, "dict"), (42, "int"), (["hi"], "list of str"),
                               # ⚠ `type` 對得上、但 `text` 欄搬走了（`qimg-fix-codex` Medium#4）
-                              ([{"type": "text", "content": "lost"}], "text 欄搬走")):
+                              ([{"type": "text", "content": "lost"}], "text 欄搬走"),
+                              # `text` 在、但空著，字在別欄／包進巢狀——取不出文字又不出聲的同一種
+                              ([{"type": "text", "text": "", "content": "hidden prompt"}], "text 空著、字在別欄"),
+                              ([{"type": "text", "text": "",
+                                 "content": [{"type": "text", "text": "hidden"}]}], "字包進巢狀"),
+                              ([{"type": "text", "text": "", "content": ["hidden"]}], "字放在字串清單")):
         _ev = [
             _qev(0, "", type="attachment", timestamp="2026-08-25T14:00:00.000Z",
                  attachment={"type": "queued_command", "prompt": _bad_prompt,
@@ -6498,6 +6750,19 @@ def test_user_turn_fidelity(tmp_path=None):
         assert "形狀認不得" in _buf.getvalue(), (
             f"`prompt` 是 {_tag} 時整則被靜默丟掉、沒有任何哨兵出聲——"
             f"崩潰換成靜默是更糟的失效。實得：{_buf.getvalue()!r}")
+    # 對照：只貼了圖、文字欄是空的——那是正常形狀，不可以出聲
+    _ok = [
+        _qev(0, "", type="attachment", timestamp="2026-08-25T14:00:00.000Z",
+             attachment={"type": "queued_command", "commandMode": "prompt", "origin": {"kind": "human"},
+                         "prompt": [{"type": "text", "text": ""},
+                                    {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                                 "data": "iVBORw0KGgo="}}],
+                         "timestamp": "2026-08-25T14:00:00.000Z"}),
+    ]
+    _buf = io.StringIO()
+    with _ctx.redirect_stderr(_buf):
+        v.synth_queued_user_events(_ok, "fake.jsonl")
+    assert "形狀認不得" not in _buf.getvalue(), f"只貼圖的正常形狀不該出聲：{_buf.getvalue()!r}"
 
     # --- ①-i ⚠⚠ `remove` 比 attachment 多時：時刻可以沿用，**圖片不可以** ------
     # 沿用是為了「不要整句不畫」；但那一筆帶著圖，照抄的話同一張使用者只貼過一次的圖
@@ -6755,6 +7020,104 @@ def test_codex_sentinel_false_alarms(tmp_path=None):
     assert "回合開始了卻沒收到" in err, (
         f"⚠⚠ 真的有一個窗零則 prompt，哨兵卻沒出聲——這條哨兵等於被關掉了。實得：{err!r}")
 
+    # --- ⑩（反向）字被包進**巢狀結構**：`text` 空著、真文字在 `content:[{"type":"text",…}]` --
+    # 只看頂層字串欄位的話，這種整則靜默消失（零則助理事件、零警告）。
+    nested = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "",
+                                                "content": [{"type": "text",
+                                                             "text": "包在裡面的回答SENTNEST。"}]}]}),
+    ]
+    _n, err = run(nested, "nested")
+    assert "抽不出文字" in err, (
+        f"⚠⚠ 字被包進巢狀結構時那一則整批消失，哨兵一定要出聲。實得：{err!r}")
+    # 對照：巢狀的**結構性 metadata**（引用的 url／title）不是被搬走的內容，不可以出聲
+    annotated = turn(10) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "",
+                                                "annotations": [{"type": "url_citation",
+                                                                 "url": "https://example.invalid/x",
+                                                                 "title": "某個標題"}]}]}),
+    ]
+    _n, err = run(annotated, "annotated")
+    assert "抽不出文字" not in err, (
+        f"巢狀的引用 metadata 不是被搬走的內容，不該出聲。實得：{err!r}")
+
+    # --- ⑪（反向）只有**加密的 reasoning**、沒有 prompt，然後 `error` ⇒ 仍是真的漏收 --
+    # 真實 rollout 的 reasoning 幾乎全是 `summary: []` ＋ `encrypted_content`：只在「有摘要」時才算
+    # 助理內容的話，這一窗會被 `error` 錯誤豁免，而這一格在真實資料上就等於從不成立。
+    enc = turn(10) + [
+        line(30, "event_msg", {"type": "task_started", "turn_id": "t-30"}),
+        line(31, "response_item", {"type": "reasoning", "summary": [],
+                                   "encrypted_content": "gAAAAB-synthetic-ciphertext"}),
+        line(32, "event_msg", {"type": "error", "message": "stream disconnected"}),
+        line(33, "event_msg", {"type": "task_complete"}),
+    ] + turn(40)
+    _n, err = run(enc, "encreason")
+    assert "回合開始了卻沒收到" in err, (
+        f"⚠⚠ 有助理產出（加密的 reasoning）卻沒有 prompt 的失敗回合被豁免了。實得：{err!r}")
+    # 同一件事、但**整場只有這一個回合**：助理事件一個都沒有（加密 reasoning 不產生事件），
+    # 收尾那道「有助理內容才出聲」的門檻不可以把它擋掉
+    enc_only = [
+        line(30, "event_msg", {"type": "task_started", "turn_id": "t-30"}),
+        line(31, "response_item", {"type": "reasoning", "summary": [],
+                                   "encrypted_content": "gAAAAB-synthetic-ciphertext"}),
+        line(32, "event_msg", {"type": "error", "message": "stream disconnected"}),
+        line(33, "event_msg", {"type": "task_complete"}),
+    ]
+    _n, err = run(enc_only, "encreasononly")
+    assert "回合開始了卻沒收到" in err, (
+        f"⚠⚠ 整場只有一個「加密 reasoning ＋失敗、沒有 prompt」的回合時，哨兵被收尾門檻擋掉了。實得：{err!r}")
+
+    # --- ⑬（反向）**抽得到文字**的助理訊息裡，其餘帶著內容的 block 被略過 ⇒ 要出聲 ----------
+    # 「取不出文字」那條只在一個字都抽不到時才看；文字＋圖片的那一則會只留文字、圖片安靜消失。
+    mixed = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "有文字SENTMIX。"},
+                                               {"type": "image", "url": "synthetic-image"}]}),
+    ]
+    _n, err = run(mixed, "mixed")
+    assert "沒被收下" in err, f"文字以外的 block 被略過時要出聲。實得：{err!r}"
+    # 對照：旁邊只是一個真的沒有話講的空文字 block ⇒ 不可以出聲
+    mixed_ok = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "有文字SENTOK。"},
+                                               {"type": "output_text", "text": ""}]}),
+    ]
+    _n, err = run(mixed_ok, "mixedok")
+    assert "沒被收下" not in err, f"空文字 block 不是被丟掉的內容，不該出聲。實得：{err!r}"
+    # `text` 不是字串（物件）⇒ 不可以把 Python 的 repr 當成回答收下，而且要出聲
+    objtext = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": {"value": "SENTOBJ"}}]}),
+    ]
+    _n, err = run(objtext, "objtext")
+    assert _n == 0 and "抽不出文字" in err, (
+        f"`text` 是物件時不可以把 repr 當回答（實得 {_n} 則助理內容），而且要出聲：{err!r}")
+
+    # --- ⑭（反向）reasoning 摘要換了形狀（不是 list）⇒ 要出聲；正常的空摘要不出聲 --------------
+    badsum = turn(10) + [
+        line(20, "response_item", {"type": "reasoning",
+                                   "summary": {"type": "summary_text", "text": "摘要SENTSUM"}}),
+    ]
+    _n, err = run(badsum, "badsum")
+    assert "摘要形狀認不得" in err, f"reasoning 摘要不是 list 時那一則摘要會安靜消失，要出聲：{err!r}"
+    oksum = turn(10) + [
+        line(20, "response_item", {"type": "reasoning", "summary": [],
+                                   "encrypted_content": "gAAAAB-synthetic"}),
+    ]
+    _n, err = run(oksum, "oksum")
+    assert "摘要形狀認不得" not in err, f"加密、沒有摘要的 reasoning 是正常形狀，不該出聲：{err!r}"
+
+    # --- ⑫（反向）字放在內容容器的**字串清單**裡：`content: ["…"]` ⇒ 一樣要出聲 ------------
+    strlist = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "",
+                                                "content": ["字串清單裡的回答SENTLIST。"]}]}),
+    ]
+    _n, err = run(strlist, "strlist")
+    assert "抽不出文字" in err, f"字放在 content 的字串清單裡時那一則整批消失，要出聲。實得：{err!r}"
+
     print("OK: codex sentinel false alarms test passed")
 
 
@@ -6808,12 +7171,13 @@ def test_one_bad_session_does_not_kill_batch(tmp_path=None):
     # ⚠⚠ **三個注入點各驗一次。** 壞掉的那一場有三條路會走到同一個處理器
     #   （解析／分析／渲染），先前只有分析那一條被守著，於是「回填舊 row」只做了三分之一
     #   ——`qimg-fix-codex` Medium#1／#8 讀碼各抓到一條。
-    def code_of(outdir, inject="analyze"):
+    def code_of(outdir, inject="analyze", extra=()):
         head = (
             "import sys\n"
             f"sys.path.insert(0, {str(ROOT)!r})\n"
             "sys.argv = ['ai_session_viewer.py', '--claude-source', "
-            f"'demo=' + {str(projects.parent)!r}, '--no-codex', '--out', {str(outdir)!r}]\n"
+            f"'demo=' + {str(projects.parent)!r}, '--no-codex', '--out', {str(outdir)!r}]"
+            f" + {list(extra)!r}\n"
             "import ai_session_viewer as v\n")
         BOOM = ("        raise AttributeError(\"'list' object has no attribute 'strip'\")\n")
         if inject == "analyze":
@@ -6837,6 +7201,22 @@ def test_one_bad_session_does_not_kill_batch(tmp_path=None):
                     + BOOM +
                     "    return _orig(s, *a, **k)\n"
                     "v.render_session_html = _boom\n")
+        elif inject == "replace_md":
+            # HTML 換上了、MD 換不上（Windows 上目標檔被開著或唯讀時就是這樣）
+            boom = ("_orig_rep = v.os.replace\n"
+                    "def _rep(a, b):\n"
+                    f"    if str(b).endswith('.md') and {BAD[:8]!r} in str(b):\n"
+                    "        raise PermissionError('injected: target is open')\n"
+                    "    return _orig_rep(a, b)\n"
+                    "v.os.replace = _rep\n")
+        elif inject == "render_md":
+            # HTML 已經渲染完、MD 才失敗：直接寫正式檔的話，HTML 這時已經被換成新內容了
+            boom = ("_orig = v.render_session_md\n"
+                    "def _boom(s, *a, **k):\n"
+                    f"    if getattr(s, 'session_id', '') == {BAD!r}:\n"
+                    + BOOM +
+                    "    return _orig(s, *a, **k)\n"
+                    "v.render_session_md = _boom\n")
         else:
             boom = ""
         return head + boom + "v.main()\n"
@@ -6945,6 +7325,123 @@ def test_one_bad_session_does_not_kill_batch(tmp_path=None):
     assert not any(BAD in k for k in _man3.get("entries", {})), (
         "⚠⚠ 舊輸出已經不在磁碟上了，卻還是把那一列放回 manifest ⇒ 索引會多一條"
         "**指向不存在的檔**的連結。回填之前一定要確認那份輸出還在")
+
+    # --- ⑤ ⚠⚠ **渲染到一半失敗，不可以留下 manifest 仍然信任的新頁面** --------------
+    # HTML 渲染完、MD 才失敗：直接寫正式檔的話 HTML 已經換成新內容，而 manifest 放回的是
+    # **上一次**的 row（舊指紋）——頁面與紀錄對不上，寫壞的頁面還會被下一次當成「沿用」。
+    # 要求：正式檔要嘛是完整的舊版、要嘛是完整的新版；失敗時就是舊版，而且不留暫存檔。
+    out4 = tmp / "out4"
+    _r1 = subprocess.run([sys.executable, "-c", code_of(out4, inject=None)],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r1.returncode == 0, "前提：out4 的第一次建置要成功"
+    _before = {p.name: p.read_bytes() for p in (out4 / "sessions").rglob("*")
+               if p.is_file() and BAD[:8] in p.name}
+    assert any(n.endswith(".html") for n in _before), f"前提：要有舊的 HTML：{sorted(_before)}"
+    src_bad4 = projects / f"{BAD}.jsonl"
+    src_bad4.write_text(src_bad4.read_text(encoding="utf-8").replace(
+        "BADSESSION", "BADSESSION-NEWER"), encoding="utf-8")
+    _r2 = subprocess.run([sys.executable, "-c", code_of(out4, inject="render_md")],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r2.returncode == 0 and "渲染失敗" in _r2.stderr, f"前提：MD 渲染要失敗並出聲\n{_r2.stderr[-400:]}"
+    _after = {p.name: p.read_bytes() for p in (out4 / "sessions").rglob("*")
+              if p.is_file() and BAD[:8] in p.name}
+    assert _after == _before, (
+        "⚠⚠ 渲染到一半失敗，正式檔卻被換掉了（或留下暫存檔）——manifest 放回的是上一次的 row，"
+        f"頁面與紀錄對不上。前：{sorted(_before)}；後：{sorted(_after)}")
+
+    # --- ⑥ ⚠⚠ 上一次只建了 MD，這一次渲染又失敗 ⇒ 索引不可以連到不存在的 HTML -------
+    out5 = tmp / "out5"
+    _r1 = subprocess.run([sys.executable, "-c", code_of(out5, inject=None, extra=("--format", "md"))],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r1.returncode == 0, "前提：out5 的第一次（只建 MD）建置要成功"
+    src_bad5 = projects / f"{BAD}.jsonl"
+    src_bad5.write_text(src_bad5.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    _r2 = subprocess.run([sys.executable, "-c", code_of(out5, inject="render")],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r2.returncode == 0 and "渲染失敗" in _r2.stderr, f"前提：HTML 渲染要失敗\n{_r2.stderr[-400:]}"
+    _idx = (out5 / "index.html").read_text(encoding="utf-8")
+    _hrefs = re.findall(r'href="sessions/([^"]+)"', _idx)
+    _bad_links = [h for h in _hrefs if BAD[:8] in h]
+    assert _bad_links and all((out5 / "sessions" / h).exists() for h in _bad_links), (
+        "⚠⚠ 索引連到不存在的頁面：上一次只有 MD、這一次 HTML 渲染失敗，"
+        f"那一列要改連 MD。實得連結：{_bad_links}")
+    assert "僅 .md" in _idx, "改連 MD 的那一列要標示「僅 .md」"
+
+    # --- ⑥-b 舊紀錄說「有 HTML」、但那個檔已經不在：沿用時旗標要照磁碟實況改寫 --------
+    out6 = tmp / "out6"
+    _r1 = subprocess.run([sys.executable, "-c", code_of(out6, inject=None)],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r1.returncode == 0, "前提：out6 的第一次建置要成功"
+    for _p in (out6 / "sessions").rglob("*.html"):
+        if BAD[:8] in _p.name:
+            _p.unlink()                      # HTML 被清掉了，MD 還在
+    src_bad6 = projects / f"{BAD}.jsonl"
+    src_bad6.write_text(src_bad6.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    _r2 = subprocess.run([sys.executable, "-c", code_of(out6, inject="render")],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r2.returncode == 0 and "渲染失敗" in _r2.stderr, "前提：HTML 渲染要失敗"
+    _idx6 = (out6 / "index.html").read_text(encoding="utf-8")
+    _l6 = [h for h in re.findall(r'href="sessions/([^"]+)"', _idx6) if BAD[:8] in h]
+    assert _l6 and all((out6 / "sessions" / h).exists() for h in _l6), (
+        "⚠⚠ 沿用的舊紀錄仍說「有 HTML」，索引就連到了已經不在的檔。實得：" + repr(_l6))
+
+    # --- ⑦ ⚠⚠ HTML 換上了、MD 換不上：manifest 要照磁碟實況記，不可以新舊混在一起卻說全是舊的 ----
+    out7 = tmp / "out7"
+    _r1 = subprocess.run([sys.executable, "-c", code_of(out7, inject=None)],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r1.returncode == 0, "前提：out7 的第一次建置要成功"
+    src_bad7 = projects / f"{BAD}.jsonl"
+    src_bad7.write_text(src_bad7.read_text(encoding="utf-8").replace(
+        "BADSESSION", "BADSESSION-PUB7"), encoding="utf-8")
+    _r2 = subprocess.run([sys.executable, "-c", code_of(out7, inject="replace_md")],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r2.returncode == 0 and "寫出失敗" in _r2.stderr, f"前提：MD 要換不上並出聲\n{_r2.stderr[-400:]}"
+    _man7 = json.loads((out7 / ".build-manifest.json").read_text(encoding="utf-8"))
+    _row7 = next(e["row"] for k, e in _man7["entries"].items() if BAD in k)
+    _html7 = next(p for p in (out7 / "sessions").rglob("*.html") if BAD[:8] in p.name)
+    assert "BADSESSION-PUB7" in _html7.read_text(encoding="utf-8"), "前提：HTML 已經換成新版"
+    assert _row7.get("has_html") is True and _row7.get("has_md") is False, (
+        "⚠⚠ HTML 是新的、MD 是舊的：manifest 要照實記（HTML 同步、MD 過期），"
+        f"不可以整列說成舊的或新的。實得 has_html={_row7.get('has_html')} has_md={_row7.get('has_md')}")
+    _idx7 = (out7 / "index.md").read_text(encoding="utf-8")
+    _bad_line = next(l for l in _idx7.splitlines() if BAD[:8] in l)
+    assert ".html)" in _bad_line and "僅 HTML" in _bad_line, (
+        f"MD 過期時，MD 索引要改連 HTML 並標示：{_bad_line}")
+
+    # --- ⑧ 沿用時兩種格式都不可用（磁碟上那份 MD 原本就被標成過期）⇒ 不回填、索引不給連結 ----------
+    out8 = tmp / "out8"
+    _r1 = subprocess.run([sys.executable, "-c", code_of(out8, inject=None)],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r1.returncode == 0, "前提：out8 的第一次建置要成功（兩種格式都有）"
+    src_bad8 = projects / f"{BAD}.jsonl"
+    src_bad8.write_text(src_bad8.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    _r2 = subprocess.run([sys.executable, "-c", code_of(out8, inject=None, extra=("--format", "html"))],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r2.returncode == 0, "前提：第二次只建 HTML（MD 留著但標成過期）"
+    for _p in (out8 / "sessions").rglob("*.html"):
+        if BAD[:8] in _p.name:
+            _p.unlink()
+    src_bad8.write_text(src_bad8.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    _r3 = subprocess.run([sys.executable, "-c", code_of(out8, inject="render")],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r3.returncode == 0 and "渲染失敗" in _r3.stderr, "前提：第三次渲染要失敗"
+    _man8 = json.loads((out8 / ".build-manifest.json").read_text(encoding="utf-8"))
+    assert not any(BAD in k for k in _man8.get("entries", {})), (
+        "⚠⚠ 兩種格式都不可用（HTML 不在、MD 過期），卻還是把那一列放回 manifest")
+    for _ix in ("index.html", "index.md"):
+        _t8 = (out8 / _ix).read_text(encoding="utf-8")
+        assert not any(BAD[:8] in h and not (out8 / "sessions" / h).exists()
+                       for h in re.findall(r'sessions/([^")\s]+)', _t8)), (
+            f"{_ix} 連到了不存在的檔")
+    # 索引本身的防線：一列兩種格式都標成不可用時（例如縮範圍建置沿用的舊紀錄），兩份索引都不給連結
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    _v8 = importlib.import_module("ai_session_viewer")
+    _good = dict(next(e["row"] for k, e in _man8["entries"].items() if GOOD in k),
+                 has_html=False, has_md=False)
+    assert "sessions/" not in _v8.render_index_html([_good]).split("<tbody", 1)[-1], (
+        "HTML 索引替「兩種格式都不可用」的列給了連結")
+    assert "](sessions/" not in _v8.render_index_md([_good]), "MD 索引替「兩種格式都不可用」的列給了連結"
 
     print("OK: one bad session does not kill the batch test passed")
 
@@ -7336,6 +7833,207 @@ def test_archive_command_only(tmp_path=None):
     assert not _stuck, (
         f"⚠⚠ Ctrl+C 之後留下了佔位檔：{[p.name for p in _stuck]}"
         "——它沒有任何 manifest 紀錄，卻會讓之後每一次執行都撞「已有同名檔」")
+
+    def _one_cmd_session(sid, t):
+        w(sid, [dict(type="user", uuid=f"x{sid[:4]}", timestamp=t, sessionId=sid,
+                     message={"role": "user", "content": CMD_U}, **base)])
+        run()
+        _s = _v.load_session(proj / f"{sid}.jsonl", "demo-proj", "demo", _v.SOURCE_CLAUDE)
+        _v.analyze(_s)
+        return _s
+
+    # --- ⚠⚠ Ctrl+C 落在「關閉佔位檔」那一刻 ---------------------------------
+    # 只接 OSError 的話，這一刻中斷同樣留下 0 位元組的佔位檔、之後每一次都撞「已有同名檔」。
+    # 注入的 close 會**真的關掉** handle 再丟 Ctrl+C（第二次呼叫就回 EBADF），
+    # 這樣才驗得到「先確保 handle 關了、再收佔位檔」那一段。
+    arc9 = tmp / "archive-interrupt-close"
+    sid_cl = "ac110000-0000-4000-8000-00000000ac11"
+    _s9 = _one_cmd_session(sid_cl, "2026-07-25T15:10:00.000Z")
+    _real_close, _hits = _v.os.close, []
+
+    def _close_then_ki(fd):
+        _real_close(fd)
+        if not _hits:
+            _hits.append(fd)
+            raise KeyboardInterrupt("injected Ctrl+C at close")
+
+    _v.os.close = _close_then_ki
+    _propagated9 = False
+    try:
+        _v.archive_command_only(
+            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_cl}.jsonl", _s9)],
+            arc9, [proj.parent], out)
+    except KeyboardInterrupt:
+        _propagated9 = True
+    finally:
+        _v.os.close = _real_close
+    assert _hits, "前提：注入的 close 要真的被呼叫到"
+    assert _propagated9, "⚠⚠ 關檔時的 Ctrl+C 被吞掉了——Ctrl+C 會失效"
+    assert (proj / f"{sid_cl}.jsonl").is_file(), "中斷時來源必須留在原地"
+    _stuck9 = [p for p in arc9.glob("*.jsonl") if p.name != "_archived.jsonl"]
+    assert not _stuck9, (
+        f"⚠⚠ 關檔時 Ctrl+C 留下了佔位檔：{[p.name for p in _stuck9]}"
+        "——之後每一次執行都會撞「已有同名檔」")
+
+    # --- ⚠⚠ 搬移其實完成了、來源路徑又被重建，然後才 Ctrl+C ---------------------
+    # 只看「來源還在」會把目的地刪掉——而那是原本那份的**唯一完整副本**
+    # （例如 Claude Code 又往同一場寫了一行，重建出一個只有新內容的檔）。
+    arc10 = tmp / "archive-recreated-source"
+    sid_rc = "ac120000-0000-4000-8000-00000000ac12"
+    _s10 = _one_cmd_session(sid_rc, "2026-07-25T15:20:00.000Z")
+    _orig_body = (proj / f"{sid_rc}.jsonl").read_text(encoding="utf-8")
+    _orig_move2 = _v.shutil.move
+
+    def _move_then_recreate(src, dst):
+        _orig_move2(src, dst)                                   # 搬移真的完成
+        Path(src).write_text("RECREATED-BY-ANOTHER-WRITER\n", encoding="utf-8")
+        raise KeyboardInterrupt("injected Ctrl+C after the move completed")
+
+    _v.shutil.move = _move_then_recreate
+    _propagated10, _sk10 = False, None
+    try:
+        _v.archive_command_only(
+            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_rc}.jsonl", _s10)],
+            arc10, [proj.parent], out)
+    except KeyboardInterrupt:
+        _propagated10 = True
+    finally:
+        _v.shutil.move = _orig_move2
+    assert _propagated10, "⚠⚠ Ctrl+C 被吞掉了"
+    _kept = [p for p in arc10.glob("*.jsonl") if p.name != "_archived.jsonl"]
+    assert _kept and _kept[0].read_text(encoding="utf-8") == _orig_body, (
+        "⚠⚠ 搬移已完成、來源路徑被重建之後的 Ctrl+C 把目的地刪掉了——"
+        f"那是原本那份的唯一完整副本。目的地現況：{[(p.name, p.stat().st_size) for p in _kept]}")
+
+    # --- 對照組：複製到一半就 Ctrl+C（來源沒被動過）⇒ 半截檔照樣要收掉 ----------
+    # 身分檢查不可以變成「什麼都不敢刪」：來源還是搬之前那一個時，目的地只是半截檔。
+    arc11 = tmp / "archive-partial-interrupt"
+    sid_pk = "ac130000-0000-4000-8000-00000000ac13"
+    _s11 = _one_cmd_session(sid_pk, "2026-07-25T15:30:00.000Z")
+
+    def _partial_then_ki(src, dst):
+        Path(dst).write_text("PARTIAL", encoding="utf-8")
+        raise KeyboardInterrupt("injected Ctrl+C mid-copy")
+
+    _v.shutil.move = _partial_then_ki
+    try:
+        try:
+            _v.archive_command_only(
+                [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_pk}.jsonl", _s11)],
+                arc11, [proj.parent], out)
+        except KeyboardInterrupt:
+            pass
+    finally:
+        _v.shutil.move = _orig_move2
+    assert (proj / f"{sid_pk}.jsonl").is_file(), "複製到一半中斷，來源必須留在原地"
+    _half = [p for p in arc11.glob("*.jsonl") if p.name != "_archived.jsonl"]
+    assert not _half, (
+        f"複製到一半的半截檔沒有收掉：{[(p.name, p.stat().st_size) for p in _half]}"
+        "——身分檢查不可以把該刪的也擋掉")
+
+    # --- ⚠⚠ 來源被**同長度改寫、mtime 又被設回去**：metadata 全一樣，內容卻不一樣 ----------
+    # 只比 (裝置, inode, 大小, mtime) 的話會被騙過而刪掉目的地——那是原本那份的唯一完整副本。
+    arc12 = tmp / "archive-sameshape-rewrite"
+    sid_sw = "ac140000-0000-4000-8000-00000000ac14"
+    _s12 = _one_cmd_session(sid_sw, "2026-07-25T15:40:00.000Z")
+    _src12 = proj / f"{sid_sw}.jsonl"
+    _orig12 = _src12.read_bytes()
+
+    def _copy_then_forge(src, dst):
+        Path(dst).write_bytes(Path(src).read_bytes())            # 完整複製到目的地
+        _st = os.stat(src)
+        _forged = bytes(b ^ 0x01 if 97 <= b <= 122 else b for b in _orig12)   # 同長度、不同內容
+        Path(src).write_bytes(_forged)
+        os.utime(src, ns=(_st.st_atime_ns, _st.st_mtime_ns))    # mtime 設回去
+        raise KeyboardInterrupt("injected Ctrl+C after a same-shape rewrite")
+
+    _v.shutil.move = _copy_then_forge
+    _err12 = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(_err12):
+            try:
+                _v.archive_command_only(
+                    [(_v.SOURCE_CLAUDE, "demo", "demo-proj", _src12, _s12)], arc12, [proj.parent], out)
+            except KeyboardInterrupt:
+                pass
+    finally:
+        _v.shutil.move = _orig_move2
+    _kept12 = [p for p in arc12.glob("*.jsonl") if p.name != "_archived.jsonl"]
+    assert _kept12 and _kept12[0].read_bytes() == _orig12, (
+        "⚠⚠ 來源被同長度改寫、mtime 設回之後，清理把目的地刪了——那是原本內容唯一的副本")
+    assert "目的地保留" in _err12.getvalue(), (
+        "保留目的地時要**當場**印出來（Ctrl+C 會直接往外拋，排隊的訊息來不及印）："
+        f"{_err12.getvalue()!r}")
+
+    # --- 對照：只動了 mtime、內容沒變（半截目的地）⇒ 內容一樣就可以刪，不可以留下擋路的檔 ------
+    arc13 = tmp / "archive-touch-only"
+    sid_to = "ac150000-0000-4000-8000-00000000ac15"
+    _s13 = _one_cmd_session(sid_to, "2026-07-25T15:50:00.000Z")
+    _src13 = proj / f"{sid_to}.jsonl"
+
+    def _partial_touch_ki(src, dst):
+        Path(dst).write_text("PARTIAL", encoding="utf-8")
+        os.utime(src, None)                                       # 只動 mtime
+        raise KeyboardInterrupt("injected Ctrl+C after a metadata-only change")
+
+    _v.shutil.move = _partial_touch_ki
+    try:
+        try:
+            _v.archive_command_only(
+                [(_v.SOURCE_CLAUDE, "demo", "demo-proj", _src13, _s13)], arc13, [proj.parent], out)
+        except KeyboardInterrupt:
+            pass
+    finally:
+        _v.shutil.move = _orig_move2
+    _left13 = [p for p in arc13.glob("*.jsonl") if p.name != "_archived.jsonl"]
+    assert not _left13, (
+        "來源內容沒變（只動了 mtime）時，半截目的地要收掉——留著會擋住之後每一次執行："
+        f"{[(p.name, p.stat().st_size) for p in _left13]}")
+
+    # --- 搬之前讀不到來源內容（沒辦法確認）、而搬移一個位元組都還沒寫就失敗 ⇒ 空佔位檔照樣要收 ----
+    # 「沒辦法確認就保留目的地」只適用於有內容的目的地；0 位元組的佔位檔不可能是任何東西的副本。
+    arc14 = tmp / "archive-unreadable-source"
+    sid_ur = "ac160000-0000-4000-8000-00000000ac16"
+    _s14 = _one_cmd_session(sid_ur, "2026-07-25T16:00:00.000Z")
+    _orig_digest = _v._file_digest
+
+    def _fail_before_write(src, dst):
+        raise OSError("injected failure before any byte was written")
+
+    _v._file_digest = lambda p: None
+    _v.shutil.move = _fail_before_write
+    try:
+        _v.archive_command_only(
+            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_ur}.jsonl", _s14)], arc14, [proj.parent], out)
+    finally:
+        _v._file_digest, _v.shutil.move = _orig_digest, _orig_move2
+    _left14 = [p for p in arc14.glob("*.jsonl") if p.name != "_archived.jsonl"]
+    assert not _left14, (
+        "搬移還沒寫任何東西就失敗時，空的佔位檔要收掉（它不可能是任何內容的副本）："
+        f"{[(p.name, p.stat().st_size) for p in _left14]}")
+
+    # --- Ctrl+C 落在「算來源雜湊」那一刻：名字已經搶到、pending 也寫了 ⇒ 佔位檔要收掉 -----------
+    arc15 = tmp / "archive-interrupt-hash"
+    sid_hk = "ac170000-0000-4000-8000-00000000ac17"
+    _s15 = _one_cmd_session(sid_hk, "2026-07-25T16:10:00.000Z")
+
+    def _hash_ki(p):
+        raise KeyboardInterrupt("injected Ctrl+C while hashing the source")
+
+    _v._file_digest = _hash_ki
+    _prop15 = False
+    try:
+        _v.archive_command_only(
+            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_hk}.jsonl", _s15)], arc15, [proj.parent], out)
+    except KeyboardInterrupt:
+        _prop15 = True
+    finally:
+        _v._file_digest = _orig_digest
+    assert _prop15, "算雜湊時的 Ctrl+C 被吞掉了"
+    assert (proj / f"{sid_hk}.jsonl").is_file(), "中斷時來源必須留在原地"
+    _left15 = [p for p in arc15.glob("*.jsonl") if p.name != "_archived.jsonl"]
+    assert not _left15, (
+        f"算雜湊時 Ctrl+C 留下了佔位檔：{[p.name for p in _left15]}——之後每一次都會撞「已有同名檔」")
 
     # --- ⚠⚠ cleanup **自己**失敗時要講出來，不可以吞掉 ----------------------
     # 我原本以為這一格「只能靠 Windows 檔案鎖、寫進測試會不可攜」——`utf-fix-codex-r4`

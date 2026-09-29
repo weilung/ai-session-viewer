@@ -189,7 +189,21 @@ MANIFEST_NAME = ".build-manifest.json"
 #    而 `c966f04d` 的子代理寫入佔 32.8%：同樣一句「快取很貴」，結論相反。
 #    ⚠ `call_cost` 改成 `call_cost_parts` 的加總，**兩處共用同一份公式**（測試釘住）。
 #    ⚠ HTML 與 MD 都變 ⇒ 一定要升（不升的話既有的 `out/` 會靜默沿用舊版）。
-RENDERER_VERSION = 61
+# 61 → 62（2026-09-29）：同一批呈現的四處更正，HTML 與 MD 都變。
+#    ① 表頭的寫入 TTL 摘要改成**讀逐步徽章那一串步驟**（同一個迴圈、同一個時間序），不再另外走
+#       原始事件的檔案行序——兩處各算一次時，行序與時間序不同的檔會讓表頭與徽章講出兩種切換。
+#       沒有可呈現內容的呼叫（沒有徽章）另列次數，「全程 1h 就不顯示」也把它們算進去。
+#    ② 「距上一步」與 TTL 切換的軸改以**代理身分**分：父 Task 對不上的子代理會落進同一組，
+#       照分組算會把代理 A 的最後一步當成代理 B 的上一步。
+#    ③ 花費組成表多一列「快取寫入（TTL 未知，按 5m 計）」：沒有 TTL 細分的舊資料原本被記成
+#       「快取寫入 5m」，那是估價口徑，不是觀察到的 TTL。只在有這種資料時出現；總額不變。
+#    ④ 文案：5m 的後果改成「這段寫入閒置 5 分鐘就過期」（不保證整段重寫：先前用 1h 寫入、
+#       還沒過期的前綴仍可能讀得到）；子代理是「預設」5m；勾選框也控制 `5m+1h`。
+#    ⑤ 表頭的估算總額回到**最初的算式**（先加總、最後除一次）：61 版改成「各項各除一次再加」，
+#       在大約四分之一的輸入上差最後一位，半分邊界會顯示成不同的分——62 版起與 60 版逐位元相同。
+#    ⑥ 沒有 TTL 細分的舊資料寫入，在表頭有其他檔次時另列「TTL 未知」。
+#    另外，Codex 使用者 prompt 的字串一律原樣收下、不再嘗試當成序列化的 JSON 解析（同一版一起升）。
+RENDERER_VERSION = 62
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -633,34 +647,63 @@ def _ephemeral_split(u):
     return out[0], out[1]
 
 
-COST_PARTS = ("in", "w5", "w1h", "read", "out")     # 花費組成的欄位順序（顯示端共用）
+COST_PARTS = ("in", "w5", "w1h", "wx", "read", "out")     # 花費組成的欄位順序（顯示端共用）
 COST_PART_LABELS = {"in": "新輸入", "w5": "快取寫入 5m", "w1h": "快取寫入 1h",
-                    "read": "快取讀取", "out": "產出"}
+                    "wx": "快取寫入（TTL 未知，按 5m 計）", "read": "快取讀取", "out": "產出"}
 
 
-def call_cost_parts(model, inp, cache_create, cache_read, out, cc_5m=0, cc_1h=0):
-    """單次呼叫的成本**拆解**（USD）；未知模型回 None。`call_cost` 就是它的加總——
-    兩者共用同一份公式，免得表頭那張組成表與總額各自算出一套數字。
-    舊資料沒有 TTL 細分的寫入量併進 `w5`（按 5 分計價，與 `call_cost` 的既有口徑一致）。"""
+def _cost_terms(model, inp, cache_create, cache_read, out, cc_5m, cc_1h):
+    """花費組成表的各項（USD）：(新輸入, 5 分寫入＋無細分寫入, 1 小時寫入, 讀取, 產出,
+    其中無細分寫入, 其中已知的 5 分寫入)；未知模型回 None。
+    ⚠ 只給 `call_cost_parts` 用；總額（`call_cost`）用的是另一條、逐字沿用最初的算式。"""
     p = model_price(model)
     if not p:
         return None
     pin, pout = p
     legacy = max(cache_create - cc_5m - cc_1h, 0)      # 無細分資訊的寫入量
-    return {
-        "in": inp * pin / 1_000_000,
-        "w5": (legacy + cc_5m) * CACHE_WRITE_MULT * pin / 1_000_000,
-        "w1h": cc_1h * CACHE_WRITE_MULT_1H * pin / 1_000_000,
-        "read": cache_read * pin * CACHE_READ_MULT / 1_000_000,
-        "out": out * pout / 1_000_000,
-    }
+    return (inp * pin / 1_000_000,
+            (legacy + cc_5m) * CACHE_WRITE_MULT * pin / 1_000_000,
+            cc_1h * CACHE_WRITE_MULT_1H * pin / 1_000_000,
+            cache_read * pin * CACHE_READ_MULT / 1_000_000,
+            out * pout / 1_000_000,
+            legacy * CACHE_WRITE_MULT * pin / 1_000_000,
+            cc_5m * CACHE_WRITE_MULT * pin / 1_000_000)
+
+
+def call_cost_parts(model, inp, cache_create, cache_read, out, cc_5m=0, cc_1h=0):
+    """單次呼叫的成本**拆解**（USD）；未知模型回 None。單價與倍率和 `call_cost` 同一份。
+    舊資料沒有 TTL 細分的寫入量放在 `wx`：**按 5 分計價**（與 `call_cost` 的既有口徑一致），
+    但不併進 `w5`——那個 5m 是估價口徑，不是觀察到的 TTL，標成「快取寫入 5m」就是在講資料沒說的事。
+    ⚠ 各項加總與 `call_cost` 只保證到浮點誤差內相等：拆開的兩項再相加，最後一位可能不同。
+      總額一律以 `call_cost` 為準（見那裡的說明），這張表只負責「錢花在哪裡」。"""
+    t = _cost_terms(model, inp, cache_create, cache_read, out, cc_5m, cc_1h)
+    if t is None:
+        return None
+    t_in, _t_w5all, t_w1h, t_read, t_out, t_wx, t_w5 = t
+    # ⚠ `w5` 直接由已知的 5 分寫入量算，**不可以**用「合併項減掉無細分項」：減出來的值會多出
+    #   浮點尾數，恰好在半分邊界時「5m 那一列」就會顯示成不同的分（實測 $0.01 → $0.02）。
+    return {"in": t_in, "w5": t_w5, "w1h": t_w1h, "wx": t_wx, "read": t_read, "out": t_out}
 
 
 def call_cost(model, inp, cache_create, cache_read, out, cc_5m=0, cc_1h=0):
     """單次 API 呼叫的估算成本（USD）；未知模型回 None。
-    快取寫入依 TTL 細分計價（5 分 1.25×、1 小時 2×）；細分未涵蓋的部分（舊資料）按 5 分計，會低估。"""
-    parts = call_cost_parts(model, inp, cache_create, cache_read, out, cc_5m, cc_1h)
-    return None if parts is None else sum(parts.values())
+    快取寫入依 TTL 細分計價（5 分 1.25×、1 小時 2×）；細分未涵蓋的部分（舊資料）按 5 分計，會低估。
+    ⚠⚠ **總額用的是最初那一條算式：先把各項加起來、最後才除一次**，逐字不改。
+      花費組成表（`call_cost_parts`）是另外拆的，各項各除一次——兩者只保證到浮點誤差內相等。
+      不可以把總額改成「各項加總」：每項各除一次再加，和「加總後除一次」的結果在大約四分之一的
+      輸入上差最後一位，恰好落在半分邊界時就顯示成不同的分（實測 $0.01 → $0.02）；
+      連 `sum()` 與逐項 `+` 都不一樣（Python 3.12 起 `sum()` 做補償求和）。
+      既有的每一個總額都是這條算式算出來的，換寫法就會逐位元改變。"""
+    p = model_price(model)
+    if not p:
+        return None
+    pin, pout = p
+    legacy = max(cache_create - cc_5m - cc_1h, 0)      # 無細分資訊的寫入量
+    write = (legacy + cc_5m) * CACHE_WRITE_MULT + cc_1h * CACHE_WRITE_MULT_1H
+    return (inp * pin
+            + write * pin
+            + cache_read * pin * CACHE_READ_MULT
+            + out * pout) / 1_000_000
 
 
 def cost_label(cost, partial):
@@ -1032,32 +1075,94 @@ def load_session(path: Path, proj_munged: str, account: str = "", source_kind: s
     return s
 
 
-def _codex_normalize_content(content):
-    """(v36-fam6 #3) content 被**序列化成 JSON 字串**時還原成 list；回 `(content, 漂了沒)`。
+def _nested_text(v, _depth=0):
+    """list／dict 裡面有沒有「帶字的 `text` 欄」——內容被包進巢狀結構的形狀。
 
-    `_codex_content_text` 對 `str` 型的 content 原封不動回傳，於是整包 JSON 原文會被當成
-    prompt 收下——與 `v36-fam3` F3 修掉的「`str()` 的 repr 被當 prompt」是同一類失效，
-    只是漂移點再往內一層，F3 的修法沒有涵蓋到，而且新舊兩種格式**都**中。
-    這個漂移形態不是憑空假設：`_codex_container_user_like` 本來就特地涵蓋
-    「被序列化成 JSON 字串的 dict」——上游會這樣漂是本檔早就認可的前提。
+    只認 `text` 這個鍵：`annotations` 裡的 url／title、`cache_control` 這類結構性
+    metadata 也是巢狀、也可能帶字串，但它們不是被搬走的內容。深度設上限，只為了不被病態輸入拖垮。"""
+    if _depth > 6:
+        return False
+    if isinstance(v, dict):
+        t = v.get("text")
+        if isinstance(t, str) and t.strip():
+            return True
+        return any(_nested_text(x, _depth + 1) for x in v.values() if isinstance(x, (list, dict)))
+    if isinstance(v, list):
+        return any(_nested_text(x, _depth + 1) for x in v)
+    return False
 
-    ⚠ **判準刻意收得很緊**：只有「解得出來、是 list、而且元素是帶 `type` 的 dict」才算漂移。
-    使用者本來就有可能**真的把一段 JSON 當成問題貼進來**，那時解析它會把使用者的原文
-    換成抽出來的片段——那是比漏報更糟的竄改。條件不滿足就原樣當純文字。
-    ⚠ 只解一層（同 `_codex_container_user_like`）：雙重序列化不在涵蓋範圍內。"""
-    if not isinstance(content, str):
-        return content, False
-    s = content.strip()
-    if not s.startswith("["):
-        return content, False
+
+_TEXTY_KEYS = ("content", "parts", "value", "body")   # 名字就是「內容容器」的欄位
+
+
+def _any_text(v, _depth=0):
+    """list／dict 裡面任何一個看得見字的字串（只用在名字就是內容容器的欄位上）。"""
+    if _depth > 6:
+        return False
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, dict):
+        return any(_any_text(x, _depth + 1) for x in v.values())
+    if isinstance(v, list):
+        return any(_any_text(x, _depth + 1) for x in v)
+    return False
+
+
+def _block_text_elsewhere(b):
+    """一個 block 除了 `type`／`text` 之外，還有沒有欄位帶著看得見的字（「內容搬到別欄位」）。
+
+    頂層看**字串**欄位；名字就是內容容器的欄位（`content`／`parts`…）裡**任何**帶字的字串都算
+    （`content: ["…"]`、`content: [{"type":"text","text":"…"}]`）；其他巢狀欄位只認帶字的 `text` 鍵
+    （`_nested_text()`）——`annotations` 裡的 url／title、`index: 0` 這類結構性 metadata 不算。"""
+    return any(k not in ("type", "text")
+               and ((isinstance(v, str) and v.strip())
+                    or (k in _TEXTY_KEYS and _any_text(v))
+                    or _nested_text(v))
+               for k, v in b.items())
+
+
+def _jsonish_nontext_blocks(s):
+    """字串若解得出「每個元素都帶 `type` 的 block 陣列」，回其中**非文字** block 的數目；否則 0。
+
+    ⚠ **只用來出聲，不改寫原文**：從字串內容分不出那是上游序列化的 content 還是使用者
+    貼的原文，所以原文一律照收；這裡只回答「若真是序列化的，有沒有東西（圖片…）沒被畫出來」。"""
+    t = s.strip() if isinstance(s, str) else ""
+    if not t.startswith("["):
+        return 0
     try:
-        parsed = json.loads(s)
+        parsed = json.loads(t)
     except Exception:
-        return content, False
-    if (isinstance(parsed, list) and parsed
+        return 0
+    if not (isinstance(parsed, list) and parsed
             and all(isinstance(b, dict) and b.get("type") for b in parsed)):
-        return parsed, True
-    return content, False
+        return 0
+    return sum(1 for b in parsed if str(b.get("type")) not in ("text", "input_text", "output_text"))
+
+
+def _codex_consumed(item, text_type="output_text"):
+    """這個 block 會不會被 `_codex_content_text` 收下——三支函式共用這一條，改一邊就是改全部。
+    ⚠ `text` 一定要是**字串**：物件、數字之類的 `text` 是上游換了形狀，`str()` 一下收下來的是
+      Python 的 repr（`{'value': 'Q'}`），而且不會有任何一條哨兵出聲。"""
+    return (isinstance(item, dict)
+            and (item.get("type") == text_type or (not item.get("type") and item.get("text")))
+            and isinstance(item.get("text"), str) and item["text"] != "")
+
+
+def _codex_carries_unread(b, text_type="output_text"):
+    """沒被收下的這個 block 還帶著沒讀到的東西嗎（＝有內容被丟掉）。
+
+    ① 不是 dict、或型別認不得 ⇒ 是；② `text` 不是字串 ⇒ 是；③ `text` 有字卻沒被收（型別對不上）⇒ 是；
+    ④ `text` 是空字串：只有「別的欄位帶著字」時才是（見 `_block_text_elsewhere`）——
+      `{"type":"output_text","text":""}` 是**真的沒有話講**，不可以算。"""
+    if not isinstance(b, dict):
+        return True
+    if b.get("type") not in (text_type, None):
+        return True
+    if not isinstance(b.get("text"), str):
+        return True
+    if b["text"].strip():
+        return True
+    return _block_text_elsewhere(b)
 
 
 def _codex_content_text(content, text_type="output_text"):
@@ -1065,15 +1170,7 @@ def _codex_content_text(content, text_type="output_text"):
         return content
     if not isinstance(content, list):
         return ""
-    parts = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == text_type or (not item.get("type") and item.get("text")):
-            txt = item.get("text")
-            if txt:
-                parts.append(str(txt))
-    return "\n".join(parts)
+    return "\n".join(item["text"] for item in content if _codex_consumed(item, text_type))
 
 
 def _codex_content_unconsumed(content, text_type="output_text"):
@@ -1085,16 +1182,7 @@ def _codex_content_unconsumed(content, text_type="output_text"):
     於是頁面看起來完整、卻少了一半內容，正是本檔一再要擋的那種形狀。"""
     if not isinstance(content, list):
         return 0
-    n = 0
-    for item in content:
-        if not isinstance(item, dict):
-            n += 1
-            continue
-        if ((item.get("type") == text_type or (not item.get("type") and item.get("text")))
-                and item.get("text")):
-            continue
-        n += 1
-    return n
+    return sum(1 for item in content if not _codex_consumed(item, text_type))
 
 
 def _codex_container_user_like(raw):
@@ -1330,16 +1418,27 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     turn_systemic = False
     turn_error = False                       # 這個窗出現過 `event_msg:error`
     turn_ai = False                          # 這個窗真的產出過助理內容
+    # 整場有沒有看過「沒有產生助理事件的助理產出」（加密、沒有摘要的 reasoning）。
+    # 收尾兩條哨兵的「有助理內容」原本只數助理事件，而那種 reasoning 一個事件都不產生 ⇒
+    # 只有它的那一場會被當成「沒有助理內容」而整條哨兵閉嘴。
+    saw_unrendered_ai = False
     # (v36-fam5 #2) `response_item` 的 payload.type 認不得的則數，與「content 元素型別漂掉、
     # 抽不出助理文字」的則數。兩者都是助理內容整批消失的入口，而容器那條哨兵只認 payload 不是
     # dict 的情形，接不到這兩種。
     n_unhandled_response_items = 0
     n_empty_assistant_items = 0
+    # 抽得到文字的助理訊息裡，**其餘**帶著內容卻沒被收下的 block 數（圖片、型別認不得的…）。
+    n_dropped_assistant_blocks = 0
+    # reasoning 摘要的形狀認不得（不是 list、或 list 裡有帶著內容卻沒被收下的元素）。
+    n_bad_reasoning_summary = 0
     # (v36-fam6 #2) 同一條路徑上另外兩格漂移：`role` 認不得、`content` 欄形狀不對。
     n_unknown_message_role = 0
     n_bad_message_content = 0
-    # (v36-fam6 #3) content 被序列化成 JSON 字串（已還原，但仍是上游漂移，要出聲）。
-    n_json_string_content = 0
+    # 新格式 `UserMessage.content` 是字串（正常形狀是 block 陣列）：原樣收下，但那是上游換了形狀，要出聲。
+    n_str_user_content = 0
+    # 舊格式 `user_message.message` 的字串本身是一段含**非文字 block** 的 JSON 陣列：原文照收，
+    # 但若那是上游序列化的內容，圖片等不會被畫出來——講「可能」，不講「一定」。
+    n_legacy_jsonish_nontext = 0
     # (v36-fam5 #3) 整場收到幾則 prompt。⚠ **不可以**改用 `s.events` 裡 type=="user" 的則數
     # ——工具結果也是以 `user` 存的（見下方 `function_call_output` 那一支），一場有工具呼叫、
     # prompt 卻全丟時它不會是 0。獨立計數器才是「真的被當成 prompt 收下」的則數。
@@ -1439,11 +1538,13 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                 # repr 非空 → 不觸發「取不出文字」；型別名還在 → 不觸發型別哨兵；
                 # 不走 item 分支 → 不數 dropped block。圖片 block 無聲消失。
                 # 那正是不變量①要擋的形狀，只是漂移點在舊格式這一側（新格式那條路徑早就有這兩層）。
-                # (v36-fam6 #3) 先還原「被序列化成 JSON 字串的 content」，否則整包原文會被
-                # 當成 prompt 收下（同上一段講的 repr 問題，只是漂移點再往內一層）。
-                raw_msg, _jsond = _codex_normalize_content(raw_msg)
-                if _jsond:
-                    n_json_string_content += 1
+                # ⚠ **字串是這個欄位的正常形狀，一律原樣收下、不解析**：使用者本來就可能把一段 JSON
+                #   （甚至長得就像 content block 陣列）當成問題貼進來，從字串內容分不出那是
+                #   「上游把 content 序列化了」還是「使用者的原文」——解析它就可能竄改使用者的原文。
+                #   唯一例外是**出聲**：若那段 JSON 裡有非文字 block（圖片…），而它真的是序列化的內容，
+                #   那些就沒被畫出來——這種要講出來，否則是看不見的遺失。
+                if isinstance(raw_msg, str) and _jsonish_nontext_blocks(raw_msg):
+                    n_legacy_jsonish_nontext += 1
                 user_text = (raw_msg if isinstance(raw_msg, str)
                              else _codex_content_text(raw_msg, "text"))
                 if not user_text.strip():
@@ -1473,13 +1574,14 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                     n_unhandled_user_items += 1
                 itype = str(item.get("type") or "")
                 if itype == "UserMessage":
-                    # (v36-fam6 #3) 與舊格式對稱：先還原被序列化成 JSON 字串的 content。
-                    # ⚠ 還原後要**寫回 `item`**，否則下面的 `_codex_content_unconsumed(item…)`
-                    #   仍看到字串、回 0，沒被吃掉的 block（圖片…）又靜默消失一次。
-                    _c, _jsond = _codex_normalize_content(item.get("content"))
-                    if _jsond:
-                        n_json_string_content += 1
-                        item["content"] = _c
+                    _c = item.get("content")
+                    if isinstance(_c, str) and _c.strip():
+                        # 這個欄位的正常形狀是 block 陣列；是字串＝上游換了形狀。**原樣收下、不解析**
+                        # （理由同舊格式那一支：看起來像 JSON 也分不出是序列化還是使用者原文）。
+                        # 字串裡若真的包著圖片等 block，那些不會出現在輸出裡——收尾的警告要講到這一點。
+                        # ⚠ 空字串不算在這裡：那一則實際上沒有收下任何東西，由下面「取不出文字」
+                        #   那條出聲——兩條都出的話，一句說「已原樣收下」、一句說「取不出文字」，互相矛盾。
+                        n_str_user_content += 1
                     user_text = _codex_content_text(_c, "text")
                     if not user_text.strip():
                         # 同上：content 形狀與預期不符（element type 改名、純圖片/音訊…）。
@@ -1595,31 +1697,22 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                 #   ③ `[{"type":"output_text","text":"","content":"真正的文字"}]` ＝ 上游把內容
                 #      **搬到別的欄位**。型別沒改、`text` 也還是字串 ⇒ 只看型別的判準會**吞掉它**，
                 #      而那一則的文字整批消失。這種一定要出聲。
-                # ⇒ 判準：**這個 block 除了「型別認得的空文字」之外還帶著別的東西嗎**。
+                # ⇒ 判準：**這個 block 除了「型別認得的空文字」之外還帶著別的東西嗎**
+                #   （`_codex_carries_unread`；結構性 metadata 如 `index: 0` 不算）。
                 # ⚠ 全語料實測（本機 566 份 rollout ＋ 同事 4 份，12738 個 content block）：
                 #   **欄位集合 100% 是 `{text,type}`**，空文字的那 3 個也沒有任何其他非空欄位
                 #   ⇒ 「還帶著別的非空欄位」這一條在現有資料上**零誤報**。
-                def _carries_unread(b):
-                    if not isinstance(b, dict):
-                        return True
-                    # `_codex_content_text()` 收得下的兩種型別形狀之外 ⇒ 認不得
-                    if b.get("type") not in ("output_text", None):
-                        return True
-                    if not isinstance(b.get("text"), str):
-                        return True          # `text` 欄改名／型別不對
-                    if b["text"].strip():
-                        return True          # 有字卻沒被抽出來（型別對不上上面那支的 text_type）
-                    # 空文字：只有「除了 type/text 以外還有**帶字的字串欄位**」時才算漂移（③）。
-                    # ⚠⚠ **不可以看「任何非空值」**：`{"type":"output_text","text":"","index":0}`
-                    # 這種結構性 metadata 會被誤判成「內容搬到別欄位」而誤報
-                    # （`qimg-fix-codex` Medium#3）。承載文字的欄位一定是字串，
-                    # 用型別把 metadata 擋在外面，比列舉欄位名穩。
-                    return any(k not in ("type", "text") and isinstance(v, str) and v.strip()
-                               for k, v in b.items())
                 _c = payload.get("content")
-                if isinstance(_c, list) and _c and any(_carries_unread(b) for b in _c):
+                if isinstance(_c, list) and _c and any(_codex_carries_unread(b) for b in _c):
                     n_empty_assistant_items += 1
                 continue
+            # 抽得到文字**不代表整則都收下了**：同一則裡其他帶著內容的 block（圖片、型別認不得的、
+            # `text` 不是字串的…）會被整個略過，而「取不出文字」那條只在一個字都抽不到時才看。
+            # 判準與上面那條相同（`_codex_carries_unread`），真的沒有話講的空文字 block 不算。
+            _c = payload.get("content")
+            if isinstance(_c, list):
+                n_dropped_assistant_blocks += sum(
+                    1 for b in _c if not _codex_consumed(b) and _codex_carries_unread(b))
             turn_ai = True          # 這個窗真的有助理內容（見上面 `error` 那段的分界線）
             ev = {
                 "type": "assistant",
@@ -1638,7 +1731,20 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             if step_first_event is None:
                 step_first_event = ev
         elif ptype == "reasoning":
-            text = _codex_content_text(payload.get("summary"), "summary_text")
+            # reasoning 項目本身就是助理的產出（見 `error` 那段的分界線）——**摘要是空的也算**：
+            # 真實 rollout 的 reasoning 幾乎全是只有加密內容、沒有可顯示的摘要，
+            # 只在「有摘要」時才算的話，這個旗標在真實資料上等於從不成立。
+            turn_ai = True
+            _sm = payload.get("summary")
+            text = _codex_content_text(_sm, "summary_text")
+            # 摘要的形狀：正常是 list（加密的那種是空 list）。不是 list、或 list 裡有帶著內容卻沒被收下的
+            # 元素 ⇒ 上游換了形狀，而「摘要是空的」這一格會把它當成正常的加密 reasoning 安靜略過。
+            if (_sm is not None and not isinstance(_sm, list)) or (isinstance(_sm, list) and any(
+                    not _codex_consumed(b, "summary_text") and _codex_carries_unread(b, "summary_text")
+                    for b in _sm)):
+                n_bad_reasoning_summary += 1
+            if not text.strip():
+                saw_unrendered_ai = True
             if text.strip():
                 ev = {
                     "type": "assistant",
@@ -1649,7 +1755,6 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                     "message": {"role": "assistant", "id": f"codex-reason-{i}", "model": current_model,
                                 "content": [{"type": "thinking", "thinking": text}]},
                 }
-                turn_ai = True      # reasoning 也是助理內容（見 `error` 那段的分界線）
                 s.events.append(ev)
                 if step_first_event is None:
                     step_first_event = ev
@@ -1719,10 +1824,22 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     if n_empty_assistant_items:
         print(f"  ! {path.name}: {n_empty_assistant_items} 則助理訊息有 content 卻抽不出文字"
               f"（承載文字的元素型別可能改名了）——那幾則不會出現在輸出裡", file=sys.stderr)
-    if n_json_string_content:
-        print(f"  ! {path.name}: {n_json_string_content} 則訊息的 content 是被序列化成 JSON 字串的"
-              f"——已自動還原並照常收下，但那是上游換了形狀，值得回頭確認解析是否還正確",
+    if n_dropped_assistant_blocks:
+        print(f"  ! {path.name}: 助理訊息裡有 {n_dropped_assistant_blocks} 個帶著內容的 block 沒被收下"
+              f"（圖片、型別認不得、或 text 不是字串）——文字照常顯示，那幾個 block 不會出現在輸出裡",
               file=sys.stderr)
+    if n_bad_reasoning_summary:
+        print(f"  ! {path.name}: {n_bad_reasoning_summary} 則 reasoning 的摘要形狀認不得"
+              f"（不是 list、或裡面有帶著內容卻沒被收下的元素）——那幾則摘要不會出現在輸出裡",
+              file=sys.stderr)
+    if n_str_user_content:
+        print(f"  ! {path.name}: {n_str_user_content} 則使用者訊息的 content 是字串（預期是 block 陣列）"
+              f"——已原樣收下；若內容看起來像 JSON，可能是上游把 content 序列化了，"
+              f"其中的圖片等非文字內容不會出現在輸出裡", file=sys.stderr)
+    if n_legacy_jsonish_nontext:
+        print(f"  ! {path.name}: {n_legacy_jsonish_nontext} 則使用者訊息的文字本身是一段含非文字 block"
+              f"（圖片等）的 JSON 陣列——已原樣當文字收下；若那是上游序列化的內容，"
+              f"其中的非文字 block 不會出現在輸出裡", file=sys.stderr)
     if n_unknown_message_role:
         print(f"  ! {path.name}: {n_unknown_message_role} 則 response_item:message 的 role 不認得"
               f"——助理訊息是靠 role=='assistant' 認出來的，role 改名等於整批被吞掉，"
@@ -1774,6 +1891,8 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     #   會在正常資料上吵。可靠的修法要「窗內宣告的則數 vs 收到的則數」相比，而那個欄位
     #   不確定存不存在。實測數字與回頭處理的條件見 planning/scope-limits.md。
     n_ai_turns = sum(1 for e in s.events if e.get("type") == "assistant")
+    # 「有助理內容」也算進沒有產生事件的那種（加密 reasoning），見 `saw_unrendered_ai`。
+    n_ai_turns = n_ai_turns or int(saw_unrendered_ai)
     if n_empty_turns and n_ai_turns and not subagent_thread:
         print(f"  ! {path.name}: 有 {n_empty_turns} 個回合開始了卻沒收到任何使用者 prompt"
               f"——不論形狀漂成什麼樣，這都代表使用者那一側有東西沒解析出來", file=sys.stderr)
@@ -2387,13 +2506,15 @@ def synth_queued_user_events(events, name=""):
         _pr = a.get("prompt")
         if _pr is not None and not isinstance(_pr, (str, list)):
             n_bad_prompt += 1
-        # ⚠ `type` 對得上還不夠：`[{"type":"text","content":"lost"}]`（`text` 欄搬走了）
-        #   在第一版是「認得的形狀」⇒ 取不出文字、又不出聲 ⇒ 整則靜默消失
-        #   （`qimg-fix-codex` Medium#4 實測 `synth=0, warned=False`）。
+        # ⚠ `type` 對得上還不夠：`[{"type":"text","content":"lost"}]`（`text` 欄搬走了）是
+        #   「取不出文字、又不出聲」⇒ 整則靜默消失。`text` 在、但空著而字在別欄
+        #   （`{"type":"text","text":"","content":"…"}`）也是同一種——判準與 Codex 那側共用
+        #   `_block_text_elsewhere()`。
         elif isinstance(_pr, list) and any(
                 not (isinstance(b, dict)
                      and (b.get("type") == "image"
-                          or (b.get("type") == "text" and isinstance(b.get("text"), str))))
+                          or (b.get("type") == "text" and isinstance(b.get("text"), str)
+                              and (b["text"].strip() or not _block_text_elsewhere(b)))))
                 for b in _pr):
             n_bad_prompt += 1
         # ⚠ **`or imgs`**：只貼了圖、一個字都沒打的那一則，文字是空字串。
@@ -2809,7 +2930,13 @@ def group_turns(events, per_step=True, step_by_usage=False):
                     cur["n_steps"] += 1
                     cur["blocks"].append({"type": "_step", "idx": cur["n_steps"], "mid": mid,
                                           "u": _step_usage(msg, e), "t": _epoch(e),
-                                          "tms": _epoch_ms(e)})
+                                          "tms": _epoch_ms(e),
+                                          # 這一步屬於哪條對話軸：(來源檔, agentId)。直接取自事件本身，
+                                          # 不經 message.id 反查（id 可能缺、也可能在不同代理間重複）。
+                                          "ax": (e.get("_srcf") or "", e.get("agentId") or "")})
+                    # 掛回事件：這一次呼叫畫成了一步（`analyze()` 另計「沒畫出來的呼叫」時靠它，
+                    # 沒有 message.id 的呼叫也分得出來）。
+                    e["_stepped"] = True
             elif step_by_usage:
                 su = _step_usage(msg, e)
                 if su:
@@ -3093,27 +3220,81 @@ def analyze(s, acct_switches=None):
                     b["cause_masked"] = masked.get(k) if k is not None else None
     # 每步「距上一步多久」：同一條對話軸（主對話／子代理各自算）上一次 API 呼叫到這次的間隔——
     # 快取 TTL 是「距上次使用」在算的，這個數字才是判讀冷熱的直接依據（statusline 的 (Xs ago) 同義）。
-    for groups in [s.main_groups] + list(s.subagent_map.values()):   # 子代理各自一條軸，不與主對話相混
-        prev_t = None
-        prev_ttl = ""       # 這條軸上一個**有寫入**的步是哪個 TTL 檔次 → 切換的那一步才標得出來
+    # ⚠ 軸以**代理身分**分，不以分組分：父 Task 對不上的子代理（缺 `.meta.json` 的外部檔、
+    #   檔內的舊格式 sidechain）會全部落進同一組（鍵 ""），照分組算會把代理 A 的最後一步當成
+    #   代理 B 的「上一步」。身分是 `_step` 建立時就掛上的 (來源檔, agentId)。
+    #   範圍限制 SCOPE-SIDECHAIN-NO-AGENT-ID：兩者都缺的步（檔內 sidechain 又沒有 agentId）
+    #   分不出是哪個代理，只能共用所在分組那一條軸。
+    # 表頭的寫入 TTL 摘要**直接讀這一串步驟**（主對話那一條軸）：與逐步徽章同一個迴圈、同一個
+    # 時間序、同一套「哪些步算數」。另外走原始事件重算一次的話，檔案行序與時間序不同時，
+    # 表頭與徽章會講出兩種切換。沒有 `_step` 的呼叫（沒有可呈現內容）另計在 `ttl_hidden`。
+    ttl_n = {"1h": 0, "5m": 0, "both": 0}
+    ttl_switches = []       # [(當地 HH:MM, 前, 後)]
+    ttl_unknown_steps = 0   # 主對話上「有寫入、但沒有 TTL 細分」的步（舊資料）
+    for gi, groups in enumerate([s.main_groups] + list(s.subagent_map.values())):
+        prev_t = {}
+        prev_ttl = {}       # 每條軸上一個**有寫入**的步是哪個 TTL 檔次 → 切換的那一步才標得出來
         for g in groups:
             for b in g.get("blocks", []):
                 if b.get("type") != "_step":
                     continue
+                ax = b.get("ax", ("", "")) if gi else ("", "")
                 u = b.get("u")
                 tier = ttl_tier(u)
                 if tier:
                     # 只有「有寫入」的步才更新基準：純讀取的步沒有 TTL 可言，拿它當基準會讓
                     # 下一次寫入被誤標成切換。
-                    if prev_ttl and prev_ttl != tier:
-                        u["ttl_prev"] = prev_ttl
-                    prev_ttl = tier
+                    p = prev_ttl.get(ax, "")
+                    if p and p != tier:
+                        u["ttl_prev"] = p
+                    prev_ttl[ax] = tier
+                    if gi == 0:      # 表頭只計主對話：子代理預設寫 5m，混進來會讓每一場都掛上這行
+                        ttl_n[tier] += 1
+                        if p and p != tier:
+                            ttl_switches.append((epoch_str(b.get("t"), "%H:%M"), p, tier))
+                elif gi == 0 and isinstance(u, dict) and (
+                        (u.get("cache_create") or 0) > (u.get("cc5") or 0) + (u.get("cc1h") or 0)):
+                    # 有寫入、但沒有 TTL 細分（舊資料）：沒有徽章可掛，表頭另列（見 `_ttl_head`）
+                    ttl_unknown_steps += 1
                 t = b.get("t")
                 if t is None:
                     continue
-                if prev_t is not None and t >= prev_t:
-                    b["gap"] = t - prev_t
-                prev_t = t
+                pt = prev_t.get(ax)
+                if pt is not None and t >= pt:
+                    b["gap"] = t - pt
+                prev_t[ax] = t
+    s.ttl_n = ttl_n
+    s.ttl_switches = ttl_switches
+    # 沒有可呈現內容的主對話呼叫（沒有 `_step`、也就沒有徽章）：寫入照樣發生、錢照樣算進
+    # 花費組成表，只是畫不出來。另計次數，讓表頭照實講——否則一次只寫 5m 的隱形呼叫
+    # 會讓表頭以為「全程 1h」而整行不出現。
+    # 一次呼叫＝同一個 message.id 的所有事件（沒有 id 的每一筆各自一次）；其中任何一筆畫成了步
+    # （`group_turns` 掛的 `_stepped`）就不算隱形。usage 取**第一筆帶 usage 的**，不是第一筆事件。
+    _calls = {}
+    for e in (main if s.source_kind == SOURCE_CLAUDE else ()):
+        if e.get("type") != "assistant":
+            continue
+        _msg = e.get("message") or {}
+        _key = _msg.get("id") or ("_anon", id(e))
+        _st = _calls.setdefault(_key, [False, None])
+        if e.get("_stepped"):
+            _st[0] = True
+        if _st[1] is None and isinstance(_msg.get("usage"), dict):
+            _st[1] = _msg["usage"]
+    ttl_hidden = {"1h": 0, "5m": 0, "both": 0}
+    ttl_unknown_hidden = 0
+    for _stepped, _u in _calls.values():
+        if _stepped or _u is None:
+            continue
+        _c5, _c1h = _ephemeral_split(_u)
+        _tier = ttl_tier({"cc5": _c5, "cc1h": _c1h})
+        if _tier:
+            ttl_hidden[_tier] += 1
+        elif usage_int(_u, "cache_creation_input_tokens", "cacheCreationInputTokens") > _c5 + _c1h:
+            ttl_unknown_hidden += 1       # 隱形、而且沒有 TTL 細分的寫入（舊資料）
+    s.ttl_hidden = ttl_hidden
+    s.ttl_unknown_steps = ttl_unknown_steps
+    s.ttl_unknown_hidden = ttl_unknown_hidden
     first_txt = first_user_text(s.events)
     s.kind = ("review" if REVIEW_RE.search(first_txt)
               else "exec" if s.exec_origin else "chat")
@@ -3137,9 +3318,6 @@ def _collect_usage(s):
     miss_cold = 0           # 其中「整段沒命中」的次數（其餘為只掉一段的部分失效）
     efforts = []            # 出現過的 effort 等級（依序、去重）——中途改 effort 會影響快取
     cost_mix = {k: 0.0 for k in COST_PARTS}   # 花費組成（全場，含子代理——與表頭的總額同一口徑）
-    ttl_n = {"1h": 0, "5m": 0, "both": 0}   # 主對話**有寫入**的步各用哪個 TTL 檔次（只計主對話）
-    ttl_switches = []       # 主對話上的檔次切換 [(當地時間字串, 前, 後)]——多半＝帳號額度狀態變了
-    ttl_prev = ""
     for e in s.events:
         if e.get("type") != "assistant":
             continue
@@ -3169,19 +3347,11 @@ def _collect_usage(s):
             resume_ctx = i + c1 + c2          # 主對話按時間在後者覆蓋前者 → 最終為最後一筆
             resume_model = mdl or resume_model
         c5, c1h = _ephemeral_split(u)
-        if not e.get("isSidechain"):     # 子代理固定 5m（設計如此），混進來會把主對話的切換洗掉
-            tier = ttl_tier({"cc5": c5, "cc1h": c1h})
-            if tier:
-                ttl_n[tier] += 1
-                if ttl_prev and ttl_prev != tier:
-                    when_sw = local_str(e.get("_dt"), "%H:%M") if e.get("_dt") else ""
-                    ttl_switches.append((when_sw, ttl_prev, tier))
-                ttl_prev = tier
         parts = call_cost_parts(mdl, i, c1, c2, o, c5, c1h)
         if parts is None:
             unpriced = True
         else:
-            cost += sum(parts.values())
+            cost += call_cost(mdl, i, c1, c2, o, c5, c1h)    # 總額以 call_cost 為準（見其說明）
             for k in COST_PARTS:
                 cost_mix[k] += parts[k]
         eff = str(e.get("effort") or "")
@@ -3214,8 +3384,6 @@ def _collect_usage(s):
     s.miss_cold = miss_cold
     s.efforts = efforts
     s.cost_mix = cost_mix
-    s.ttl_n = ttl_n
-    s.ttl_switches = ttl_switches
     s.cache_pct = round(100 * cr / total_in) if total_in else 0
     s.usage = {"input": inp, "cache_create": cc, "cache_read": cr, "output": out, "total_in": total_in}
 
@@ -3310,14 +3478,15 @@ def _history_epoch_ms(ts):
     任何跡象。涵蓋的是「量級整個錯掉」，不是逐列的日期正確性。"""
     if isinstance(ts, bool):
         return None
-    if isinstance(ts, (int, float)):
-        val = float(ts)
-    elif isinstance(ts, str):
-        try:
+    try:
+        if isinstance(ts, (int, float)):
+            # ⚠ 太大的**整數**（JSON 本來就允許任意位數）轉 float 會丟 OverflowError，不是變成 inf
+            val = float(ts)
+        elif isinstance(ts, str):
             val = float(ts.strip())
-        except ValueError:
+        else:
             return None
-    else:
+    except (ValueError, OverflowError):
         return None
     if not math.isfinite(val):
         return None
@@ -4065,7 +4234,7 @@ TTL_LABELS = {"1h": "1h", "5m": "5m", "both": "5m+1h"}
 _TTL_TIP = ("這一步**寫入**快取時用的 TTL（`usage.cache_creation` 的 5 分／1 小時細分）。"
             "只描述寫入：同一步仍可能讀到先前用另一種 TTL 寫進去的前綴。"
             "子代理預設寫 5m（可用 CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h 改掉）；"
-            "主對話中途由 1h 轉 5m 多半是帳號進入 usage overage")
+            "主對話中途由 1h 轉 5m：資料本身不帶成因，本機實測的兩次都發生在帳號進入 usage overage 的時候")
 
 
 def _ttl_meter(u):
@@ -4074,7 +4243,9 @@ def _ttl_meter(u):
     ⚠⚠ **5m 一律紅底白字、而且不受勾選開關控制**（`.t5` 被 `body.hide-ttl` 的規則排除）。
     理由：5m **不是**「子代理本來就這樣」的中性事實——`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL`
     （或 settings 的 `subagentPromptCacheTtl`）可以把子代理設成 `1h`，所以看到 5m 一律代表
-    「這段快取只能活 5 分鐘、中斷回來就是整段重寫」，那是要當場看見的事，不是要勾才看得到的細節。
+    「這一步寫進去的快取閒置 5 分鐘就過期」，那是要當場看見的事，不是要勾才看得到的細節。
+    ⚠ 只講**這一步的寫入**：同一段對話先前用 1h 寫入、還沒過期的前綴仍可能讀得到，
+    所以不可以寫成「中斷回來就整段重寫」。
     1h 的徽章維持可勾選（預設關），因為它是常態、每步都標只會變成噪音。
     `5m+1h` 混合步維持中性：它不是純粹的 5m，紅字會誇大。"""
     tier = ttl_tier(u)
@@ -4131,13 +4302,16 @@ def _miss_head(s):
 def cost_mix_rows(s):
     """花費組成 → [(標籤, 金額, 佔比 0–1)]；沒有可計價的呼叫回 []。
 
-    ⚠ **分母是這一場的估算總額**（含子代理），與表頭 `💲~$X` 同一個數字——換別的分母，
-    兩個地方對同一場會給出兩套佔比。未知模型的呼叫兩邊都算不進去（表頭已用 `+?` 揭露）。"""
+    ⚠ **分母是這一場的估算總額**（含子代理）：各列加總，與表頭 `💲~$X` 只差浮點誤差
+    （總額的算法見 `call_cost`）——換別的分母，兩個地方對同一場會給出兩套佔比。
+    未知模型的呼叫兩邊都算不進去（表頭已用 `+?` 揭露）。
+    「TTL 未知」那一列只在真的有舊資料（寫入量沒有 TTL 細分）時出現；其餘五列是 0 也留著。"""
     mix = getattr(s, "cost_mix", None) or {}
     tot = sum(mix.get(k, 0.0) for k in COST_PARTS)
     if tot <= 0:
         return []
-    return [(COST_PART_LABELS[k], mix.get(k, 0.0), mix.get(k, 0.0) / tot) for k in COST_PARTS]
+    return [(COST_PART_LABELS[k], mix.get(k, 0.0), mix.get(k, 0.0) / tot) for k in COST_PARTS
+            if k != "wx" or mix.get(k, 0.0) > 0]
 
 
 def _cost_mix_html(s):
@@ -4159,22 +4333,42 @@ def _cost_mix_html(s):
 def _ttl_head(s):
     """session 表頭的「寫入 TTL」摘要 → (文字, tip)；**全程 1h（最常見）就回 ("", "")**，不佔版面。
 
-    只計主對話：子代理固定寫 5m，混進來會讓每一場都掛上這行。**中途從 1h 轉 5m 值得看一眼**
+    只計主對話：子代理預設寫 5m，混進來會讓每一場都掛上這行。**中途從 1h 轉 5m 值得看一眼**
     ——本機實測兩場（`b61dc0b7`、`515b05fa`）都是帳號進入 usage overage 的那一刻，
-    之後每次閒置超過 5 分鐘回來就是整段重寫。"""
+    之後寫進去的快取閒置 5 分鐘就過期。
+    `ttl_n`／`ttl_switches` 由 `analyze()` 在算逐步徽章的**同一個迴圈**裡產生（主對話那條軸），
+    所以表頭與徽章對「哪幾步、在哪一步切換」必然一致。沒有 `_step` 的呼叫（`ttl_hidden`）
+    另列次數：它們的寫入照樣發生，只是畫不出來；「全程 1h 就不顯示」要把它們也算進去。
+    沒有 TTL 細分的寫入（舊資料，`ttl_unknown_*`）：**有已知檔次時**才另列——那時「不顯示」
+    會被讀成「全程 1h」；整場都是舊資料時照樣不顯示（沒有任何檔次可講，花費組成表另有一列）。"""
     n = getattr(s, "ttl_n", None) or {}
-    tot = sum(n.values())
-    if not tot or (n.get("1h", 0) == tot and not getattr(s, "ttl_switches", None)):
+    hid = getattr(s, "ttl_hidden", None) or {}
+    sw = getattr(s, "ttl_switches", None) or []
+    us = getattr(s, "ttl_unknown_steps", 0) or 0
+    uh = getattr(s, "ttl_unknown_hidden", 0) or 0
+    tot, htot = sum(n.values()), sum(hid.values())
+    if not (tot or htot):
+        return "", ""
+    if n.get("1h", 0) == tot and hid.get("1h", 0) == htot and not sw and not (us or uh):
         return "", ""
     parts = [f"{TTL_LABELS[k]} {n[k]} 步" for k in ("1h", "5m", "both") if n.get(k)]
+    if us:
+        parts.append(f"TTL 未知 {us} 步")
     text = "寫入 TTL：" + "／".join(parts)
-    sw = getattr(s, "ttl_switches", None) or []
     if sw:
         shown = "、".join(f"{t} 起 {TTL_LABELS.get(a, a)}→{TTL_LABELS.get(b, b)}" for t, a, b in sw[:2])
         text += f"（{shown}{'…' if len(sw) > 2 else ''}）"
+    if htot or uh:
+        hp = [f"{TTL_LABELS[k]} ×{hid[k]}" for k in ("1h", "5m", "both") if hid.get(k)]
+        if uh:
+            hp.append(f"TTL 未知 ×{uh}")
+        text += f"{'；' if parts else ''}另有 {htot + uh} 次沒有可呈現內容的呼叫（{'／'.join(hp)}）"
     return text, ("只計主對話（子代理另計，預設寫 5m，可用 CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h 改）。"
-                  "主對話中途由 1h 轉 5m，本機實測對應帳號進入 usage overage；"
-                  "5m 期間閒置超過 5 分鐘回來就是整段重寫")
+                  "步數與逐步徽章同一串；沒有可呈現內容的呼叫沒有徽章，另列次數。"
+                  "「TTL 未知」是沒有 5m／1h 細分的舊資料。"
+                  "主對話中途由 1h 轉 5m：資料本身不帶成因，本機實測的兩次都發生在帳號進入 usage overage 的時候。"
+                  "5m 寫入的快取閒置超過 5 分鐘就會過期；之後若再用到那一段，就要重新寫入"
+                  "（先前用 1h 寫入、還沒過期的前綴仍可能讀得到）")
 
 
 def _ttl_summary_html(s):
@@ -4182,9 +4376,11 @@ def _ttl_summary_html(s):
     text, tip = _ttl_head(s)
     if not text:
         return ""
-    # 只要有 5m 就標警示色：5m 不是中性事實（子代理也能設成 1h），它代表「中斷回來就整段重寫」。
+    # 只要有 5m 就標警示色：5m 不是中性事實（子代理也能設成 1h），它代表「這段寫入閒置 5 分鐘就過期」。
     n = getattr(s, "ttl_n", None) or {}
-    cls = ' class="warn"' if ((getattr(s, "ttl_switches", None) or []) or n.get("5m")) else ""
+    hid = getattr(s, "ttl_hidden", None) or {}
+    cls = (' class="warn"' if ((getattr(s, "ttl_switches", None) or []) or n.get("5m") or hid.get("5m"))
+           else "")
     return f' · <span{cls} title="{esc_attr(tip)}">{esc(text)}</span>'
 
 
@@ -6676,7 +6872,7 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
     <label><input type="checkbox" id="cb_out" onchange="tm('out')">產出</label>
     <label><input type="checkbox" id="cb_gap" onchange="tm('gap')" title="距上一次 API 呼叫多久（快取 TTL 以距上次使用計）">距上一步</label>
     <label><input type="checkbox" id="cb_dur" onchange="tm('dur')" title="這個回合實際耗時（送出 → 答完）">⏱耗時</label>
-    <label><input type="checkbox" id="cb_ttl" onchange="tm('ttl')" title="這一步寫入快取用的 TTL；只描述寫入，不代表讀到的快取。⚠ 5m 一律紅底顯示，不受這個開關控制；這裡勾的是 1h 那些">寫入 TTL</label>
+    <label><input type="checkbox" id="cb_ttl" onchange="tm('ttl')" title="這一步寫入快取用的 TTL；只描述寫入，不代表讀到的快取。⚠ 純 5m 一律紅底顯示，不受這個開關控制；這裡勾的是 1h 與 5m+1h 那些">寫入 TTL</label>
     <label><input type="checkbox" id="cb_eff" onchange="tm('eff')" title="該次呼叫的推理強度 effort">effort</label>
   </div>
   <h1>{h1}</h1>
@@ -7428,6 +7624,11 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
         mem_link = (f'<a class="memlink" href="{esc_attr(r["mem_href"])}" title="此專案 memory">🧠</a>'
                     if r.get("mem_href") else "")
         cost_cell = cost_label(r.get("cost", 0) or 0, r.get("cost_partial"))
+        # 這一列沒有 HTML（`--format md` 建置，或渲染失敗而沿用只有 MD 的上一次輸出）⇒ 改連 MD 並標示，
+        # 不可以留一條連到不存在頁面的連結。判準與全文搜尋結果頁相同（`has_html` 旗標）。
+        row_href = r["out_html"] if r.get("has_html", True) else r["out_md"]
+        md_only = "" if r.get("has_html", True) else ' <span class="chip">僅 .md</span>'
+        _no_out = not r.get("has_html", True) and not r.get("has_md", True)   # 兩種都不可用：不給連結
         rc = r.get("resume_ctx") or 0
         rw = r.get("resume_window")
         rc_title = f' title="≈{round(100 * rc / rw)}% / {fmt_tokens(rw)}"' if (rc and rw) else ""
@@ -7444,7 +7645,9 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
             f'{src_td}'
             f'{acc_td}'
             f'<td><span class="chip" title="{esc_attr(chip_title)}">{esc(r["proj"])}</span></td>'
-            f'<td><a href="sessions/{esc_attr(r["out_html"])}">{title_html}</a>{mem_link}</td>'
+            + (f'<td>{title_html} <span class="chip">沒有可用的輸出</span>{mem_link}</td>' if _no_out else
+               f'<td><a href="sessions/{esc_attr(row_href)}">{title_html}</a>{md_only}{mem_link}</td>')
+            +
             f'<td class="num">{r["n_user"]}/{r["n_assistant"]}</td>'
             f'<td class="num">{r["n_tools"]}</td>'
             f'<td class="num" data-sort="{(r.get("cost", 0) or 0):.6f}">{cost_cell}</td>'
@@ -7592,7 +7795,13 @@ def render_index_md(rows, show_account=False, cache_report=False, codex_report=F
             waste = (f" · 🔥人因浪費 "
                      f"{cost_label(r.get('waste_usd') or 0, r.get('waste_partial'))}"
                      f"（{wn} 次）") if wn else ""
-            out.append(f"- {acc}[{mark}{r['title']}](sessions/{r['out_md']}) — {r.get('date_str','?')} · "
+            # 這一列沒有 MD（`--format html` 建置，或渲染失敗而沿用只有 HTML 的上一次輸出）⇒ 改連 HTML 並標示
+            md_href, only = ((r["out_md"], "") if r.get("has_md", True) else (r["out_html"], "（僅 HTML）"))
+            # 兩種都不可用：不給連結（連到不存在的檔比沒有連結更糟）
+            _link = (f"{mark}{r['title']}（沒有可用的輸出）"
+                     if not r.get("has_md", True) and not r.get("has_html", True)
+                     else f"[{mark}{r['title']}](sessions/{md_href}){only}")
+            out.append(f"- {acc}{_link} — {r.get('date_str','?')} · "
                        f"~{cost} · {r['n_user']}問/{r['n_assistant']}答 · 🔧{r['n_tools']}"
                        + (f" · 型態:{KIND_LABELS.get(kind, kind)}" if kind != "chat" else "")
                        + waste
@@ -10194,6 +10403,23 @@ def archive_command_only(sessions, dest: Path, scanned_roots, out: Path) -> tupl
     return moved, skipped
 
 
+def _file_digest(p):
+    """檔案內容的 SHA-256；讀不到回 None。
+
+    用來回答封存清理唯一要問的問題：「來源路徑上**現在**是不是還保有原本那份位元組」。
+    ⚠ 不用 metadata（裝置／inode／大小／mtime）：同長度改寫再把 mtime 設回去就騙得過它，
+      而騙過的後果是刪掉唯一完整的副本；反過來只動了 mtime、內容沒變時，它又會誤判成「變了」
+      而留下一個擋住之後每一次執行的半截檔。內容一樣＝刪掉目的地不會少任何東西。"""
+    try:
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
     """`archive_command_only()` 的主迴圈——安全閘都過了之後的逐場處理。
 
@@ -10224,8 +10450,15 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         # 注入一次 `fsync` 失敗就實測到：`source=True target=True target_size=0
         # html=False md=False`——**頁面已經刪了、目的地留下 0 位元組的佔位檔，
         # 而下一次執行會撞到「目的地已有同名檔」永遠略過這一場。**
-        def _unreserve(tgt=None):
+        def _unreserve(tgt=None, src_id=None):
             """把這一趟用 `O_EXCL` 搶到的目的地檔收回來。**每一條失敗路徑都要走它。**
+
+            ⚠⚠ **搬移那一段要帶 `src_id`**（搬之前量的來源內容雜湊，見 `_file_digest`）。
+            「來源還在」只證明路徑上有一個檔，不證明它還保有原本那份內容：搬移其實已經完成、
+            而來源路徑被別的程式重建（例如 Claude Code 又往同一場寫了一行）之後才中斷的話，
+            目的地就是**原本那份的唯一完整副本**——只看 `exists()` 會把它刪掉。
+            內容對不上（或讀不到、搬之前也沒量到）就保留目的地，**當場印到 stderr**
+            （Ctrl+C 會直接往外拋，排到 `_skip` 的訊息來不及被印），並附上復原方法。
 
             ⚠⚠ **不可以只刪 0 位元組的。** `shutil.move` 跨磁碟會退化成「複製＋刪來源」，
             複製寫到一半才失敗時目的地是**部分內容**，不是 0 位元組
@@ -10251,6 +10484,16 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
                 if not path.exists():
                     # 來源已經不在 ⇒ 目的地那個檔可能就是搬成功的結果，**絕對不要刪**。
                     return False
+                if tgt.stat().st_size == 0:
+                    # 還是搶名字時建的空佔位檔：它不可能是任何內容的副本，刪掉一定安全
+                    tgt.unlink()
+                    return True
+                if src_id is not None and (src_id is False or _file_digest(path) != src_id):
+                    _msg = (f"⚠ 來源的內容與搬移前不同（或讀不到），目的地保留——它可能是原本那份的"
+                            f"唯一完整副本：{tgt}。確認來源 {path} 的內容完整之後，刪掉目的地那個檔再重跑即可")
+                    print(f"  ! {_msg}", file=sys.stderr)
+                    _skip(_msg)
+                    return False
                 tgt.unlink()
                 return True
             except OSError as e2:
@@ -10274,6 +10517,17 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             _unreserve()
             _skip(f"目的地建不出來：{type(e).__name__}: {e}")
             continue
+        except BaseException:
+            # Ctrl+C 落在關檔這一刻：留下的 0 位元組佔位檔會擋住之後每一次執行。
+            # 先確保 handle 關了（Windows 上開著的檔刪不掉），再收佔位檔，**原樣拋出**。
+            # （`os.open` 回來到進入這個 `try` 之間只剩幾個 bytecode，那一格涵蓋不到——
+            #   與 SCOPE-ARCHIVE-NO-RESTART-RECONCILE 同一類：留下的是佔位檔，來源安全。）
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            _unreserve()
+            raise
 
         # ⚠⚠ **搬之前先記「打算搬」。** 這一行落磁之後，就算下一步整個行程被砍，
         # 還原的人也知道「有一場正在從 A 搬到 B」——去 A 或 B 找得到它。
@@ -10314,6 +10568,15 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         # 兩者之間有窗：另一個 viewer（或任何程序）在中間建出同名檔時，
         # `shutil.move` 跨磁碟會退化成 copy ⇒ **覆蓋掉先前封存的紀錄**
         # （`utf-fix-codex` Medium 實測）。搶到名字的只會有一個，搶輸的拿 `FileExistsError`。
+        # 搬之前的來源內容雜湊：中斷後的清理靠它判斷能不能刪目的地。讀不到就記 False
+        # ＝「沒辦法確認」⇒ 清理一律保留目的地（寧可留一個要人工處理的檔，也不冒刪掉唯一副本的險）。
+        # ⚠ 雜湊也要在受保護區裡：這時名字已經搶到、pending 也寫了，在這裡按 Ctrl+C 會留下
+        #   擋住之後每一次執行的空佔位檔（目的地還沒被寫過，收掉一定安全）。
+        try:
+            src_id = _file_digest(path) or False
+        except BaseException:
+            _unreserve()
+            raise
         try:
             # ⚠⚠ **一定要用 `shutil.move`，不可以用 `Path.replace()`。**
             # 後者是 `os.replace`，**跨磁碟機會直接丟 OSError**（Windows WinError 17）——
@@ -10327,8 +10590,9 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             # ⚠⚠ 跨磁碟複製到一半被 Ctrl+C：目的地是**部分內容**、來源還在。
             # 不收的話那個半截檔會擋住之後每一次執行
             # （`utf-fix-codex-r4` 實測 `PARTIAL_INTERRUPT` ＋ `PARTIAL_INTERRUPT_RETRY`）。
-            # ⚠ `_unreserve()` 自己會判「來源還在才刪」，所以搬成功之後才中斷不會誤刪。
-            _unreserve()
+            # ⚠ `_unreserve()` 會判「來源還在、而且還是搬之前那一個才刪」，
+            #   所以搬成功之後才中斷（含來源路徑被重建）不會誤刪。
+            _unreserve(src_id=src_id)
             raise
         except Exception as e:
             # ⚠ 把實際訊息帶出來。只印例外類別名的話，「跨磁碟機」和「權限不足」
@@ -10336,7 +10600,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             # ⚠⚠ **佔位檔要收掉**：上面用 `O_EXCL` 搶到的那個名字是我們的，
             # 搬失敗還留著的話，下一次執行會撞到「目的地已有同名檔」而永遠搬不動。
             # ⚠ 跨磁碟時它可能是**寫到一半的部分內容**，不是 0 位元組——見 `_unreserve()`。
-            _unreserve()
+            _unreserve(src_id=src_id)
             try:
                 _journal({"state": "failed", "moved_at": datetime.now(timezone.utc).isoformat(),
                           "from": src_abs, "to": str(target),
@@ -11201,9 +11465,18 @@ def main():
             # ⚠⚠ **要先確認上一次的輸出真的還在磁碟上**。無條件回填的話，舊 row 指向的
             # 頁面若早就不見了（被清過、被手動刪過），索引就會多一條**指向不存在的檔**
             # 的連結——那和這一條原本要修的缺陷是同一種傷害，只是方向相反。
-            row = (cached or {}).get("row") or {}
-            if any(row.get(k) and (sess_dir / row[k]).exists() for k in ("out_html", "out_md")):
-                new_entries[key] = cached
+            # ⚠ 旗標要照**磁碟上實際在、而且原本就標成同步的檔**改寫：上一次若只建了其中一種格式
+            #   （`--format md`／`html`），這一次又失敗，兩份索引都照舊旗標連結的話，就會有一份連到
+            #   不存在的頁面。索引頁與書籤反查表都看 `has_html`／`has_md` 決定連哪一種。
+            # ⚠ **兩個旗標都不成立就不回填**：磁碟上就算還有一份檔，它若原本就被標成過期（別的
+            #   指紋產的），回填只會多一條連到不存在（或不該信）的頁面的連結。
+            row = dict((cached or {}).get("row") or {})
+            row["has_html"] = bool(row.get("has_html", True) and row.get("out_html")
+                                   and (sess_dir / row["out_html"]).exists())
+            row["has_md"] = bool(row.get("has_md", True) and row.get("out_md")
+                                 and (sess_dir / row["out_md"]).exists())
+            if row["has_html"] or row["has_md"]:
+                new_entries[key] = dict(cached, row=row)
                 n_broken_kept += 1
 
         try:
@@ -11256,24 +11529,61 @@ def main():
         # ⚠⚠ **護欄要真的包到渲染。** 先前只包了 `analyze()`，而註解卻寫著「包到渲染完為止」
         # ——那是**只修一半、而且註解在說謊**（`qimg-fix-codex` Medium#8 讀碼抓到）。
         # 渲染層拿到的是同一份髒資料，而這條線新增的碼有一半在渲染層。
+        # ⚠⚠ **先寫到暫存檔、全部成功才換上正式檔。** 直接寫正式檔的話，寫到一半失敗（或 HTML
+        #   寫好了、MD／`session_to_row` 才失敗）時，磁碟上留下的是**寫壞的新頁面**或「新 HTML ＋舊 MD」，
+        #   而 `_broken` 會把上一次的 row 放回去 ⇒ manifest 信任一個壞掉的頁面，下一次建置還會沿用它。
+        #   換上用 `os.replace`（同一個目錄內原子取代）：每一個正式檔永遠是完整的舊版或完整的新版。
+        staged = []           # [(暫存檔, 正式檔)]
         try:
             if want_html:
                 mem_link = ("../" * len(PureWindowsPath(s.out_html).parts) + s.mem_href) if s.mem_href else ""
-                (sess_dir / s.out_html).write_text(
-                    render_session_html(s, rel_index_href(s.out_html), mem_link), encoding="utf-8")
+                _t = sess_dir / (s.out_html + ".tmp")
+                staged.append((_t, sess_dir / s.out_html))
+                _t.write_text(render_session_html(s, rel_index_href(s.out_html), mem_link), encoding="utf-8")
             if want_md:
-                (sess_dir / s.out_md).write_text(render_session_md(s), encoding="utf-8")
+                _t = sess_dir / (s.out_md + ".tmp")
+                staged.append((_t, sess_dir / s.out_md))
+                _t.write_text(render_session_md(s), encoding="utf-8")
             row = session_to_row(s)
         except Exception as e:
+            for _t, _ in staged:
+                try:
+                    _t.unlink(missing_ok=True)
+                except OSError:
+                    pass
             _broken("渲染失敗", e)
             continue
+        # ⚠⚠ **換上是兩個動作，不是一個交易。** HTML 換上了、MD 才換不上（Windows 上目標檔被開著或
+        #   唯讀時 `os.replace` 會丟 `PermissionError`）⇒ 磁碟上是新 HTML ＋舊 MD。
+        #   做法是**讓 manifest 照磁碟實況記**：這一次的 row，只有真的換上的格式標成同步，
+        #   沒換上的那一份（舊檔）標成過期 ⇒ 索引改連另一種、`--search` 不讀過期的 MD、
+        #   下一次建置因為旗標不成立而重寫。一個都沒換上時就等於渲染失敗：沿用上一次的輸出。
+        published = []
+        try:
+            for _t, _final in staged:
+                os.replace(_t, _final)
+                published.append(_final)
+        except OSError as e:
+            for _t, _ in staged:
+                try:
+                    _t.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if not published:
+                _broken("寫出失敗", e)
+                continue
+            print(f"  ! 寫出失敗（部分） {sf.name}: {type(e).__name__}: {e}——"
+                  f"已換上 {', '.join(p.name for p in published)}，其餘沿用舊檔並標成過期，"
+                  f"下一次建置會重寫", file=sys.stderr)
         # has_html/has_md＝該檔與本 row 的 sig+renderer 同步。縮格式建置（--format md/html）時，
         # 另一格式若在「同一 sig」下產過且檔仍在，旗標沿用；sig 變了就不可信（過期檔）。
         prev = cached.get("row") if cached.get("sig") == sig else None
-        row["has_html"] = want_html or bool(prev and prev.get("has_html")
-                                            and (sess_dir / row["out_html"]).exists())
-        row["has_md"] = want_md or bool(prev and prev.get("has_md")
-                                        and (sess_dir / row["out_md"]).exists())
+        html_new = (sess_dir / s.out_html) in published
+        md_new = (sess_dir / s.out_md) in published
+        row["has_html"] = html_new or (not want_html and bool(
+            prev and prev.get("has_html") and (sess_dir / row["out_html"]).exists()))
+        row["has_md"] = md_new or (not want_md and bool(
+            prev and prev.get("has_md") and (sess_dir / row["out_md"]).exists()))
         new_entries[key] = {"sig": sig, "row": row}
         n_build += 1
 

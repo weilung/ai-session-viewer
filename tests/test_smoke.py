@@ -2041,6 +2041,121 @@ def test_cost_mix_table(tmp_path=None):
     print("OK: cost mix table test passed")
 
 
+def test_split_call_usage_last_event(tmp_path=None):
+    """同一次呼叫（同一個 `message.id`）拆成好幾筆事件時，usage 取**最後一筆帶 usage 的那筆**（RENDERER_VERSION 64）。
+
+    各筆的輸入與快取欄位相同，但 `output_tokens` 是寫到那一刻為止的產出（前面幾筆常是個位數，
+    最後一筆才是整次呼叫的總產出）。取第一筆會讓總額、花費組成、回合與逐步的「↑產出」一起少算。
+    守三件事：
+    ① 總額／產出／花費組成用的是最後一筆，而且彼此一致；
+    ② 回合與逐步徽章同一個口徑（各自依 id 去重、取先遇到的那筆——統一要在那之前做）；
+    ③ 第一筆沒有 usage、後面才有的呼叫，那一步照樣有徽章、總額照樣算到。
+    """
+    import importlib
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    tmp = new_tmp(tmp_path)
+    sid = "64640000-0000-4000-8000-00000000640a"
+    proj = tmp / "projects" / "split-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    mdl = "claude-opus-4-8"
+
+    def _u(o):
+        return {"input_tokens": 12, "cache_creation_input_tokens": 3000,
+                "cache_read_input_tokens": 200000, "output_tokens": o,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 3000}}
+
+    def _a(uuid, ts, mid, content, usage):
+        m = {"role": "assistant", "model": mdl, "id": mid, "content": content}
+        if usage is not None:
+            m["usage"] = usage
+        return {"type": "assistant", "uuid": uuid, "timestamp": ts, "sessionId": sid,
+                "isSidechain": False, "message": m}
+
+    ev = [
+        {"type": "user", "uuid": "u1", "timestamp": "2026-10-07T03:00:00.000Z", "cwd": "/x/Proj",
+         "gitBranch": "main", "version": "2.1.300", "sessionId": sid, "isSidechain": False,
+         "message": {"role": "user", "content": "問題SPLITQ"}},
+        # 呼叫 A：三筆，產出 3 → 7 → 1234（最後一筆才是總產出）
+        _a("a1", "2026-10-07T03:00:02.000Z", "call_A", [{"type": "thinking", "thinking": "想SPLITA"}], _u(3)),
+        _a("a2", "2026-10-07T03:00:03.000Z", "call_A", [{"type": "text", "text": "答SPLITA"}], _u(7)),
+        _a("a3", "2026-10-07T03:00:04.000Z", "call_A",
+           [{"type": "tool_use", "id": "tu_A", "name": "Bash", "input": {"command": "echo hi"}}], _u(1234)),
+        {"type": "user", "uuid": "u2", "timestamp": "2026-10-07T03:00:05.000Z", "sessionId": sid,
+         "isSidechain": False, "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tu_A", "content": "hi"}]}},
+        # 呼叫 B：第一筆沒有 usage、第二筆才有
+        _a("b1", "2026-10-07T03:00:06.000Z", "call_B", [{"type": "text", "text": "答SPLITB"}], None),
+        _a("b2", "2026-10-07T03:00:07.000Z", "call_B", [{"type": "text", "text": "續SPLITB"}], _u(2222)),
+    ]
+    (proj / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in ev), encoding="utf-8")
+    # 子代理轉錄檔裡的呼叫 C：同樣拆兩筆，產出 5 → 3333（總額含子代理，口徑要一樣）
+    side = proj / sid / "subagents"
+    side.mkdir(parents=True, exist_ok=True)
+    (side / "agent-split.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        _a("c1", "2026-10-07T03:00:08.000Z", "call_C", [{"type": "text", "text": "子SPLITC"}], _u(5)),
+        _a("c2", "2026-10-07T03:00:09.000Z", "call_C", [{"type": "text", "text": "子續SPLITC"}], _u(3333)),
+    ]), encoding="utf-8")
+
+    s = v.load_session(proj / f"{sid}.jsonl", "split-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s)
+    exp_cost = (v.call_cost(mdl, 12, 3000, 200000, 1234, 0, 3000) + v.call_cost(mdl, 12, 3000, 200000, 2222, 0, 3000)
+                + v.call_cost(mdl, 12, 3000, 200000, 3333, 0, 3000))
+    assert s.tok_out == 1234 + 2222 + 3333, (
+        f"產出要取每次呼叫最後一筆（含子代理轉錄檔）：{s.tok_out}"
+        f"（取第一筆會是 8：A 只算到 3、B 整次漏掉、子代理 C 只算到 5）")
+    assert s.cost == exp_cost, f"總額要用最後一筆的 usage：{s.cost!r} vs {exp_cost!r}"
+    assert abs(sum(s.cost_mix.values()) - s.cost) < 1e-12, "花費組成要與總額同一口徑"
+    assert s.usage["cache_create"] == 9000 and s.usage["input"] == 36, \
+        f"輸入與快取欄位不可因為統一而重複或遺漏：{s.usage}"
+
+    # 回合與逐步：同一個口徑
+    a_turns = [t for t in s.main_groups if t["role"] == "assistant"]
+    assert sum(t["u"]["output"] for t in a_turns) == 1234 + 2222, \
+        f"回合的 ↑產出 要與表頭一致：{[t['u']['output'] for t in a_turns]}"
+    steps = [b for t in a_turns for b in t["blocks"] if b.get("type") == "_step"]
+    by_mid = {b["mid"]: b["u"] for b in steps}
+    assert by_mid.get("call_A") and by_mid["call_A"]["output"] == 1234, \
+        f"逐步徽章的 ↑產出 要取最後一筆：{by_mid.get('call_A')}"
+    assert by_mid.get("call_B") is not None and by_mid["call_B"]["output"] == 2222, \
+        f"第一筆沒有 usage 的呼叫，那一步照樣要有徽章：{by_mid.get('call_B')}"
+    assert by_mid["call_B"]["cc1h"] == 3000, "那一步的寫入 TTL 也要在（切換偵測靠它）"
+
+    # 頁面：逐步徽章畫出最後一筆的產出
+    out = tmp / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--claude-source", f"demo={tmp / 'projects'}",
+         "--no-codex", "--out", str(out)],
+        capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    html = list(_session_pages(out))[0].read_text(encoding="utf-8")
+    assert "↑1.2k</span>" in html and "↑2.2k</span>" in html, "逐步徽章要畫出最後一筆的產出"
+    assert ">↑3</span>" not in html, "不可再畫出第一筆的產出"
+
+    # 鍵要帶來源檔：主檔與子代理檔出現**同一個** message.id 時各取各的最後一筆
+    # （不帶的話，主檔那一步會拿到子代理檔的 usage——子代理的事件排在主檔之後）
+    sid2 = "64640000-0000-4000-8000-00000000640b"
+    ev2 = [dict(ev[0], sessionId=sid2, uuid="v1"),
+           dict(_a("x1", "2026-10-07T04:00:02.000Z", "dup_1", [{"type": "text", "text": "主DUPA"}], _u(3)), sessionId=sid2),
+           dict(_a("x2", "2026-10-07T04:00:03.000Z", "dup_1", [{"type": "text", "text": "主續DUPA"}], _u(800)), sessionId=sid2)]
+    (proj / f"{sid2}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in ev2), encoding="utf-8")
+    side2 = proj / sid2 / "subagents"
+    side2.mkdir(parents=True, exist_ok=True)
+    (side2 / "agent-dup.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        dict(_a("y1", "2026-10-07T04:00:04.000Z", "dup_1", [{"type": "text", "text": "子DUPA"}], _u(2)), sessionId=sid2),
+        dict(_a("y2", "2026-10-07T04:00:05.000Z", "dup_1", [{"type": "text", "text": "子續DUPA"}], _u(77)), sessionId=sid2),
+    ]), encoding="utf-8")
+    s2 = v.load_session(proj / f"{sid2}.jsonl", "split-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s2)
+    main_steps = [b for t in s2.main_groups if t["role"] == "assistant" for b in t["blocks"] if b.get("type") == "_step"]
+    assert [b["u"]["output"] for b in main_steps if b.get("mid") == "dup_1"] == [800], \
+        f"主檔那一步要取主檔自己的最後一筆（800），不可拿到子代理檔的：{[b['u'] for b in main_steps]}"
+
+    print("OK: split call usage test passed")
+
+
 def test_ctx_window_and_coldest(tmp_path=None):
     # G3 gate 修正的回歸釘子：兩個「門檻／前綴一致性」bug。
     import importlib
@@ -8838,7 +8953,7 @@ def test_build_interrupt_residue(tmp_path=None):
 #    **只改雜湊、不升版本，這支測試就會放行——那是作弊，不是修法**：既有的 `out/` 會靜默沿用舊頁面。
 # 範圍限制 SCOPE-RENDER-PIN-FIXTURE：釘的是這支測試的 fixture 走得到的輸出；Codex、子代理、圖片、
 #    壓縮、排隊句、未知模型這些路徑不在 fixture 裡。詳見 planning/scope-limits.md。
-_RENDER_PIN =(63, "1dc4e32c27b9425b3666919ce17c0261b49fbd63f0d09ad9c3261f27301a0b4a")
+_RENDER_PIN =(64, "1dc4e32c27b9425b3666919ce17c0261b49fbd63f0d09ad9c3261f27301a0b4a")
 
 
 def test_renderer_version_pinned(tmp_path=None):
@@ -8934,6 +9049,7 @@ if __name__ == "__main__":
     test_api_miss_reason()
     test_write_ttl_badges()
     test_cost_mix_table()
+    test_split_call_usage_last_event()
     test_ctx_window_and_coldest()
     test_codex_ai_label()
     test_codex_item_completed_user()

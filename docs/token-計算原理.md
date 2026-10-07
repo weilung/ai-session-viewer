@@ -204,7 +204,7 @@ total_in = i + c1 + c2             # 這輪脈絡
 ## 5. 為什麼要「依 message.id 去重」
 
 新版 Claude Code 會把**同一則** assistant 回應，在 JSONL 裡**拆成多筆事件**
-（思考一筆、文字一筆、每個工具呼叫各一筆），但它們**共用同一個 `message.id` 和同一份 `usage`**。
+（思考一筆、文字一筆、每個工具呼叫各一筆），它們**共用同一個 `message.id`**，通常每一筆都帶著 `usage`（偶爾第一筆沒有）。
 
 如果你逐筆事件把 `usage` 加總，同一則回應的 token 就會被**重複計算好幾次**。
 正確做法是**依 `message.id` 去重**——同一個 id 只算一次：
@@ -214,6 +214,12 @@ if mid and mid in seen:
     continue          # 這則的 usage 已經算過了，跳過
 seen.add(mid)
 ```
+
+⚠ **但各筆的 `usage` 不一定相同。** 輸入與快取欄位（`input_tokens`、`cache_creation_input_tokens`、
+`cache_read_input_tokens` 與 5m／1h 細分）各筆一致，`output_tokens` 卻是**寫到那一筆為止的產出**——
+前面幾筆常常只有個位數，**最後一筆才是整次呼叫的總產出**（作者機器上約每 120 個多筆呼叫有 1 個是這樣）。
+所以去重時要留的是**最後一筆帶 usage 的那筆**，不是第一筆；取第一筆會少算產出 token 與金額（第一筆沒有 usage 的話，整次呼叫都會漏掉）。
+本工具在載入時就把同一個 id 各筆的 `usage` 統一成最後那一份，之後各處照上面的寫法去重即可。
 
 > 這也是「為什麼有去重邏輯」的原因。Codex 有一個更棘手的版本，見第 7 節。
 

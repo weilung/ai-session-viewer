@@ -213,7 +213,13 @@ MANIFEST_NAME = ".build-manifest.json"
 #    ③ 提示文字：拿掉 tooltip 裡的 `**`／反引號、作者機器上的觀察（移到 docs）、「子代理另計」
 #       （子代理的寫入沒有在別處彙總）。
 #    ⚠ 沒有動到算錢與錨點的路徑（總額、兩層錨點都應逐位元不變——驗法是全語料新舊對照）。
-RENDERER_VERSION = 63
+# 63 → 64（2026-10-07）：同一次呼叫（同一個 `message.id`）拆成好幾筆事件時，usage 改取**最後一筆帶 usage
+#    的那筆**（`_unify_call_usage`）。各筆的輸入與快取欄位相同，`output_tokens` 卻是寫到那一刻為止的
+#    產出——取第一筆會讓總額、花費組成、回合與逐步的「↑產出」一起少算；第一筆沒有 usage 的呼叫，
+#    那一步原本沒有徽章、總額也漏掉整次。⚠ 動到算錢的路徑。會變的有兩種場次：①拆成多筆、各筆產出不同
+#    ⇒ 產出與金額變多；②某次呼叫的第一筆沒有 usage ⇒ 那次呼叫的輸入、快取寫入／讀取、快取步驟與報告
+#    也一起補進來（原本整次記成 0）。其餘場次的總額、脈絡峰值，以及所有場次的兩層錨點都應逐位元不變。
+RENDERER_VERSION = 64
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -1013,6 +1019,38 @@ def load_events(path: Path, sidechain_force=False):
     return evs
 
 
+def _unify_call_usage(events):
+    """同一次 API 呼叫（同一個 `message.id`）拆成好幾筆事件時，把各筆的 `usage` 統一成
+    **最後一筆帶 usage 的那份**（就地改 `message["usage"]`）。
+
+    各筆的輸入與快取欄位相同，但 `output_tokens` 是寫到那一刻為止的產出——前面幾筆偏小、
+    最後一筆才是整次呼叫的總產出。下游（總額、花費組成、回合與逐步徽章、快取步驟）各自依 id
+    去重、取它們先遇到的那一筆；在這裡先統一，所有下游就是同一個口徑，不必各改各的。
+    沒有任何一筆帶 usage 的呼叫維持原樣。鍵帶來源檔（`_srcf`）：不同子代理轉錄檔裡的 id
+    各算各的。
+    範圍限制 SCOPE-USAGE-LAST-EVENT-WHOLE：取的是最後一筆的**整份** usage，不逐欄合併、也不取各筆最大值；
+    涵蓋的是「各筆的輸入與快取欄位相同、事件依寫入順序排列」的資料形狀。詳見 planning/scope-limits.md。"""
+    last = {}
+    for e in events:
+        if e.get("type") != "assistant":
+            continue
+        msg = e.get("message")
+        if not isinstance(msg, dict):
+            continue
+        mid = msg.get("id")
+        if mid and isinstance(msg.get("usage"), dict):
+            last[(e.get("_srcf") or "", mid)] = msg["usage"]
+    for e in events:
+        if e.get("type") != "assistant":
+            continue
+        msg = e.get("message")
+        if not isinstance(msg, dict) or not msg.get("id"):
+            continue
+        u = last.get((e.get("_srcf") or "", msg["id"]))
+        if u is not None:
+            msg["usage"] = u
+
+
 def load_session(path: Path, proj_munged: str, account: str = "", source_kind: str = SOURCE_CLAUDE) -> Session:
     s = Session(path, proj_munged, source_kind)
     s.account = account
@@ -1047,6 +1085,8 @@ def load_session(path: Path, proj_munged: str, account: str = "", source_kind: s
                 ev["_agent_type"] = agent_type
                 ev["_agent_desc"] = agent_desc
             s.events.extend(evs)
+
+    _unify_call_usage(s.events)
 
     # /compact 邊界中繼資料：compact_boundary 系統事件帶 trigger/preTokens/postTokens，
     # 其 uuid = 對應 isCompactSummary 摘要事件的 parentUuid，據此把資訊接到摘要上。
@@ -1108,9 +1148,10 @@ def _nested_text(v, _depth=0):
 
 _TEXTY_KEYS = ("content", "parts", "value", "body")   # 名字就是「內容容器」的欄位
 # 範圍限制 SCOPE-SENTINEL-UNCOVERED-SHAPES：「內容搬到別處」的偵測只認 `text` 鍵與上面這幾個容器名；
-# 內容放在其他名字的鍵底下（例 `{"delta": {"answer": …}}`）、或 reasoning 的原文放在 `content` 以外的
-# 欄位（例 `reasoning_content`），不在哨兵的涵蓋範圍內。反方向同樣有邊界：頂層的字串欄位一律當成內容，
-# 分不出是 metadata（例 `language: "en"`）。詳見 planning/scope-limits.md。
+# 內容放在其他名字的鍵底下（例 `{"delta": {"answer": …}}`、巢狀的 `{"image_url": {"url": …}}`）、或 reasoning
+# 的原文放在 `content` 以外的欄位（例 `reasoning_content`），不在哨兵的涵蓋範圍內。反方向同樣有邊界：
+# 頂層的字串欄位一律當成內容，分不出是 metadata（例 `language: "en"`）；使用者那一側，沒被收下的 block
+# 一律計入（含空字串的 text block）。詳見 planning/scope-limits.md。
 
 
 def _any_text(v, _depth=0):
@@ -3655,6 +3696,7 @@ def load_account_switches(config_dirs, health=None) -> dict:
             # 只丟撞到的那幾列的話，「兩份曾經相同、之後其中一邊被裁切／輪替」會留下乾淨的
             # 「舊的只在 A、新的只在 B」——與真正切帳號完全同形，於是生出一個假標記、
             # 把不是使用者做的事算到他頭上。寧可漏報。
+            # 範圍限制 SCOPE-CFG-PATH-IDENTITY：因此被略過的 sid 數不另計入 `health`。
             continue
         clean = sorted(set(rows))
         marks = []

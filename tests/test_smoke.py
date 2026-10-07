@@ -16,14 +16,25 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "ai_session_viewer.py"
+
+# ⚠⚠ **整套測試一律在假的家目錄下跑。** 工具就算給了明確的 `--claude-source`，切帳號偵測照樣會掃
+#    `~/.claude*/history.jsonl`（`claude_config_dirs()`——那是刻意的：多帳號機器上各帳號的
+#    `projects/` 常是同一個 junction，history 卻各一份）。不隔離的話，測試會讀到跑測試那台機器上
+#    使用者**真的** history，結果還會隨機器而變（`v62-fam` 的觀察）。
+#    指到一個不存在的目錄就夠了：工具對家目錄只讀不寫，glob 一個不存在的目錄就是零筆。
+#    需要家目錄素材的那幾格自己另設 `HOME`／`USERPROFILE`。
+os.environ["HOME"] = os.environ["USERPROFILE"] = str(
+    Path(tempfile.gettempdir()) / f"asv-test-no-home-{os.getpid()}")
 
 
 def new_tmp(tmp_path=None):
@@ -1817,6 +1828,68 @@ def test_write_ttl_badges(tmp_path=None):
     assert b_step.get("gap") is None, \
         f"代理 B 的第一步沒有「上一步」，不可以量到代理 A 的最後一步：{b_step.get('gap')!r}"
 
+    # --- 同一次呼叫被使用者回合切成兩段：畫成兩個步，表頭只能算一次（`v62-fam` #6）------------
+    # 花費組成表依 message.id 去重、只算一次；表頭若算兩次，就是同一場兩處講出兩個數字。
+    sid11 = "dddd0000-0000-4000-8000-00000000ddff"
+    (proj / f"{sid11}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        q(sid11, "2026-09-22T12:00:00.000Z", "d1", "切段TTLQ"),
+        a(sid11, "2026-09-22T12:00:05.000Z", "m_1", 5000, 0, "dm1"),
+        a(sid11, "2026-09-22T12:00:08.000Z", "m_2", 700, 5000, "dm2a", ttl="5m"),
+        q(sid11, "2026-09-22T12:00:09.000Z", "d2", "中間插進來的使用者回合TTLQ"),
+        a(sid11, "2026-09-22T12:00:10.000Z", "m_2", 700, 5000, "dm2b", ttl="5m"),
+    ]), encoding="utf-8")
+    s11 = v.load_session(proj / f"{sid11}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s11)
+    _mids11 = [b.get("mid") for g in s11.main_groups for b in g.get("blocks", []) if b.get("type") == "_step"]
+    assert _mids11.count("m_2") == 2, f"前提：同一個 id 要真的畫成兩個步：{_mids11}"
+    assert s11.ttl_n == {"1h": 1, "5m": 1, "both": 0}, (
+        f"⚠⚠ 同一次呼叫的寫入算了兩次（花費組成表只算一次）：{s11.ttl_n}")
+    assert "5m 1 步" in v._ttl_head(s11)[0], v._ttl_head(s11)[0]
+
+    # --- 沒有時間戳的步不參與切換判定（`v62-fam` #6：檔案是 1h→5m，表頭卻講 5m→1h）------------
+    # 缺時間戳的事件在時間序裡排最前面（那是假的位置），拿它當基準會把方向講反。
+    sid12 = "eeee0000-0000-4000-8000-00000000eeff"
+    _nt12 = a(sid12, "2026-09-22T13:00:09.000Z", "k_2", 700, 5000, "kb2", ttl="5m")
+    _nt12.pop("timestamp")
+    (proj / f"{sid12}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        q(sid12, "2026-09-22T13:00:00.000Z", "k0", "缺時間戳切換TTLQ"),
+        a(sid12, "2026-09-22T13:00:05.000Z", "k_1", 5000, 0, "kb1"),
+        _nt12,
+    ]), encoding="utf-8")
+    s12 = v.load_session(proj / f"{sid12}.jsonl", "ttl-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s12)
+    assert s12.ttl_switches == [], (
+        f"⚠⚠ 缺時間戳的步被拿來當切換基準，方向講反了：{s12.ttl_switches}")
+    assert not any((b.get("u") or {}).get("ttl_prev") for g in s12.main_groups
+                   for b in g.get("blocks", []) if b.get("type") == "_step"), "徽章也不可以標出那個假切換"
+    assert s12.ttl_n == {"1h": 1, "5m": 1, "both": 0}, f"缺時間戳的步，寫入照樣要算進步數：{s12.ttl_n}"
+
+    # --- 提示文字：不可以有 Markdown 記號、不可以帶作者機器上的觀察、不可以說「子代理另計」（`v62-fam` #5）----
+    # tooltip 是純文字 title 屬性，`**`／反引號會原樣露出；「本機實測…overage」讀的人會以為是他的機器；
+    # 子代理的寫入沒有在任何地方彙總，「另計」是不存在的東西。
+    _tips = v._TTL_TIP + v._ttl_head(s3)[1]
+    assert "**" not in _tips and "`" not in _tips, f"提示文字裡有 Markdown 記號：{_tips!r}"
+    assert "本機實測" not in _tips and "overage" not in _tips, f"提示文字帶著作者機器上的觀察：{_tips!r}"
+    assert "另計" not in v._ttl_head(s3)[1], f"子代理的寫入沒有另外彙總，不可以寫「另計」：{v._ttl_head(s3)[1]!r}"
+    _titles = re.findall(r'class="meter m-ttl[^"]*" title="([^"]*)"', html)
+    assert _titles and not any("**" in t or "`" in t or "&#x60;" in t for t in _titles), (
+        "渲染出來的徽章 title 也要乾淨（不是只驗常數）")
+
+    # --- MD 的回合列要帶寫入 TTL：切換那一則標切換、5m 的標 5m、純 1h 不標（`v62-fam` #10）----------
+    # MD 不畫逐步列；舊版 MD 只有表頭說「有切換」，每一則都找不到是哪一則。
+    _md_turns = [l for l in mdtxt.splitlines() if "⚡" in l and "寫入 TTL：" not in l]
+    assert sum("寫入 TTL 1h→5m" in l for l in _md_turns) == 1, (
+        f"MD 裡切換那一則要標「寫入 TTL 1h→5m」，而且只有那一則：{[l[-60:] for l in _md_turns]}")
+    assert any(re.search(r"寫入 TTL 5m(?![+→])", l) for l in _md_turns), "子代理那一則（5m）要標出來"
+    assert not any(re.search(r"寫入 TTL 1h(?![→+])", l) for l in _md_turns), "純 1h 是常態，MD 不標"
+
+    # --- `5m+1h` 混合步維持中性：只有「落點是純 5m」才紅（`v62-fam` #9 的 m08）---------------------
+    _mixed = v._ttl_meter({"cc5": 9, "cc1h": 9})
+    _mixed_sw = v._ttl_meter({"cc5": 9, "cc1h": 9, "ttl_prev": "1h"})
+    assert "5m+1h" in _mixed and "t5" not in _mixed, f"混合步不是純 5m，紅色會誇大：{_mixed}"
+    assert "1h→5m+1h" in _mixed_sw and "t5" not in _mixed_sw, f"切到混合也不是純 5m：{_mixed_sw}"
+    assert " t5" in v._ttl_meter({"cc5": 9, "cc1h": 0}), "對照：純 5m 要紅"
+
     print("OK: write TTL badges test passed")
 
 
@@ -1934,6 +2007,36 @@ def test_cost_mix_table(tmp_path=None):
     assert rows.get("快取寫入 5m") == 0, f"舊資料的寫入不可記成 5m：{rows}"
     assert abs(sum(s_l.cost_mix.values()) - s_l.cost) < 1e-12, "舊資料同樣要與表頭總額一致"
     assert "TTL 未知" in v._cost_mix_html(s_l), "HTML 的組成表也要有那一列"
+
+    # --- ⚠⚠ **場次總額**要逐位元等於「每次呼叫的 `call_cost` 依序相加」（`v62-fam` #9 的 m01）--------
+    # 上面只釘了 `call_cost` 這個函式本身；`_collect_usage` 若改成累加組成表的各項，整場的總額會在
+    # 很多輸入上差最後一位（reviewer 的合成語料 151 場裡 89 場），而整套測試照樣綠。
+    # （這三筆是用隨機搜尋找到的「逐次 call_cost 相加」與「各項加總」會分岔的形狀：0.75826874999… vs 0.75826875）
+    _calls = [("claude-opus-4-8", 1335, 22358, 582423, 1976, 16985, 4347),
+              ("claude-haiku-4-5", 434, 28941, 260565, 783, 18359, 930),
+              ("claude-sonnet-4-6", 1134, 1382, 474140, 2300, 200, 1039)]
+    sid_t = "99990000-0000-4000-8000-0000000099ee"
+    _ev_t = [dict(ev[0], sessionId=sid_t, uuid="T0")]
+    for _n, (_mdl, _i, _cc, _cr, _o, _c5, _c1h) in enumerate(_calls):
+        _ev_t.append({"type": "assistant", "uuid": f"T{_n + 1}",
+                      "timestamp": f"2026-09-22T03:0{_n + 1}:00.000Z", "sessionId": sid_t, "isSidechain": False,
+                      "message": {"role": "assistant", "model": _mdl, "id": f"tot_{_n}",
+                                  "usage": {"input_tokens": _i, "cache_creation_input_tokens": _cc,
+                                            "cache_read_input_tokens": _cr, "output_tokens": _o,
+                                            "cache_creation": {"ephemeral_5m_input_tokens": _c5,
+                                                               "ephemeral_1h_input_tokens": _c1h}},
+                                  "content": [{"type": "text", "text": f"答TOTAL{_n}"}]}})
+    (proj / f"{sid_t}.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in _ev_t), encoding="utf-8")
+    s_t = v.load_session(proj / f"{sid_t}.jsonl", "mix-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s_t)
+    _exp, _alt = 0.0, 0.0
+    for _c in _calls:
+        _exp += v.call_cost(*_c)
+        _alt += sum(v.call_cost_parts(*_c).values())
+    assert _exp != _alt, "前提：這組呼叫要是「各項加總」與總額算式會分岔的形狀，否則這一格驗不到東西"
+    assert s_t.cost == _exp, (
+        f"⚠⚠ 場次總額不是逐次 `call_cost` 相加：{s_t.cost!r} vs {_exp!r}（各項加總會是 {_alt!r}）")
 
     print("OK: cost mix table test passed")
 
@@ -7118,6 +7221,97 @@ def test_codex_sentinel_false_alarms(tmp_path=None):
     _n, err = run(strlist, "strlist")
     assert "抽不出文字" in err, f"字放在 content 的字串清單裡時那一則整批消失，要出聲。實得：{err!r}"
 
+    # --- ⑮（反向）推理**原文**放在 reasoning 的 `content` ⇒ 要出聲（`v62-fam` #8）---------------
+    # 本工具只畫摘要；摘要是空的 list 時，摘要那條哨兵完全安靜，原文就無聲消失。
+    rcontent = turn(10) + [
+        line(20, "response_item", {"type": "reasoning", "summary": [],
+                                   "content": [{"type": "reasoning_text", "text": "推理原文SENTRC。"}]}),
+    ]
+    _n, err = run(rcontent, "rcontent")
+    assert "推理原文" in err, f"reasoning 的 content 帶著文字時要出聲：{err!r}"
+    # 對照：加密的 reasoning（content 是 null）是正常形狀
+    rnull = turn(10) + [
+        line(20, "response_item", {"type": "reasoning", "summary": [], "content": None,
+                                   "encrypted_content": "gAAAAB-synthetic"}),
+    ]
+    _n, err = run(rnull, "rnull")
+    assert "推理原文" not in err and "摘要形狀認不得" not in err, f"加密的 reasoning 不該出聲：{err!r}"
+
+    # --- ⑯（反向）摘要**是 list**、裡面有帶著內容卻沒被收下的元素 ⇒ 要出聲（`v62-fam` #9 的 m09）-----
+    # ⑭ 只驗了「不是 list」那一支；list 那一支拿掉也照樣綠。
+    listsum = turn(10) + [
+        line(20, "response_item", {"type": "reasoning",
+                                   "summary": [{"type": "summary_text", "text": "摘要SENTLS。"},
+                                               {"type": "summary_image", "url": "synthetic-image"}]}),
+    ]
+    _n, err = run(listsum, "listsum")
+    assert "摘要形狀認不得" in err, f"摘要 list 裡有沒被收下、帶著內容的元素時要出聲：{err!r}"
+
+    # --- ⑰（反向）`text` 收下了、**別的欄位還帶著內容** ⇒ 要出聲（`v62-fam` #8）---------------------
+    # 只收 `text` 會把同一個 block 裡的圖片連結（或搬過去的內容）整個丟掉，而「有文字」讓其他哨兵全靜。
+    ride = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "See chart SENTRIDE:",
+                                                "image_url": "https://example.invalid/chart.png"}]}),
+    ]
+    _n, err = run(ride, "ride")
+    assert "沒被收下" in err, f"同一個 block 的其他欄位帶著內容時要出聲：{err!r}"
+    wsmoved = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "有文字SENTWS。"},
+                                               {"type": "output_text", "text": " ",
+                                                "value": "搬到別欄位的內容SENTWSV"}]}),
+    ]
+    _n, err = run(wsmoved, "wsmoved")
+    assert "沒被收下" in err, f"`text` 只剩空白、內容搬到別欄位時要出聲：{err!r}"
+    # 對照：`annotations`（引用的 url／title）是 metadata，不是被丟掉的內容
+    annot = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "有引用SENTANN。",
+                                                "annotations": [{"type": "url_citation",
+                                                                 "url": "https://example.invalid/",
+                                                                 "title": "Example", "start_index": 0,
+                                                                 "end_index": 3}]}]}),
+    ]
+    _n, err = run(annot, "annot")
+    assert "沒被收下" not in err, f"引用的 metadata 不是被丟掉的內容，不該出聲：{err!r}"
+    # 使用者那一側同一個形狀：收下了 `text`、同一個 block 還帶著圖片連結
+    uride = [line(10, "event_msg", {"type": "task_started", "turn_id": "t-ur"}),
+             line(11, "event_msg", {"type": "item_completed", "item": {
+                 "type": "UserMessage",
+                 "content": [{"type": "text", "text": "看這張SENTUR",
+                              "image_url": "https://example.invalid/u.png"}]}}),
+             line(12, "response_item", {"type": "message", "role": "assistant",
+                                        "content": [{"type": "output_text", "text": "好SENTURA。"}]}),
+             line(13, "event_msg", {"type": "task_complete"})]
+    _n, err = run(uride, "uride")
+    assert "沒被收進來" in err, f"使用者訊息的 block 收下了文字、還帶著圖片時要出聲：{err!r}"
+
+    # --- ⑱（反向）內容藏在**不叫 `text` 的鍵**底下一層 ⇒ 要出聲（`v62-fam` #8）---------------------
+    nested = turn(10, text=None) + [
+        line(20, "response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"text": "", "output": {"value": "藏在別層SENTNEST。"}}]}),
+    ]
+    _n, err = run(nested, "nested")
+    assert "抽不出文字" in err, f"內容換一層、換個鍵名時整則消失，要出聲：{err!r}"
+
+    # --- ⑲ 使用者貼了一段 Slack Block Kit JSON：那是他的原文，不是序列化的 content ⇒ 不可以出聲 -------
+    # （`v62-fam` #8 的誤報）。反向：真的序列化的 content（文字＋圖片）照樣要出聲。
+    def _legacy(prompt, name):
+        rows = [line(10, "event_msg", {"type": "task_started", "turn_id": f"t-{name}"}),
+                line(11, "event_msg", {"type": "user_message", "message": prompt}),
+                line(12, "response_item", {"type": "message", "role": "assistant",
+                                           "content": [{"type": "output_text", "text": "回答SENTLG。"}]}),
+                line(13, "event_msg", {"type": "task_complete"})]
+        return run(rows, name)[1]
+
+    err = _legacy(json.dumps([{"type": "section", "text": {"type": "mrkdwn", "text": "Hello SENTSLACK"}},
+                              {"type": "divider"}]), "slack")
+    assert "含非文字 block" not in err, f"使用者貼的 Slack Block Kit 不是序列化的 content，不該出聲：{err!r}"
+    err = _legacy(json.dumps([{"type": "input_text", "text": "看圖SENTSER"},
+                              {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]), "serial")
+    assert "含非文字 block" in err, f"真的序列化的 content（文字＋圖片）照樣要出聲：{err!r}"
+
     print("OK: codex sentinel false alarms test passed")
 
 
@@ -7408,6 +7602,18 @@ def test_one_bad_session_does_not_kill_batch(tmp_path=None):
     assert ".html)" in _bad_line and "僅 HTML" in _bad_line, (
         f"MD 過期時，MD 索引要改連 HTML 並標示：{_bad_line}")
 
+    # --- ⑦-b 「下一次建置會修好」要真的發生：MD 標成過期的那一場，下一次正常建置一定要重寫 ----------
+    # （`v62-fam` #9 的 m07：沿用判定不看 `has_md` 時，過期的 MD 連續兩次建置都沒被重寫，整套照樣綠）
+    _r3 = subprocess.run([sys.executable, "-c", code_of(out7, inject=None)],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert _r3.returncode == 0, f"第三次（正常）建置非零退出\n{_r3.stderr[-400:]}"
+    _md7 = next(p for p in (out7 / "sessions").rglob("*.md") if BAD[:8] in p.name)
+    assert "BADSESSION-PUB7" in _md7.read_text(encoding="utf-8"), (
+        "⚠⚠ MD 標成過期的那一場，下一次建置沒有重寫——沿用了舊 MD（`--search` 讀的就是它）")
+    _row7b = next(e["row"] for k, e in json.loads(
+        (out7 / ".build-manifest.json").read_text(encoding="utf-8"))["entries"].items() if BAD in k)
+    assert _row7b.get("has_md") is True, f"重寫之後 MD 要標回同步：{_row7b.get('has_md')!r}"
+
     # --- ⑧ 沿用時兩種格式都不可用（磁碟上那份 MD 原本就被標成過期）⇒ 不回填、索引不給連結 ----------
     out8 = tmp / "out8"
     _r1 = subprocess.run([sys.executable, "-c", code_of(out8, inject=None)],
@@ -7464,9 +7670,15 @@ def test_archive_command_only(tmp_path=None):
     # ⚠ 四個 sid 的**前 8 碼必須互不相同**：頁面檔名只帶 sid 前 8 碼
     # （`<時間>__<專案>__<sid[:8]>.html`），相同的話「誰的頁面被刪了」根本分不出來，
     # 而那正是這一格要驗的事。
+    # ⚠⚠ 素材的 mtime 一律撥回一天前：封存不碰最近 `ARCHIVE_MIN_IDLE_SEC` 內有寫入的 session
+    #    （可能還開著）。不撥的話每一場都被那道閘擋下，下面的斷言全部對著「什麼都沒搬」在跑。
+    #    那道閘本身由「最近有寫入的不搬」那一格單獨驗（它刻意不撥）。
+    _OLD = time.time() - 86400
+
     def w(sid, evs):
-        (proj / f"{sid}.jsonl").write_text(
-            "\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+        p = proj / f"{sid}.jsonl"
+        p.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+        os.utime(p, (_OLD, _OLD))
 
     base = dict(cwd="/x/Proj", gitBranch="main", version="2.1.240")
     CMD_U = ("<command-name>/effort</command-name>\n"
@@ -7672,16 +7884,209 @@ def test_archive_command_only(tmp_path=None):
     # 第一版用 `Path.replace()`（＝`os.replace`），跨磁碟機直接丟 OSError ⇒
     # 92 場**全部**失敗，而失敗被收成一行「搬移失敗：OSError：92」，
     # **跑起來像是「沒有東西需要搬」**——這一格當時是綠的，因為暫存目錄和來源同一顆碟。
-    # 這裡不能真的造出第二顆碟，所以改**直接驗那個 API 選對了**：
-    # `os.replace` 跨裝置會炸，`shutil.move` 不會。
+    # 這裡不能真的造出第二顆碟，所以**把「搬進封存目錄」的 `os.replace` 換成跨磁碟錯誤**
+    # （`EXDEV`），驗它真的退回「凍結→複製→比對→刪」那條路而且搬得成。
+    # ⚠ 舊版這一格是 grep 原始碼裡有沒有 `shutil.move(...)`——那只證明 API 名字對，
+    #   證明不了行為（`v62-fam` #1：`shutil.move` 在佔位檔前面**每一次**都退化成複製＋刪來源）。
     import ai_session_viewer as _v
-    _src = (ROOT / "ai_session_viewer.py").read_text(encoding="utf-8", errors="replace")
-    assert "shutil.move(str(path), str(target))" in _src, (
-        "封存必須用 shutil.move——Path.replace()／os.replace 跨磁碟機會全數失敗，"
-        "而失敗長得像「沒有東西需要搬」")
-    assert "path.replace(target)" not in _src, (
-        "封存不可以用 Path.replace()（跨磁碟機會丟 OSError）")
-    assert hasattr(_v, "shutil"), "模組要 import shutil"
+    import errno as _errno
+    _real_replace, _real_copyfile, _real_move = _v.os.replace, _v.shutil.copyfile, _v.shutil.move
+
+    def _one_cmd_session(sid, t):
+        w(sid, [dict(type="user", uuid=f"x{sid[:4]}", timestamp=t, sessionId=sid,
+                     message={"role": "user", "content": CMD_U}, **base)])
+        run()
+        _s = _v.load_session(proj / f"{sid}.jsonl", "demo-proj", "demo", _v.SOURCE_CLAUDE)
+        _v.analyze(_s)
+        return _s
+
+    def _into(dst, arc_dir):
+        return Path(dst).resolve().parent == Path(arc_dir).resolve()
+
+    @contextlib.contextmanager
+    def _cross_device(arc_dir):
+        """「搬進 `arc_dir`」的 `os.replace` 一律丟跨磁碟錯誤（造不出第二顆碟，改造它的錯誤碼）。"""
+        def _fake(src, dst, *a, **k):
+            if _into(dst, arc_dir):
+                raise OSError(_errno.EXDEV, "simulated cross-device move")
+            return _real_replace(src, dst, *a, **k)
+        _v.os.replace = _fake
+        try:
+            yield
+        finally:
+            _v.os.replace = _real_replace
+
+    def _arc_one(sid, s, arc_dir, *cls):
+        return _v.archive_command_only(
+            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid}.jsonl", s, *cls)],
+            arc_dir, [proj.parent], out)
+
+    def _journal_rows(arc_dir):
+        f = arc_dir / "_archived.jsonl"
+        return [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines() if x.strip()] \
+            if f.is_file() else []
+
+    arc_x = tmp / "archive-xdev"
+    sid_x = "ac180000-0000-4000-8000-00000000ac18"
+    _sx = _one_cmd_session(sid_x, "2026-07-25T16:20:00.000Z")
+    _body_x = (proj / f"{sid_x}.jsonl").read_bytes()
+    with _cross_device(arc_x):
+        _mx, _skx = _arc_one(sid_x, _sx, arc_x)
+    assert len(_mx) == 1, f"跨磁碟時要退回「凍結→複製→比對→刪」照樣搬成功：{_mx} {_skx}"
+    assert (arc_x / f"-x-Proj__{sid_x}.jsonl").read_bytes() == _body_x, "跨磁碟搬過去的內容要逐位元相同"
+    assert not (proj / f"{sid_x}.jsonl").exists(), "搬成功之後來源不該還在"
+    assert not list(proj.glob("*.archiving")), "跨磁碟搬完要刪掉凍結檔"
+
+    # --- ⚠⚠ 同一顆碟：搬移要是**原子改名**，不可以是「複製＋刪來源」 ---------------
+    # 舊版 `shutil.move` 遇到我們自己的 `O_EXCL` 佔位檔，內部的 rename 失敗（Windows 的 rename
+    # 不覆蓋）⇒ **每一次**都退化成複製＋刪來源；複製完到刪來源之間寫進來的那一行會被一起刪掉
+    # （`v62-fam` #1）。改名的話檔案身分（inode／NTFS file id）不變——複製一定會換一個。
+    arc_r = tmp / "archive-rename"
+    sid_r = "ac190000-0000-4000-8000-00000000ac19"
+    _sr = _one_cmd_session(sid_r, "2026-07-25T16:30:00.000Z")
+    _ino_r = (proj / f"{sid_r}.jsonl").stat().st_ino
+    _mr, _skr = _arc_one(sid_r, _sr, arc_r)
+    assert _mr, f"同碟搬移失敗：{_skr}"
+    assert (arc_r / f"-x-Proj__{sid_r}.jsonl").stat().st_ino == _ino_r, (
+        "⚠⚠ 同一顆碟的搬移不是原子改名（檔案身分換了 ⇒ 走的是複製＋刪來源）："
+        "複製完到刪來源之間 Claude Code 寫進來的那一行會被一起刪掉")
+
+    # --- ⚠⚠ 跨磁碟：複製途中 Claude Code **依路徑**往來源追加一行 ⇒ 那一行不可以被刪掉 ------
+    # 先改名凍結再複製：之後依路徑寫入的東西落在原處的新檔，不會跟著凍結檔被刪。
+    _LATE = (json.dumps({"type": "user", "uuid": "late1", "timestamp": "2026-07-25T16:41:00.000Z",
+                         "message": {"role": "user", "content": "LATEWRITE"}}) + "\n").encode()
+    arc_lw = tmp / "archive-latewrite"
+    sid_lw = "ac1a0000-0000-4000-8000-00000000ac1a"
+    _slw = _one_cmd_session(sid_lw, "2026-07-25T16:40:00.000Z")
+    _src_lw = proj / f"{sid_lw}.jsonl"
+
+    def _copy_then_append_path(src, dst, *a, **k):
+        r = _real_copyfile(src, dst, *a, **k)
+        with open(_src_lw, "ab") as fh:                 # 依路徑追加（複製完、刪來源之前）
+            fh.write(_LATE)
+        return r
+
+    _v.shutil.copyfile = _copy_then_append_path
+    try:
+        with _cross_device(arc_lw):
+            _arc_one(sid_lw, _slw, arc_lw)
+    finally:
+        _v.shutil.copyfile = _real_copyfile
+    _hold = [p.name for p in (_src_lw, arc_lw / f"-x-Proj__{sid_lw}.jsonl")
+             if p.is_file() and _LATE in p.read_bytes()]
+    assert _hold, ("⚠⚠ 搬移途中依路徑寫進來源的那一行被刪掉了——不在來源原處、也不在封存檔裡"
+                   "（`v62-fam` #1：紀錄還寫 moved、stderr 一個字都沒有）")
+    assert not list(proj.glob("*.archiving")), "凍結檔要收掉"
+
+    # --- ⚠⚠ 跨磁碟：開著的 handle 往**凍結檔**追加 ⇒ 內容對不上，不可以刪 ----------------
+    # 改名擋不住「已經開著的 handle」：那種寫入會落進凍結檔。複製完要比兩邊內容都等於搬移前那份，
+    # 對不上就把凍結檔改名回原處、這一場不搬。
+    arc_hw = tmp / "archive-handlewrite"
+    sid_hw = "ac1b0000-0000-4000-8000-00000000ac1b"
+    _shw = _one_cmd_session(sid_hw, "2026-07-25T16:50:00.000Z")
+    _src_hw = proj / f"{sid_hw}.jsonl"
+    _orig_hw = _src_hw.read_bytes()
+
+    def _copy_then_append_src(src, dst, *a, **k):
+        r = _real_copyfile(src, dst, *a, **k)
+        with open(src, "ab") as fh:                     # 寫進「被複製的那個檔」
+            fh.write(_LATE)
+        return r
+
+    _v.shutil.copyfile = _copy_then_append_src
+    try:
+        with _cross_device(arc_hw):
+            _mhw, _skhw = _arc_one(sid_hw, _shw, arc_hw)
+    finally:
+        _v.shutil.copyfile = _real_copyfile
+    assert not _mhw, f"凍結檔在複製後被寫過，不可以算搬成功：{_mhw}"
+    assert _src_hw.is_file() and _src_hw.read_bytes() == _orig_hw + _LATE, (
+        "⚠⚠ 寫進凍結檔的那一行不見了——凍結檔要改名回原處，內容一個位元組都不可以少")
+    assert not [p for p in arc_hw.glob("*.jsonl") if p.name != "_archived.jsonl"], (
+        "來源原處完整保有內容時，目的地那份複本是多餘的，要收掉（否則下一次撞「已有同名檔」）")
+    assert not list(proj.glob("*.archiving")), "凍結檔要改名回原處，不可以留在旁邊"
+
+    # --- ⚠⚠ 跨磁碟：**比對完、刪凍結檔之前**依路徑追加 ⇒ 那一行要落在原處的新檔 -------------------
+    # 「複製完比對兩邊內容」擋得住複製途中的寫入，擋不住比對完到刪掉之間那一刻；先改名凍結的用處就在這裡：
+    # 那一刻依路徑寫入的東西落在原處一個新建的檔，不會跟著被刪的那個檔一起消失。
+    # （上一格的注入落在複製途中，比對會先擋下來——拿掉凍結也照樣綠，那一格驗不到這件事。）
+    arc_ul = tmp / "archive-late-unlink"
+    sid_ul = "ac250000-0000-4000-8000-00000000ac25"
+    _sul = _one_cmd_session(sid_ul, "2026-07-25T18:40:00.000Z")
+    _src_ul = proj / f"{sid_ul}.jsonl"
+    _real_unlink, _ul_hits = _v.os.unlink, []
+
+    def _append_then_unlink(path, *a, **k):
+        if not _ul_hits and Path(path).name.startswith(sid_ul):
+            _ul_hits.append(Path(path).name)
+            with open(_src_ul, "ab") as fh:             # 依路徑追加（比對完、刪掉之前）
+                fh.write(_LATE)
+        return _real_unlink(path, *a, **k)
+
+    _v.os.unlink = _append_then_unlink
+    try:
+        with _cross_device(arc_ul):
+            _mul, _skul = _arc_one(sid_ul, _sul, arc_ul)
+    finally:
+        _v.os.unlink = _real_unlink
+    assert _ul_hits, "前提：注入的寫入要真的落在刪掉來源（凍結檔）之前"
+    assert _mul, f"前提：這一場要搬成功：{_skul}"
+    _hold_ul = [p.name for p in (_src_ul, arc_ul / f"-x-Proj__{sid_ul}.jsonl")
+                if p.is_file() and _LATE in p.read_bytes()]
+    assert _hold_ul, ("⚠⚠ 比對完、刪掉之前依路徑寫進來源的那一行被刪掉了——沒有先改名凍結的話，"
+                      "那一刻的寫入會跟著被刪的檔一起消失")
+
+    # --- ⚠⚠ 跨磁碟：搬移失敗時原處**已被重建** ⇒ 凍結檔改名回去不可以覆蓋它 ------------------------
+    # 失敗或中斷要把凍結檔改名回原處；那一刻原處若已經有 Claude Code 重建的新檔（剛寫進一行），
+    # 覆蓋上去就是把那一行刪掉。要留著凍結檔、當場講出它在哪。
+    arc_rs = tmp / "archive-restore-recreated"
+    sid_rs = "ac260000-0000-4000-8000-00000000ac26"
+    _srs = _one_cmd_session(sid_rs, "2026-07-25T18:50:00.000Z")
+    _src_rs = proj / f"{sid_rs}.jsonl"
+    _orig_rs = _src_rs.read_bytes()
+
+    def _recreate_then_fail(src, dst, *a, **k):
+        with open(_src_rs, "ab") as fh:                 # 原處被重建（依路徑寫入，凍結之後）
+            fh.write(_LATE)
+        raise OSError("simulated copy failure after the source path was recreated")
+
+    _err_rs = io.StringIO()
+    _v.shutil.copyfile = _recreate_then_fail
+    try:
+        with _cross_device(arc_rs), contextlib.redirect_stderr(_err_rs):
+            _mrs, _skrs = _arc_one(sid_rs, _srs, arc_rs)
+    finally:
+        _v.shutil.copyfile = _real_copyfile
+    _stg_rs = proj / f"{sid_rs}.jsonl.archiving"
+    assert not _mrs, f"複製失敗不可以算搬成功：{_mrs}"
+    assert _src_rs.read_bytes() == _LATE, (
+        "⚠⚠ 原處被重建的新檔（剛寫進來的那一行）被凍結檔蓋掉了——改名回原處不可以覆蓋")
+    assert _stg_rs.is_file() and _stg_rs.read_bytes() == _orig_rs, "搬移前的完整內容要留在凍結檔"
+    assert str(_stg_rs) in _err_rs.getvalue(), f"凍結檔留在哪要當場講出來：{_err_rs.getvalue()!r}"
+    assert not [p for p in arc_rs.glob("*.jsonl") if p.name != "_archived.jsonl"], "空佔位檔要收掉"
+    _stg_rs.unlink()                                    # 之後的格子不要被它干擾
+
+    # --- ⚠⚠ 唯讀的來源（`v62-fam` #1 的 C7）——同碟與跨碟都要搬得成、不可以留下擋路的檔 ------
+    # 舊版：複製把唯讀屬性一起帶到目的地、刪來源失敗 ⇒ 清理刪不掉那份唯讀的完整副本，
+    # 訊息還叫它「佔位檔」，下一次起永遠撞「目的地已有同名檔」。
+    for _xd, _sid_ro, _t_ro in ((False, "ac1c0000-0000-4000-8000-00000000ac1c", "2026-07-25T17:00:00.000Z"),
+                                (True, "ac1d0000-0000-4000-8000-00000000ac1d", "2026-07-25T17:10:00.000Z")):
+        _arc_ro = tmp / f"archive-readonly-{'xdev' if _xd else 'same'}"
+        _sro = _one_cmd_session(_sid_ro, _t_ro)
+        _src_ro = proj / f"{_sid_ro}.jsonl"
+        _body_ro = _src_ro.read_bytes()
+        os.chmod(_src_ro, stat.S_IREAD)
+        try:
+            with (_cross_device(_arc_ro) if _xd else contextlib.nullcontext()):
+                _mro, _skro = _arc_one(_sid_ro, _sro, _arc_ro)
+        finally:
+            for _p in (_src_ro, _arc_ro / f"-x-Proj__{_sid_ro}.jsonl"):
+                if _p.exists():
+                    os.chmod(_p, stat.S_IREAD | stat.S_IWRITE)
+        assert _mro, f"唯讀的來源搬不動（{'跨碟' if _xd else '同碟'}）：{_skro}"
+        assert (_arc_ro / f"-x-Proj__{_sid_ro}.jsonl").read_bytes() == _body_ro
+        assert not _src_ro.exists() and not list(proj.glob("*.archiving")), (
+            f"唯讀的來源搬完之後原處與凍結檔都不該還在（{'跨碟' if _xd else '同碟'}）")
 
     # --- 安全閘：封存目錄不可以在來源或 out/ 裡面 ---------------------------
     for bad in (proj.parent / "inside", out / "inside"):
@@ -7768,38 +8173,33 @@ def test_archive_command_only(tmp_path=None):
         f"記帳中途失敗要回報，不可以靜默略過：{_sk}")
 
     # --- ⚠⚠ 搬到一半失敗：目的地是**部分內容**，不是 0 位元組 -----------------
-    # `shutil.move` 跨磁碟會退化成「複製＋刪來源」，複製寫到一半才失敗時目的地有半截檔。
+    # 跨磁碟的搬移是「複製＋刪來源」，複製寫到一半才失敗時目的地有半截檔。
     # 舊的 cleanup 只刪 0 位元組的 ⇒ 那個半截檔留下來，下一次永遠撞「已有同名檔」
     # （`utf-fix-codex-r3` 實測 `target_size=7`）。⚠ 這一格只能在函式層造。
     arc6 = tmp / "archive-partial"
     sid_pt = "ac0d0000-0000-4000-8000-00000000ac0d"
-    w(sid_pt, [
-        dict(type="user", uuid="m1", timestamp="2026-07-25T13:00:00.000Z",
-             sessionId=sid_pt, message={"role": "user", "content": CMD_U}, **base),
-    ])
-    run()
-    _s2 = _v.load_session(proj / f"{sid_pt}.jsonl", "demo-proj", "demo", _v.SOURCE_CLAUDE)
-    _v.analyze(_s2)
-    _orig_move = _v.shutil.move
+    _s2 = _one_cmd_session(sid_pt, "2026-07-25T13:00:00.000Z")
+    _orig_pt = (proj / f"{sid_pt}.jsonl").read_bytes()
 
-    def _partial_move(src, dst):
+    def _partial_copy(src, dst, *a, **k):
         Path(dst).write_text("PARTIAL", encoding="utf-8")   # 複製寫了一半…
         raise OSError("injected after partial destination write")
 
-    _v.shutil.move = _partial_move
+    _v.shutil.copyfile = _partial_copy
     try:
-        _moved2, _sk2 = _v.archive_command_only(
-            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_pt}.jsonl", _s2)],
-            arc6, [proj.parent], out)
+        with _cross_device(arc6):
+            _moved2, _sk2 = _arc_one(sid_pt, _s2, arc6)
     finally:
-        _v.shutil.move = _orig_move
+        _v.shutil.copyfile = _real_copyfile
     assert not _moved2, f"搬到一半失敗不該算成功：{_moved2}"
-    assert (proj / f"{sid_pt}.jsonl").is_file(), "搬到一半失敗，來源必須留在原地"
+    assert (proj / f"{sid_pt}.jsonl").read_bytes() == _orig_pt, (
+        "搬到一半失敗，來源必須原封不動留在原地（凍結檔要改名回去）")
     _left = [p for p in arc6.glob("*.jsonl") if p.name != "_archived.jsonl"]
     assert not _left, (
         f"⚠⚠ 目的地留下寫到一半的檔：{[(p.name, p.stat().st_size) for p in _left]}"
         "——下一次執行會撞「已有同名檔」而永遠搬不動這一場。"
         "cleanup 不可以只認 0 位元組")
+    assert not list(proj.glob("*.archiving")), "搬到一半失敗，凍結檔要改名回原處"
 
     # --- ⚠⚠ Ctrl+C 落在「搶到名字」與「寫 pending」之間 ---------------------
     # 只接 `OSError` 的話，那一刻中斷會留下一個 **0 位元組、而且 manifest 一行都沒有**
@@ -7809,20 +8209,12 @@ def test_archive_command_only(tmp_path=None):
     #   （吞掉它會讓 Ctrl+C 失效，那是另一個缺陷）。
     arc8 = tmp / "archive-interrupt"
     sid_ki = "ac0f0000-0000-4000-8000-00000000ac0f"
-    w(sid_ki, [
-        dict(type="user", uuid="o1", timestamp="2026-07-25T15:00:00.000Z",
-             sessionId=sid_ki, message={"role": "user", "content": CMD_U}, **base),
-    ])
-    run()
-    _s4 = _v.load_session(proj / f"{sid_ki}.jsonl", "demo-proj", "demo", _v.SOURCE_CLAUDE)
-    _v.analyze(_s4)
+    _s4 = _one_cmd_session(sid_ki, "2026-07-25T15:00:00.000Z")
     _orig_fsync3 = _v.os.fsync
     _v.os.fsync = lambda fd: (_ for _ in ()).throw(KeyboardInterrupt("injected Ctrl+C"))
     _propagated = False
     try:
-        _v.archive_command_only(
-            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_ki}.jsonl", _s4)],
-            arc8, [proj.parent], out)
+        _arc_one(sid_ki, _s4, arc8)
     except KeyboardInterrupt:
         _propagated = True
     finally:
@@ -7834,41 +8226,43 @@ def test_archive_command_only(tmp_path=None):
         f"⚠⚠ Ctrl+C 之後留下了佔位檔：{[p.name for p in _stuck]}"
         "——它沒有任何 manifest 紀錄，卻會讓之後每一次執行都撞「已有同名檔」")
 
-    def _one_cmd_session(sid, t):
-        w(sid, [dict(type="user", uuid=f"x{sid[:4]}", timestamp=t, sessionId=sid,
-                     message={"role": "user", "content": CMD_U}, **base)])
-        run()
-        _s = _v.load_session(proj / f"{sid}.jsonl", "demo-proj", "demo", _v.SOURCE_CLAUDE)
-        _v.analyze(_s)
-        return _s
-
     # --- ⚠⚠ Ctrl+C 落在「關閉佔位檔」那一刻 ---------------------------------
     # 只接 OSError 的話，這一刻中斷同樣留下 0 位元組的佔位檔、之後每一次都撞「已有同名檔」。
-    # 注入的 close 會**真的關掉** handle 再丟 Ctrl+C（第二次呼叫就回 EBADF），
-    # 這樣才驗得到「先確保 handle 關了、再收佔位檔」那一段。
+    # ⚠⚠ 注入的 close **先丟 Ctrl+C、還沒真的關**（第二次呼叫才關）：這樣才驗得到
+    #   「先確保 handle 關了、再收佔位檔」那一段。舊的注入是「先關、再丟」——handle 早就關了，
+    #   產品碼重關的那一行拿掉也照樣綠（`v62-fam` #9 的 m10 實測存活）。
     arc9 = tmp / "archive-interrupt-close"
     sid_cl = "ac110000-0000-4000-8000-00000000ac11"
     _s9 = _one_cmd_session(sid_cl, "2026-07-25T15:10:00.000Z")
     _real_close, _hits = _v.os.close, []
 
-    def _close_then_ki(fd):
-        _real_close(fd)
+    def _ki_before_close(fd):
         if not _hits:
             _hits.append(fd)
-            raise KeyboardInterrupt("injected Ctrl+C at close")
+            raise KeyboardInterrupt("injected Ctrl+C at close (handle still open)")
+        _real_close(fd)
 
-    _v.os.close = _close_then_ki
+    _v.os.close = _ki_before_close
     _propagated9 = False
     try:
-        _v.archive_command_only(
-            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_cl}.jsonl", _s9)],
-            arc9, [proj.parent], out)
+        _arc_one(sid_cl, _s9, arc9)
     except KeyboardInterrupt:
         _propagated9 = True
     finally:
         _v.os.close = _real_close
     assert _hits, "前提：注入的 close 要真的被呼叫到"
+    try:
+        os.fstat(_hits[0])
+        _still_open = True
+    except OSError:
+        _still_open = False
+    if _still_open:                          # 測試自己收掉，免得暫存目錄刪不掉
+        try:
+            _real_close(_hits[0])
+        except OSError:
+            pass
     assert _propagated9, "⚠⚠ 關檔時的 Ctrl+C 被吞掉了——Ctrl+C 會失效"
+    assert not _still_open, "⚠⚠ Ctrl+C 落在關檔那一刻之後，佔位檔的 handle 沒有被關掉"
     assert (proj / f"{sid_cl}.jsonl").is_file(), "中斷時來源必須留在原地"
     _stuck9 = [p for p in arc9.glob("*.jsonl") if p.name != "_archived.jsonl"]
     assert not _stuck9, (
@@ -7882,56 +8276,59 @@ def test_archive_command_only(tmp_path=None):
     sid_rc = "ac120000-0000-4000-8000-00000000ac12"
     _s10 = _one_cmd_session(sid_rc, "2026-07-25T15:20:00.000Z")
     _orig_body = (proj / f"{sid_rc}.jsonl").read_text(encoding="utf-8")
-    _orig_move2 = _v.shutil.move
 
-    def _move_then_recreate(src, dst):
-        _orig_move2(src, dst)                                   # 搬移真的完成
-        Path(src).write_text("RECREATED-BY-ANOTHER-WRITER\n", encoding="utf-8")
-        raise KeyboardInterrupt("injected Ctrl+C after the move completed")
+    def _move_then_recreate(src, dst, *a, **k):
+        r = _real_replace(src, dst, *a, **k)                     # 搬移真的完成（同碟：原子改名）
+        if _into(dst, arc10):
+            Path(src).write_text("RECREATED-BY-ANOTHER-WRITER\n", encoding="utf-8")
+            raise KeyboardInterrupt("injected Ctrl+C after the move completed")
+        return r
 
-    _v.shutil.move = _move_then_recreate
-    _propagated10, _sk10 = False, None
+    _v.os.replace = _move_then_recreate
+    _propagated10, _err10 = False, io.StringIO()
     try:
-        _v.archive_command_only(
-            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_rc}.jsonl", _s10)],
-            arc10, [proj.parent], out)
+        with contextlib.redirect_stderr(_err10):
+            _arc_one(sid_rc, _s10, arc10)
     except KeyboardInterrupt:
         _propagated10 = True
     finally:
-        _v.shutil.move = _orig_move2
+        _v.os.replace = _real_replace
     assert _propagated10, "⚠⚠ Ctrl+C 被吞掉了"
     _kept = [p for p in arc10.glob("*.jsonl") if p.name != "_archived.jsonl"]
     assert _kept and _kept[0].read_text(encoding="utf-8") == _orig_body, (
         "⚠⚠ 搬移已完成、來源路徑被重建之後的 Ctrl+C 把目的地刪掉了——"
         f"那是原本那份的唯一完整副本。目的地現況：{[(p.name, p.stat().st_size) for p in _kept]}")
+    assert "完整副本" in _err10.getvalue(), (
+        f"保留下來的目的地是完整的，訊息要照實講出來：{_err10.getvalue()!r}")
 
     # --- 對照組：複製到一半就 Ctrl+C（來源沒被動過）⇒ 半截檔照樣要收掉 ----------
     # 身分檢查不可以變成「什麼都不敢刪」：來源還是搬之前那一個時，目的地只是半截檔。
     arc11 = tmp / "archive-partial-interrupt"
     sid_pk = "ac130000-0000-4000-8000-00000000ac13"
     _s11 = _one_cmd_session(sid_pk, "2026-07-25T15:30:00.000Z")
+    _orig_pk = (proj / f"{sid_pk}.jsonl").read_bytes()
 
-    def _partial_then_ki(src, dst):
+    def _partial_then_ki(src, dst, *a, **k):
         Path(dst).write_text("PARTIAL", encoding="utf-8")
         raise KeyboardInterrupt("injected Ctrl+C mid-copy")
 
-    _v.shutil.move = _partial_then_ki
+    _v.shutil.copyfile = _partial_then_ki
     try:
-        try:
-            _v.archive_command_only(
-                [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_pk}.jsonl", _s11)],
-                arc11, [proj.parent], out)
-        except KeyboardInterrupt:
-            pass
+        with _cross_device(arc11):
+            try:
+                _arc_one(sid_pk, _s11, arc11)
+            except KeyboardInterrupt:
+                pass
     finally:
-        _v.shutil.move = _orig_move2
-    assert (proj / f"{sid_pk}.jsonl").is_file(), "複製到一半中斷，來源必須留在原地"
+        _v.shutil.copyfile = _real_copyfile
+    assert (proj / f"{sid_pk}.jsonl").read_bytes() == _orig_pk, "複製到一半中斷，來源必須原封不動留在原地"
     _half = [p for p in arc11.glob("*.jsonl") if p.name != "_archived.jsonl"]
     assert not _half, (
         f"複製到一半的半截檔沒有收掉：{[(p.name, p.stat().st_size) for p in _half]}"
         "——身分檢查不可以把該刪的也擋掉")
+    assert not list(proj.glob("*.archiving")), "中斷時凍結檔要改名回原處"
 
-    # --- ⚠⚠ 來源被**同長度改寫、mtime 又被設回去**：metadata 全一樣，內容卻不一樣 ----------
+    # --- ⚠⚠ 凍結檔被**同長度改寫、mtime 又被設回去**：metadata 全一樣，內容卻不一樣 ----------
     # 只比 (裝置, inode, 大小, mtime) 的話會被騙過而刪掉目的地——那是原本那份的唯一完整副本。
     arc12 = tmp / "archive-sameshape-rewrite"
     sid_sw = "ac140000-0000-4000-8000-00000000ac14"
@@ -7939,25 +8336,24 @@ def test_archive_command_only(tmp_path=None):
     _src12 = proj / f"{sid_sw}.jsonl"
     _orig12 = _src12.read_bytes()
 
-    def _copy_then_forge(src, dst):
-        Path(dst).write_bytes(Path(src).read_bytes())            # 完整複製到目的地
+    def _copy_then_forge(src, dst, *a, **k):
+        _real_copyfile(src, dst, *a, **k)                         # 完整複製到目的地
         _st = os.stat(src)
         _forged = bytes(b ^ 0x01 if 97 <= b <= 122 else b for b in _orig12)   # 同長度、不同內容
-        Path(src).write_bytes(_forged)
+        Path(src).write_bytes(_forged)                            # 開著的 handle 把被複製的那個檔改寫
         os.utime(src, ns=(_st.st_atime_ns, _st.st_mtime_ns))    # mtime 設回去
         raise KeyboardInterrupt("injected Ctrl+C after a same-shape rewrite")
 
-    _v.shutil.move = _copy_then_forge
+    _v.shutil.copyfile = _copy_then_forge
     _err12 = io.StringIO()
     try:
-        with contextlib.redirect_stderr(_err12):
+        with _cross_device(arc12), contextlib.redirect_stderr(_err12):
             try:
-                _v.archive_command_only(
-                    [(_v.SOURCE_CLAUDE, "demo", "demo-proj", _src12, _s12)], arc12, [proj.parent], out)
+                _arc_one(sid_sw, _s12, arc12)
             except KeyboardInterrupt:
                 pass
     finally:
-        _v.shutil.move = _orig_move2
+        _v.shutil.copyfile = _real_copyfile
     _kept12 = [p for p in arc12.glob("*.jsonl") if p.name != "_archived.jsonl"]
     assert _kept12 and _kept12[0].read_bytes() == _orig12, (
         "⚠⚠ 來源被同長度改寫、mtime 設回之後，清理把目的地刪了——那是原本內容唯一的副本")
@@ -7969,71 +8365,311 @@ def test_archive_command_only(tmp_path=None):
     arc13 = tmp / "archive-touch-only"
     sid_to = "ac150000-0000-4000-8000-00000000ac15"
     _s13 = _one_cmd_session(sid_to, "2026-07-25T15:50:00.000Z")
-    _src13 = proj / f"{sid_to}.jsonl"
 
-    def _partial_touch_ki(src, dst):
+    def _partial_touch_ki(src, dst, *a, **k):
         Path(dst).write_text("PARTIAL", encoding="utf-8")
         os.utime(src, None)                                       # 只動 mtime
         raise KeyboardInterrupt("injected Ctrl+C after a metadata-only change")
 
-    _v.shutil.move = _partial_touch_ki
+    _v.shutil.copyfile = _partial_touch_ki
     try:
-        try:
-            _v.archive_command_only(
-                [(_v.SOURCE_CLAUDE, "demo", "demo-proj", _src13, _s13)], arc13, [proj.parent], out)
-        except KeyboardInterrupt:
-            pass
+        with _cross_device(arc13):
+            try:
+                _arc_one(sid_to, _s13, arc13)
+            except KeyboardInterrupt:
+                pass
     finally:
-        _v.shutil.move = _orig_move2
+        _v.shutil.copyfile = _real_copyfile
     _left13 = [p for p in arc13.glob("*.jsonl") if p.name != "_archived.jsonl"]
     assert not _left13, (
         "來源內容沒變（只動了 mtime）時，半截目的地要收掉——留著會擋住之後每一次執行："
         f"{[(p.name, p.stat().st_size) for p in _left13]}")
 
-    # --- 搬之前讀不到來源內容（沒辦法確認）、而搬移一個位元組都還沒寫就失敗 ⇒ 空佔位檔照樣要收 ----
+    # --- 判定時讀得到、搬之前讀不到來源內容（沒辦法確認）⇒ 不搬，空佔位檔照樣要收 ----
     # 「沒辦法確認就保留目的地」只適用於有內容的目的地；0 位元組的佔位檔不可能是任何東西的副本。
     arc14 = tmp / "archive-unreadable-source"
     sid_ur = "ac160000-0000-4000-8000-00000000ac16"
     _s14 = _one_cmd_session(sid_ur, "2026-07-25T16:00:00.000Z")
-    _orig_digest = _v._file_digest
-
-    def _fail_before_write(src, dst):
-        raise OSError("injected failure before any byte was written")
-
-    _v._file_digest = lambda p: None
-    _v.shutil.move = _fail_before_write
+    _cls14 = _v._file_ident(proj / f"{sid_ur}.jsonl")
+    _orig_ident = _v._file_ident
+    _v._file_ident = lambda p: None
     try:
-        _v.archive_command_only(
-            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_ur}.jsonl", _s14)], arc14, [proj.parent], out)
+        _m14, _sk14 = _arc_one(sid_ur, _s14, arc14, _cls14)
     finally:
-        _v._file_digest, _v.shutil.move = _orig_digest, _orig_move2
+        _v._file_ident = _orig_ident
+    assert not _m14, f"搬之前讀不到來源，不可以搬：{_m14}"
+    assert (proj / f"{sid_ur}.jsonl").is_file(), "來源必須留在原地"
     _left14 = [p for p in arc14.glob("*.jsonl") if p.name != "_archived.jsonl"]
     assert not _left14, (
-        "搬移還沒寫任何東西就失敗時，空的佔位檔要收掉（它不可能是任何內容的副本）："
+        "沒搬的時候，空的佔位檔要收掉（它不可能是任何內容的副本）："
         f"{[(p.name, p.stat().st_size) for p in _left14]}")
 
-    # --- Ctrl+C 落在「算來源雜湊」那一刻：名字已經搶到、pending 也寫了 ⇒ 佔位檔要收掉 -----------
+    # --- Ctrl+C 落在「量來源內容」那一刻：名字已經搶到、pending 也寫了 ⇒ 佔位檔要收掉 -----------
     arc15 = tmp / "archive-interrupt-hash"
     sid_hk = "ac170000-0000-4000-8000-00000000ac17"
     _s15 = _one_cmd_session(sid_hk, "2026-07-25T16:10:00.000Z")
+    _cls15 = _v._file_ident(proj / f"{sid_hk}.jsonl")
 
     def _hash_ki(p):
         raise KeyboardInterrupt("injected Ctrl+C while hashing the source")
 
-    _v._file_digest = _hash_ki
+    _v._file_ident = _hash_ki
     _prop15 = False
     try:
-        _v.archive_command_only(
-            [(_v.SOURCE_CLAUDE, "demo", "demo-proj", proj / f"{sid_hk}.jsonl", _s15)], arc15, [proj.parent], out)
+        _arc_one(sid_hk, _s15, arc15, _cls15)
     except KeyboardInterrupt:
         _prop15 = True
     finally:
-        _v._file_digest = _orig_digest
+        _v._file_ident = _orig_ident
     assert _prop15, "算雜湊時的 Ctrl+C 被吞掉了"
     assert (proj / f"{sid_hk}.jsonl").is_file(), "中斷時來源必須留在原地"
+    assert any(r.get("state") == "pending" for r in _journal_rows(arc15)), (
+        "前提：這一格要真的走到「pending 已寫、搬之前量內容」那一刻，否則等於沒驗")
     _left15 = [p for p in arc15.glob("*.jsonl") if p.name != "_archived.jsonl"]
     assert not _left15, (
         f"算雜湊時 Ctrl+C 留下了佔位檔：{[p.name for p in _left15]}——之後每一次都會撞「已有同名檔」")
+
+    # --- ⚠⚠ 判定之後、搬移之前，那一場多了一則真的問答 ⇒ 不可以搬（`v62-fam` #2）----------
+    # 判定與搬移之間隔著整批的讀取；這段時間 Claude Code 往同一場寫了真的對話，
+    # 舊版照樣把它搬走（`claude --resume` 的清單少了一場**有對話**的 session）。
+    _TALK = [
+        {"type": "user", "uuid": "rt1", "timestamp": "2026-07-25T17:30:10.000Z",
+         "message": {"role": "user", "content": "這是判定之後才寫進來的提問REALTALK。"}, **base},
+        {"type": "assistant", "uuid": "rt2", "timestamp": "2026-07-25T17:30:20.000Z",
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "mrt2",
+                     "usage": {"input_tokens": 10, "output_tokens": 5},
+                     "content": [{"type": "text", "text": "回覆REALTALK。"}]}, **base},
+    ]
+    _TALK_LINES = "\n" + "\n".join(json.dumps(e, ensure_ascii=False) for e in _TALK)
+    arc16 = tmp / "archive-changed-after-classify"
+    sid_cc = "ac1e0000-0000-4000-8000-00000000ac1e"
+    _scc = _one_cmd_session(sid_cc, "2026-07-25T17:30:00.000Z")
+    _src_cc = proj / f"{sid_cc}.jsonl"
+    _cls_cc = _v._file_ident(_src_cc)                 # 判定時那一份
+    with open(_src_cc, "a", encoding="utf-8") as fh:
+        fh.write(_TALK_LINES)
+    os.utime(_src_cc, (_OLD, _OLD))      # 不讓「最近有寫入」那道閘先擋下：這一格驗的是內容比對
+    _m16, _sk16 = _arc_one(sid_cc, _scc, arc16, _cls_cc)
+    assert not _m16, f"⚠⚠ 判定之後才補上對話的那一場被搬走了：{_m16}"
+    assert "REALTALK" in _src_cc.read_text(encoding="utf-8"), "來源要原封不動留在原地"
+    assert not [p for p in arc16.glob("*.jsonl") if p.name != "_archived.jsonl"], "不搬就不可以留下佔位檔"
+    assert any("判定之後" in k for k in _sk16), f"不搬的理由要講出來：{_sk16}"
+
+    # --- ⚠⚠ 同一件事走 CLI：`main()` 判定時量的內容身分要真的傳進去 --------------------
+    # 沒傳的話迴圈會當場重量，而那時檔案已經是新內容了——比對永遠相等，這道閘形同虛設。
+    arc17 = tmp / "archive-changed-after-classify-cli"
+    sid_cm = "ac1f0000-0000-4000-8000-00000000ac1f"
+    w(sid_cm, [dict(type="user", uuid="cm1", timestamp="2026-07-25T17:40:00.000Z", sessionId=sid_cm,
+                    message={"role": "user", "content": CMD_U}, **base)])
+    run()
+    _src_cm = proj / f"{sid_cm}.jsonl"
+    _code17 = (
+        "import sys, os\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "import ai_session_viewer as v\n"
+        "_real = v.archive_command_only\n"
+        "def _wrapped(sessions, *a, **k):\n"
+        f"    with open({str(_src_cm)!r}, 'a', encoding='utf-8') as fh:\n"
+        f"        fh.write({_TALK_LINES.replace('REALTALK', 'CLITALK')!r})\n"
+        f"    os.utime({str(_src_cm)!r}, ({_OLD!r}, {_OLD!r}))\n"
+        "    return _real(sessions, *a, **k)\n"
+        "v.archive_command_only = _wrapped\n"
+        f"sys.argv = ['ai_session_viewer.py', '--claude-source', {('demo=' + str(proj.parent))!r},"
+        f" '--no-codex', '--out', {str(out)!r}, '--format', 'both', '--archive-command-only', {str(arc17)!r}]\n"
+        "v.main()\n")
+    rr = subprocess.run([sys.executable, "-c", _code17], capture_output=True, text=True,
+                        encoding="utf-8", cwd=str(tmp))
+    assert rr.returncode == 0, f"非零退出\nSTDOUT:{rr.stdout}\nSTDERR:{rr.stderr}"
+    assert _src_cm.is_file() and "CLITALK" in _src_cm.read_text(encoding="utf-8"), (
+        "⚠⚠ 走 CLI 時，判定之後才補上對話的那一場被搬走了——`main()` 量的內容身分沒有傳進封存")
+    assert not (arc17 / f"-x-Proj__{sid_cm}.jsonl").exists()
+
+    # --- ⚠⚠ 判定**期間**（讀檔途中）就被寫過 ⇒ 不拿那一刻的內容當基準、這次不搬 ---------------------
+    # 讀檔與量身分之間有窗：讀的時候只有指令、量的時候已經多了一則真的問答 ⇒ 量到的是新內容，
+    # 搬之前再量一次當然相等，有對話的那場就被搬走了。`main()` 讀前讀後各 stat 一次，對不上就不搬。
+    # （上一格的寫入落在判定**之後**，量到的是舊內容——拿掉讀前讀後那道比對也照樣綠，驗不到這件事。）
+    arc22 = tmp / "archive-changed-during-classify"
+    sid_dc = "ac270000-0000-4000-8000-00000000ac27"
+    w(sid_dc, [dict(type="user", uuid="dc1", timestamp="2026-07-25T19:00:00.000Z", sessionId=sid_dc,
+                    message={"role": "user", "content": CMD_U}, **base)])
+    run()
+    _src_dc = proj / f"{sid_dc}.jsonl"
+    _code22 = (
+        "import sys, os\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "import ai_session_viewer as v\n"
+        "_real, _done = v.load_session, []\n"
+        "def _wrapped(path, *a, **k):\n"
+        "    s = _real(path, *a, **k)\n"
+        f"    if not _done and v.Path(path).name == {_src_dc.name!r}:\n"
+        "        _done.append(1)\n"
+        f"        with open({str(_src_dc)!r}, 'a', encoding='utf-8') as fh:\n"
+        f"            fh.write({_TALK_LINES.replace('REALTALK', 'DURINGTALK')!r})\n"
+        f"        os.utime({str(_src_dc)!r}, ({_OLD!r}, {_OLD!r}))\n"
+        "    return s\n"
+        "v.load_session = _wrapped\n"
+        f"sys.argv = ['ai_session_viewer.py', '--claude-source', {('demo=' + str(proj.parent))!r},"
+        f" '--no-codex', '--out', {str(out)!r}, '--format', 'both', '--archive-command-only', {str(arc22)!r}]\n"
+        "v.main()\n")
+    rr = subprocess.run([sys.executable, "-c", _code22], capture_output=True, text=True,
+                        encoding="utf-8", cwd=str(tmp))
+    assert rr.returncode == 0, f"非零退出\nSTDOUT:{rr.stdout}\nSTDERR:{rr.stderr}"
+    assert _src_dc.is_file() and "DURINGTALK" in _src_dc.read_text(encoding="utf-8"), (
+        "⚠⚠ 判定期間（讀檔途中）才補上對話的那一場被搬走了——讀前讀後的 stat 對不上，就不可以拿那一刻量到的內容當基準")
+    assert not (arc22 / f"-x-Proj__{sid_dc}.jsonl").exists()
+    assert "判定期間" in (rr.stdout + rr.stderr), f"不搬的理由要講出來：{(rr.stdout + rr.stderr)[-400:]}"
+
+    # --- ⚠⚠ 最近還有寫入的 session 不搬（可能還開著）------------------------------
+    # 用 `!` 下封存指令的那一場：判定時只有一行 `<bash-input>`（指令還在跑）⇒ 被判成只有指令。
+    # 搬走一場還開著的檔，Claude Code 下一次寫入會在原路徑重建新檔，對話被切成兩半。
+    arc18 = tmp / "archive-recent"
+    sid_rec = "ac200000-0000-4000-8000-00000000ac20"
+    _p_rec = proj / f"{sid_rec}.jsonl"
+    _p_rec.write_text(json.dumps(dict(type="user", uuid="rc1", timestamp="2026-07-25T17:50:00.000Z",
+                                      sessionId=sid_rec, message={"role": "user", "content": CMD_U},
+                                      **base), ensure_ascii=False), encoding="utf-8")   # ⚠ 刻意不撥 mtime
+    r18 = run("--archive-command-only", str(arc18))
+    assert _p_rec.is_file(), "⚠⚠ 剛寫過的 session（可能還開著）被搬走了"
+    assert "可能還開著" in (r18.stdout + r18.stderr), "不搬的理由要講出來"
+    os.utime(_p_rec, (_OLD, _OLD))                    # 之後的格子不要被它干擾
+
+    # --- ⚠⚠ 主檔已經搬到目的地之後才 Ctrl+C ⇒ 一定要記帳、一定要講出來（`v62-fam` #3）--------
+    # 舊版：紀錄停在 `pending`、stderr 一個字都沒有——使用者看到的是「什麼都沒發生」，
+    # 實際上那一場已經不在 `~/.claude/projects/`。
+    arc19 = tmp / "archive-cut-after-move"
+    sid_cut = "ac210000-0000-4000-8000-00000000ac21"
+    _scut = _one_cmd_session(sid_cut, "2026-07-25T18:00:00.000Z")
+    _orig_cut = (proj / f"{sid_cut}.jsonl").read_bytes()
+
+    def _replace_then_ki(src, dst, *a, **k):
+        r = _real_replace(src, dst, *a, **k)
+        if _into(dst, arc19):
+            raise KeyboardInterrupt("injected Ctrl+C right after the move landed")
+        return r
+
+    def _move_then_ki(src, dst, *a, **k):        # 搬移走 shutil.move 的版本：同一個注入點
+        r = _real_move(src, dst, *a, **k)
+        if _into(dst, arc19):
+            raise KeyboardInterrupt("injected Ctrl+C right after the move landed")
+        return r
+
+    _v.os.replace, _v.shutil.move = _replace_then_ki, _move_then_ki
+    _err19, _prop19 = io.StringIO(), False
+    try:
+        with contextlib.redirect_stderr(_err19):
+            _arc_one(sid_cut, _scut, arc19)
+    except KeyboardInterrupt:
+        _prop19 = True
+    finally:
+        _v.os.replace, _v.shutil.move = _real_replace, _real_move
+    assert _prop19, "Ctrl+C 被吞掉了"
+    _t19 = arc19 / f"-x-Proj__{sid_cut}.jsonl"
+    assert _t19.is_file() and _t19.read_bytes() == _orig_cut, "前提：主檔已經在目的地"
+    assert any(r.get("state") == "moved" and r.get("to", "").endswith(_t19.name)
+               for r in _journal_rows(arc19)), (
+        "⚠⚠ 主檔已經搬到目的地之後的 Ctrl+C，紀錄卻停在 pending——還原的人不知道它搬完了沒")
+    assert "封存中斷" in _err19.getvalue() and _t19.name in _err19.getvalue(), (
+        f"主檔已搬走卻被中斷，要當場講出它在哪裡：{_err19.getvalue()!r}")
+
+    # --- ⚠⚠ 子代理目錄搬到一半 Ctrl+C ⇒ 記帳寫兩處位置、當場講出來（`v62-fam` #3）----------
+    arc20 = tmp / "archive-cut-sidechain"
+    sid_sc = "ac220000-0000-4000-8000-00000000ac22"
+    _ssc = _one_cmd_session(sid_sc, "2026-07-25T18:10:00.000Z")
+    _side = proj / sid_sc
+    (_side / "subagents").mkdir(parents=True)
+    (_side / "subagents" / "agent-a1.jsonl").write_text("{}", encoding="utf-8")
+    (_side / "x1.json").write_text("{}", encoding="utf-8")
+    (_side / "x2.json").write_text("{}", encoding="utf-8")
+    _n_side = []
+
+    def _move_side_then_ki(src, dst, *a, **k):
+        if Path(src).resolve().parent == _side.resolve():
+            _n_side.append(src)
+            if len(_n_side) == 2:
+                raise KeyboardInterrupt("injected Ctrl+C mid sub-agent move")
+        return _real_move(src, dst, *a, **k)
+
+    _v.shutil.move = _move_side_then_ki
+    _err20, _prop20 = io.StringIO(), False
+    try:
+        with contextlib.redirect_stderr(_err20):
+            _arc_one(sid_sc, _ssc, arc20)
+    except KeyboardInterrupt:
+        _prop20 = True
+    finally:
+        _v.shutil.move = _real_move
+    assert _prop20 and len(_n_side) == 2, "前提：Ctrl+C 要真的落在子代理目錄搬到一半"
+    _mv20 = [r for r in _journal_rows(arc20) if r.get("state") == "moved"]
+    assert _mv20, "⚠⚠ 子代理目錄搬到一半被中斷：主檔已經搬走了，紀錄卻停在 pending"
+    assert ("中斷" in _mv20[-1].get("sidechain", "") and _mv20[-1].get("sidechain_from")
+            and _mv20[-1].get("sidechain_to")), (
+        f"子代理目錄一半在來源、一半在封存目錄：紀錄要寫明中斷與兩處位置：{_mv20[-1]}")
+    assert "封存中斷" in _err20.getvalue() and str(_side) in _err20.getvalue(), (
+        f"子代理目錄被切成兩半，要當場講出兩處位置：{_err20.getvalue()!r}")
+
+    # --- ⚠⚠ 量完內容之後來源又被**追加**、複製到一半 Ctrl+C ⇒ 來源仍完整，半截檔要收、不可以亂講 ----
+    # 舊版：保留 7 位元組的半截檔、說它「可能是原本那份的唯一完整副本」（`v62-fam` #4）——
+    # 其實來源完整（只是多了一行），而那個半截檔會擋住之後每一次執行。
+    _APP = ("\n" + json.dumps({"type": "user", "uuid": "ap1", "timestamp": "2026-07-25T18:21:00.000Z",
+                               "message": {"role": "user", "content": CMD_U}, **base})).encode()
+    def _cut_after_touch(_kind, _sid4, _t4):
+        _arc4b = tmp / f"archive-{_kind}-then-cut"
+        _s4b = _one_cmd_session(_sid4, _t4)
+        _src4b = proj / f"{_sid4}.jsonl"
+        _orig4b = _src4b.read_bytes()
+
+        def _touch_src(p, _kind=_kind):
+            if _kind == "append":
+                with open(p, "ab") as fh:
+                    fh.write(_APP)
+            else:                                         # 不是追加：開頭就不一樣了
+                Path(p).write_bytes(b'{"type":"user","uuid":"rw1"}\n')
+
+        def _replace_touch_xdev(src, dst, *a, _arc=_arc4b, **k):
+            if _into(dst, _arc):
+                _touch_src(src)                           # 量完內容之後、搬之前
+                raise OSError(_errno.EXDEV, "simulated cross-device move")
+            return _real_replace(src, dst, *a, **k)
+
+        def _partial_ki(src, dst, *a, **k):
+            Path(dst).write_bytes(b"PARTIAL")
+            raise KeyboardInterrupt("injected Ctrl+C mid-copy")
+
+        def _move_touch_partial_ki(src, dst, *a, _arc=_arc4b, **k):    # 搬移走 shutil.move 的版本
+            if _into(dst, _arc):
+                _touch_src(src)
+                Path(dst).write_bytes(b"PARTIAL")
+                raise KeyboardInterrupt("injected Ctrl+C mid-copy")
+            return _real_move(src, dst, *a, **k)
+
+        _v.os.replace, _v.shutil.copyfile, _v.shutil.move = (
+            _replace_touch_xdev, _partial_ki, _move_touch_partial_ki)
+        _err4b = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(_err4b):
+                try:
+                    _arc_one(_sid4, _s4b, _arc4b)
+                except KeyboardInterrupt:
+                    pass
+        finally:
+            _v.os.replace, _v.shutil.copyfile, _v.shutil.move = _real_replace, _real_copyfile, _real_move
+        _left4b = [p for p in _arc4b.glob("*.jsonl") if p.name != "_archived.jsonl"]
+        if _kind == "append":
+            assert _src4b.read_bytes() == _orig4b + _APP, "來源（含追加的那一行）要完整留在原地"
+            assert not _left4b, (
+                "來源開頭仍完整保有搬移前那份內容時，半截目的地是多餘的、要收掉（否則永遠撞「已有同名檔」）："
+                f"{[(p.name, p.stat().st_size) for p in _left4b]}")
+            assert "完整副本" not in _err4b.getvalue(), (
+                f"⚠⚠ 不可以把半截檔說成完整副本：{_err4b.getvalue()!r}")
+        else:
+            assert _left4b, "來源被改寫（不是追加）時，目的地可能是那份內容唯一的殘留，不可以刪"
+            assert "可能不完整" in _err4b.getvalue(), (
+                f"⚠⚠ 保留的目的地是半截檔，訊息要照實講「可能不完整」，不可以說是完整副本：{_err4b.getvalue()!r}")
+
+    _cut_after_touch("append", "ac230000-0000-4000-8000-00000000ac23", "2026-07-25T18:20:00.000Z")
+
+    # --- ⚠⚠ 量完內容之後來源被**改寫**（不是追加）、複製到一半 Ctrl+C ⇒ 保留目的地，但要講「可能不完整」 ----
+    _cut_after_touch("rewrite", "ac240000-0000-4000-8000-00000000ac24", "2026-07-25T18:30:00.000Z")
 
     # --- ⚠⚠ cleanup **自己**失敗時要講出來，不可以吞掉 ----------------------
     # 我原本以為這一格「只能靠 Windows 檔案鎖、寫進測試會不可攜」——`utf-fix-codex-r4`
@@ -8095,6 +8731,187 @@ def test_archive_command_only(tmp_path=None):
     print("OK: archive command-only sessions test passed")
 
 
+def test_build_interrupt_residue(tmp_path=None):
+    """建置被中斷（Ctrl+C／硬終止）之後**不可以留下半截或擋路的檔**（`v62-fam` #7）。
+
+    ① 硬終止留下的頁面暫存檔（`*.html.tmp`）：下一次建置開頭要清掉——指定來源的建置會略過孤兒清理、
+       那一場又被沿用，舊版的半截暫存檔因此**永遠**留著。不是本工具命名的檔不碰。
+    ② Ctrl+C 落在寫頁面暫存檔途中：暫存檔當場收掉（舊版只接 `Exception`）。
+    ③ 索引頁與 manifest 每次都重寫：中斷時正式檔要嘛完整的舊版、要嘛完整的新版
+       （舊版直接寫正式檔，中斷就留下截斷的索引）。
+    """
+    tmp = new_tmp(tmp_path)
+    proj = tmp / "projects" / "res-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "f0f00000-0000-4000-8000-00000000f0ff"
+    (proj / f"{sid}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+        {"type": "user", "uuid": "r1", "timestamp": "2026-09-30T01:00:00.000Z", "cwd": "/x/Res",
+         "sessionId": sid, "message": {"role": "user", "content": "提問RESIDUEQ。"}},
+        {"type": "assistant", "uuid": "r2", "timestamp": "2026-09-30T01:00:05.000Z", "sessionId": sid,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "mr2",
+                     "usage": {"input_tokens": 10, "output_tokens": 5},
+                     "content": [{"type": "text", "text": "回覆RESIDUEA。"}]}},
+    ]), encoding="utf-8")
+    out = tmp / "out"
+
+    def build(*extra, patch=""):
+        code = ("import sys, pathlib\n"
+                f"sys.path.insert(0, {str(ROOT)!r})\n"
+                "import ai_session_viewer as v\n" + patch +
+                f"sys.argv = ['ai_session_viewer.py', '--claude-source', {('demo=' + str(tmp / 'projects'))!r},"
+                f" '--no-codex', '--out', {str(out)!r}, *{list(extra)!r}]\n"
+                "v.main()\n")
+        return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+
+    def ki_on(names):
+        """`Path.write_text` 寫到這些檔名時，寫一半就丟 Ctrl+C（中斷落在寫檔途中）。`*x` ＝ 結尾是 x。"""
+        return ("_orig_wt = pathlib.Path.write_text\n"
+                f"_PATS = {list(names)!r}\n"
+                "def _wt(self, data, *a, **k):\n"
+                "    if any(self.name.endswith(p[1:]) if p.startswith('*') else self.name == p for p in _PATS):\n"
+                "        _orig_wt(self, data[:len(data) // 2], *a, **k)\n"
+                "        raise KeyboardInterrupt('injected Ctrl+C mid write')\n"
+                "    return _orig_wt(self, data, *a, **k)\n"
+                "pathlib.Path.write_text = _wt\n")
+
+    r = build()
+    assert r.returncode == 0, f"前提：第一次建置要成功\n{r.stderr[-500:]}"
+    page = next(p for p in _session_pages(out) if sid[:8] in p.name)
+    page_md = page.with_suffix(".md")
+    assert page_md.is_file(), "前提：MD 也要建出來"
+
+    # --- ① 硬終止留下的半截暫存檔：下一次建置開頭要清掉；不是本工具命名的不碰 ------------------
+    strays = [page.with_name(page.name + ".tmp"), page_md.with_name(page_md.name + ".tmp"),
+              out / "index.html.tmp", out / ".build-manifest.json.tmp"]
+    for p in strays:
+        p.write_text("<half-written>", encoding="utf-8")
+    keep = out / "notes.tmp"
+    keep.write_text("not ours", encoding="utf-8")
+    r = build()
+    assert r.returncode == 0, f"第二次建置非零退出\n{r.stderr[-500:]}"
+    left = [p.name for p in strays if p.exists()]
+    assert not left, (
+        f"⚠⚠ 上一次中斷留下的暫存檔還在：{left}——指定來源的建置會略過孤兒清理、那一場又被沿用，"
+        "它們會永遠留著")
+    assert keep.exists(), "不是本工具命名的 .tmp 不可以碰（`--out` 可能指到別的東西也在的目錄）"
+
+    # --- ② Ctrl+C 落在寫頁面暫存檔途中 ⇒ 暫存檔要當場收掉 ------------------------------------
+    r = build("--force", patch=ki_on(["*.html.tmp"]))
+    assert r.returncode != 0 and "KeyboardInterrupt" in r.stderr, f"前提：要真的中斷\n{r.stderr[-300:]}"
+    left2 = [p.name for p in (out / "sessions").rglob("*.tmp")]
+    assert not left2, f"⚠⚠ Ctrl+C 之後留下了頁面暫存檔：{left2}"
+    assert "RESIDUEA" in page.read_text(encoding="utf-8"), "正式頁面要是完整的（舊版）"
+
+    # --- ②-b Ctrl+C 落在**換上**頁面途中（HTML 換上了、換 MD 那一刻）⇒ 暫存檔一樣要當場收掉 -----
+    # ② 的中斷落在寫暫存檔途中；換上（`os.replace`）那一段是另一個 `try`，只接 `OSError` 的話
+    # MD 的暫存檔留在原地——下一次指定來源的建置又會沿用這一場（② 那一格驗不到這一段）。
+    def ki_on_replace(suffix):
+        return ("import os as _os\n"
+                "_orig_rp = _os.replace\n"
+                "def _rp(src, dst, *a, **k):\n"
+                f"    if str(src).endswith({suffix!r}):\n"
+                "        raise KeyboardInterrupt('injected Ctrl+C at replace')\n"
+                "    return _orig_rp(src, dst, *a, **k)\n"
+                "_os.replace = _rp\n")
+
+    r = build("--force", patch=ki_on_replace(".md.tmp"))
+    assert r.returncode != 0 and "KeyboardInterrupt" in r.stderr, f"前提：要真的在換上 MD 時中斷\n{r.stderr[-300:]}"
+    left2b = [p.name for p in (out / "sessions").rglob("*.tmp")]
+    assert not left2b, f"⚠⚠ 換上頁面途中 Ctrl+C，留下了暫存檔：{left2b}"
+    assert "RESIDUEA" in page.read_text(encoding="utf-8"), "HTML 要是完整的（新換上的或舊的都可以）"
+
+    # --- ③ 索引頁／manifest 寫到一半被中斷 ⇒ 正式檔原封不動（完整的舊版），不留暫存檔 -----------
+    for name in ("index.html", ".build-manifest.json"):
+        before = (out / name).read_bytes()
+        r = build("--force", patch=ki_on([name, name + ".tmp"]))
+        assert r.returncode != 0 and "KeyboardInterrupt" in r.stderr, f"前提：{name} 要真的在寫的時候中斷"
+        assert (out / name).read_bytes() == before, (
+            f"⚠⚠ {name} 寫到一半被中斷，正式檔被截斷了——要先寫暫存檔、完整了才換上")
+        assert not (out / (name + ".tmp")).exists(), f"{name} 的暫存檔要收掉"
+    json.loads((out / ".build-manifest.json").read_text(encoding="utf-8"))   # 還讀得起來
+
+    print("OK: build interrupt residue test passed")
+
+
+# ⚠⚠ 改到頁面輸出（HTML 或 MD 的任何一個位元組）就要升 `RENDERER_VERSION`，再把這兩個值一起更新。
+#    **只改雜湊、不升版本，這支測試就會放行——那是作弊，不是修法**：既有的 `out/` 會靜默沿用舊頁面。
+# 範圍限制 SCOPE-RENDER-PIN-FIXTURE：釘的是這支測試的 fixture 走得到的輸出；Codex、子代理、圖片、
+#    壓縮、排隊句、未知模型這些路徑不在 fixture 裡。詳見 planning/scope-limits.md。
+_RENDER_PIN =(63, "1dc4e32c27b9425b3666919ce17c0261b49fbd63f0d09ad9c3261f27301a0b4a")
+
+
+def test_renderer_version_pinned(tmp_path=None):
+    """`RENDERER_VERSION` 要跟著頁面輸出走（`v62-fam` #9 的 m02：把版本改回 60，整套照樣綠）。
+
+    增量建置靠它判斷舊頁面要不要重產；呈現改了、版本沒升，修正在既有的 `out/` 上**完全不生效**，
+    而且沒有任何跡象（這個 repo 連續三輪漏過）。做法：固定一份涵蓋各種區塊的合成 session，
+    在固定時區（`TZ=UTC0`）與固定雜湊種子下渲染 HTML＋MD，雜湊要等於上面記的那一個。
+    """
+    tmp = new_tmp(tmp_path)
+    proj = tmp / "projects" / "pin-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    sid = "f1f10000-0000-4000-8000-00000000f1ff"
+
+    def a(t, mid, content, cw=0, cr=0, ttl="1h", side=False, model="claude-opus-4-8"):
+        cc = {"ephemeral_5m_input_tokens": cw if ttl == "5m" else 0,
+              "ephemeral_1h_input_tokens": cw if ttl == "1h" else 0}
+        return {"type": "assistant", "uuid": f"a-{mid}-{t}", "timestamp": t, "sessionId": sid,
+                "isSidechain": side, "message": {
+                    "role": "assistant", "model": model, "id": mid,
+                    "usage": {"input_tokens": 3, "cache_creation_input_tokens": cw,
+                              "cache_read_input_tokens": cr, "output_tokens": 40, "cache_creation": cc},
+                    "content": content}}
+
+    def q(t, uuid, content, side=False):
+        return {"type": "user", "uuid": uuid, "timestamp": t, "cwd": "/x/Pin", "gitBranch": "main",
+                "version": "2.1.278", "sessionId": sid, "isSidechain": side,
+                "message": {"role": "user", "content": content}}
+
+    ev = [
+        q("2026-09-30T02:00:00.000Z", "p1", "第一個問題，含 `code` 與 **粗體**。"),
+        a("2026-09-30T02:00:05.000Z", "pm1", [{"type": "thinking", "thinking": "想一下"},
+                                              {"type": "text", "text": "| a | b |\n|---|---|\n| 1 | 2 |"}],
+          cw=5000),
+        a("2026-09-30T02:00:09.000Z", "pm2", [{"type": "tool_use", "id": "tu1", "name": "Bash",
+                                              "input": {"command": "echo hi"}}], cw=800, cr=5000),
+        q("2026-09-30T02:00:10.000Z", "p2", [{"type": "tool_result", "tool_use_id": "tu1", "content": "hi"}]),
+        a("2026-09-30T02:00:12.000Z", "pm3", [{"type": "text", "text": "完成。"}], cw=300, cr=5800),
+        q("2026-09-30T02:30:00.000Z", "p3", "<command-name>/effort</command-name>\n"
+                                           "<command-message>effort</command-message>\n<command-args>high</command-args>"),
+        q("2026-09-30T02:31:00.000Z", "p4", "第二個問題。"),
+        a("2026-09-30T02:31:05.000Z", "pm4", [{"type": "text", "text": "寫入改成 5 分鐘了。"}],
+          cw=900, cr=5000, ttl="5m"),
+        a("2026-09-30T02:31:09.000Z", "pm5", [{"type": "text", "text": "仍是 5 分鐘。"}],
+          cw=700, cr=5900, ttl="5m"),
+    ]
+    (proj / f"{sid}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in ev),
+                                       encoding="utf-8")
+    code = ("import sys, hashlib, json\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            "import ai_session_viewer as v\n"
+            f"s = v.load_session(v.Path({str(proj / (sid + '.jsonl'))!r}), 'pin-proj', 'demo', v.SOURCE_CLAUDE)\n"
+            "v.analyze(s)\n"
+            "s.out_html, s.out_md, s.mem_href = 'claude-code/demo/pin.html', 'claude-code/demo/pin.md', ''\n"
+            "blob = v.render_session_html(s, '../../../index.html', '') + '\\n@@MD@@\\n' + v.render_session_md(s)\n"
+            f"for t in {[str(tmp), str(tmp).replace(chr(92), '/'), json.dumps(str(tmp))[1:-1]]!r}:\n"
+            "    blob = blob.replace(t, '<TMP>')\n"
+            "print(v.RENDERER_VERSION, hashlib.sha256(blob.encode('utf-8')).hexdigest())\n")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=dict(os.environ, TZ="UTC0", PYTHONHASHSEED="0"))
+    assert r.returncode == 0, f"渲染失敗\n{r.stderr[-800:]}"
+    ver, digest = r.stdout.split()
+    exp_ver, exp_digest = _RENDER_PIN
+    assert int(ver) == exp_ver, (
+        f"RENDERER_VERSION 是 {ver}，這支測試記的是 {exp_ver}——升了版就把 _RENDER_PIN 一起更新成 "
+        f"({ver}, {digest!r})；沒有要升而版本卻變了，就是改錯了")
+    assert digest == exp_digest, (
+        f"⚠⚠ 頁面輸出變了，但 RENDERER_VERSION 還是 {ver}——改到呈現就要升版（既有的 out/ 才會重產），"
+        f"再把 _RENDER_PIN 更新成 (新版本, {digest!r})")
+
+    print("OK: renderer version pinned test passed")
+
+
 if __name__ == "__main__":
     # ⚠⚠ **這一格必須第一個跑**（`bookmarks-p4fix-codex` Medium）：它驗的是
     # `new_tmp()` 本身，而下面每一支測試都靠 `new_tmp()` 開工。排在後面的話，
@@ -8151,3 +8968,5 @@ if __name__ == "__main__":
     test_codex_sentinel_false_alarms()
     test_one_bad_session_does_not_kill_batch()
     test_archive_command_only()
+    test_build_interrupt_residue()
+    test_renderer_version_pinned()

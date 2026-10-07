@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import errno       # 封存搬移時認「跨磁碟」（EXDEV／WinError 17），見 `_archive_move()`
 import hashlib
 import html
 import json
@@ -27,6 +28,7 @@ import math
 import os          # 封存的原子建檔（O_EXCL）與紀錄落磁（fsync）需要，見 `_archive_loop()`
 import re
 import shutil
+import stat        # 封存清理時解除唯讀（Windows 上唯讀的檔刪不掉）
 import sys
 import webbrowser
 from datetime import datetime, timedelta, timezone
@@ -203,7 +205,15 @@ MANIFEST_NAME = ".build-manifest.json"
 #       在大約四分之一的輸入上差最後一位，半分邊界會顯示成不同的分——62 版起與 60 版逐位元相同。
 #    ⑥ 沒有 TTL 細分的舊資料寫入，在表頭有其他檔次時另列「TTL 未知」。
 #    另外，Codex 使用者 prompt 的字串一律原樣收下、不再嘗試當成序列化的 JSON 解析（同一版一起升）。
-RENDERER_VERSION = 62
+# 62 → 63（2026-10-03）：寫入 TTL 呈現的三處更正，HTML 與 MD 都變。
+#    ① MD 的回合列補上寫入 TTL（有切換標第一個切換，否則列出不是 1h 的檔次；純 1h 不標）：
+#       MD 不畫逐步列，原本**完全看不到** 5m 落在哪一則——表頭說有切換、每一則卻找不到。
+#    ② 表頭步數：同一次呼叫被使用者回合切成兩段時只算一次；沒有時間戳的步不參與切換判定
+#       （它排在時間序最前面是假的位置，會把 1h→5m 講成 5m→1h）。
+#    ③ 提示文字：拿掉 tooltip 裡的 `**`／反引號、作者機器上的觀察（移到 docs）、「子代理另計」
+#       （子代理的寫入沒有在別處彙總）。
+#    ⚠ 沒有動到算錢與錨點的路徑（總額、兩層錨點都應逐位元不變——驗法是全語料新舊對照）。
+RENDERER_VERSION = 63
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -1086,6 +1096,10 @@ def _nested_text(v, _depth=0):
         t = v.get("text")
         if isinstance(t, str) and t.strip():
             return True
+        # 巢狀裡**名字就是內容容器**的欄位也算（`{"output": {"value": "…"}}`）：只認 `text` 鍵的話，
+        # 內容換一層、換個名字就整則消失而沒有任何哨兵出聲（`v62-fam` #8）。
+        if any(k in _TEXTY_KEYS and _any_text(x) for k, x in v.items()):
+            return True
         return any(_nested_text(x, _depth + 1) for x in v.values() if isinstance(x, (list, dict)))
     if isinstance(v, list):
         return any(_nested_text(x, _depth + 1) for x in v)
@@ -1093,6 +1107,10 @@ def _nested_text(v, _depth=0):
 
 
 _TEXTY_KEYS = ("content", "parts", "value", "body")   # 名字就是「內容容器」的欄位
+# 範圍限制 SCOPE-SENTINEL-UNCOVERED-SHAPES：「內容搬到別處」的偵測只認 `text` 鍵與上面這幾個容器名；
+# 內容放在其他名字的鍵底下（例 `{"delta": {"answer": …}}`）、或 reasoning 的原文放在 `content` 以外的
+# 欄位（例 `reasoning_content`），不在哨兵的涵蓋範圍內。反方向同樣有邊界：頂層的字串欄位一律當成內容，
+# 分不出是 metadata（例 `language: "en"`）。詳見 planning/scope-limits.md。
 
 
 def _any_text(v, _depth=0):
@@ -1121,11 +1139,21 @@ def _block_text_elsewhere(b):
                for k, v in b.items())
 
 
+_TEXT_BLOCK_TYPES = ("text", "input_text", "output_text")
+# 序列化的 content 會出現的 block 型別（Codex／OpenAI 的使用者輸入與 Claude 的 content block）
+_CONTENT_BLOCK_TYPES = frozenset(_TEXT_BLOCK_TYPES + (
+    "image", "input_image", "local_image", "localImage", "image_url",
+    "input_file", "file", "input_audio", "audio"))
+
+
 def _jsonish_nontext_blocks(s):
-    """字串若解得出「每個元素都帶 `type` 的 block 陣列」，回其中**非文字** block 的數目；否則 0。
+    """字串若解得出「序列化的 content block 陣列」，回其中**非文字** block 的數目；否則 0。
 
     ⚠ **只用來出聲，不改寫原文**：從字串內容分不出那是上游序列化的 content 還是使用者
-    貼的原文，所以原文一律照收；這裡只回答「若真是序列化的，有沒有東西（圖片…）沒被畫出來」。"""
+    貼的原文，所以原文一律照收；這裡只回答「若真是序列化的，有沒有東西（圖片…）沒被畫出來」。
+    ⚠ 「每個元素都帶 `type`」不夠：使用者貼一段 Slack Block Kit（`section`／`divider`）也長那樣，
+      於是一則正常的提問被報成「上游可能把 content 序列化了」（`v62-fam` #8 的誤報）。
+      ⇒ 要嘛裡面有**帶字串 `text` 的文字 block**，要嘛**每個型別都是 content block 的型別**，才算數。"""
     t = s.strip() if isinstance(s, str) else ""
     if not t.startswith("["):
         return 0
@@ -1136,7 +1164,11 @@ def _jsonish_nontext_blocks(s):
     if not (isinstance(parsed, list) and parsed
             and all(isinstance(b, dict) and b.get("type") for b in parsed)):
         return 0
-    return sum(1 for b in parsed if str(b.get("type")) not in ("text", "input_text", "output_text"))
+    types = [str(b.get("type")) for b in parsed]
+    has_text = any(ty in _TEXT_BLOCK_TYPES and isinstance(b.get("text"), str) for ty, b in zip(types, parsed))
+    if not (has_text or all(ty in _CONTENT_BLOCK_TYPES for ty in types)):
+        return 0
+    return sum(1 for ty in types if ty not in _TEXT_BLOCK_TYPES)
 
 
 def _codex_consumed(item, text_type="output_text"):
@@ -1173,8 +1205,18 @@ def _codex_content_text(content, text_type="output_text"):
     return "\n".join(item["text"] for item in content if _codex_consumed(item, text_type))
 
 
+def _codex_block_loses(b, text_type="output_text"):
+    """這個 block 有沒有內容**沒被畫出來**：沒被收下而且帶著東西（`_codex_carries_unread`），
+    **或是**收下了 `text`、別的欄位卻還帶著字——`{"type":"output_text","text":"See chart:","image_url":…}`
+    只收 `text` 會把圖片連結整個丟掉；`text:" "` 而真正的內容搬到別欄位時也一樣（`v62-fam` #8）。"""
+    if _codex_consumed(b, text_type):
+        return _block_text_elsewhere(b)
+    return _codex_carries_unread(b, text_type)
+
+
 def _codex_content_unconsumed(content, text_type="output_text"):
-    """`_codex_content_text` **沒有吃掉**的 block 數（消費規則與它逐條對應，改一邊要改兩邊）。
+    """`_codex_content_text` **沒有完整收下**的 block 數：沒被吃掉的，加上被吃掉了 `text`、別的欄位
+    卻還帶著字的（消費規則與它逐條對應，改一邊要改兩邊）。
 
     ⚠ 只數 block、不看內容：目的是讓「有東西被丟掉」這件事**有人數得出來**，
     不是要把圖片也渲染出來（那是另一件事）。混合內容的 prompt（文字＋圖片）在舊寫法下
@@ -1182,7 +1224,9 @@ def _codex_content_unconsumed(content, text_type="output_text"):
     於是頁面看起來完整、卻少了一半內容，正是本檔一再要擋的那種形狀。"""
     if not isinstance(content, list):
         return 0
-    return sum(1 for item in content if not _codex_consumed(item, text_type))
+    return sum(1 for item in content
+               if not _codex_consumed(item, text_type)
+               or (isinstance(item, dict) and _block_text_elsewhere(item)))
 
 
 def _codex_container_user_like(raw):
@@ -1226,6 +1270,8 @@ def _json_obj_maybe(text):
 
 
 def _codex_usage(usage):
+    # 範圍限制 SCOPE-CODEX-CACHE-WRITE-UNREAD：只讀輸入／快取讀取／產出三個欄位；
+    # `cache_write_input_tokens` 不在換算範圍內。詳見 planning/scope-limits.md。
     if not isinstance(usage, dict):
         return {}
     total_in = usage_int(usage, "input_tokens")
@@ -1431,6 +1477,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     n_dropped_assistant_blocks = 0
     # reasoning 摘要的形狀認不得（不是 list、或 list 裡有帶著內容卻沒被收下的元素）。
     n_bad_reasoning_summary = 0
+    n_reasoning_content = 0        # reasoning 的推理原文放在 `content`（只畫摘要 ⇒ 不會出現）
     # (v36-fam6 #2) 同一條路徑上另外兩格漂移：`role` 認不得、`content` 欄形狀不對。
     n_unknown_message_role = 0
     n_bad_message_content = 0
@@ -1708,11 +1755,11 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                 continue
             # 抽得到文字**不代表整則都收下了**：同一則裡其他帶著內容的 block（圖片、型別認不得的、
             # `text` 不是字串的…）會被整個略過，而「取不出文字」那條只在一個字都抽不到時才看。
-            # 判準與上面那條相同（`_codex_carries_unread`），真的沒有話講的空文字 block 不算。
+            # 判準與上面那條相同（`_codex_carries_unread`），真的沒有話講的空文字 block 不算；
+            # **收下了的 block 別的欄位還帶著字**也算（`_codex_block_loses`）。
             _c = payload.get("content")
             if isinstance(_c, list):
-                n_dropped_assistant_blocks += sum(
-                    1 for b in _c if not _codex_consumed(b) and _codex_carries_unread(b))
+                n_dropped_assistant_blocks += sum(1 for b in _c if _codex_block_loses(b))
             turn_ai = True          # 這個窗真的有助理內容（見上面 `error` 那段的分界線）
             ev = {
                 "type": "assistant",
@@ -1740,9 +1787,14 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             # 摘要的形狀：正常是 list（加密的那種是空 list）。不是 list、或 list 裡有帶著內容卻沒被收下的
             # 元素 ⇒ 上游換了形狀，而「摘要是空的」這一格會把它當成正常的加密 reasoning 安靜略過。
             if (_sm is not None and not isinstance(_sm, list)) or (isinstance(_sm, list) and any(
-                    not _codex_consumed(b, "summary_text") and _codex_carries_unread(b, "summary_text")
-                    for b in _sm)):
+                    _codex_block_loses(b, "summary_text") for b in _sm)):
                 n_bad_reasoning_summary += 1
+            # 推理**原文**放在 `content`（`[{"type":"reasoning_text","text":…}]`）：本工具只畫摘要，
+            # 那段文字不會出現在輸出裡，而摘要是空的 list 時上面那條完全安靜（`v62-fam` #8）。
+            # 加密的 reasoning 這一欄是 null／不存在 ⇒ 正常資料不會出聲。
+            # 只看 `content` 這一欄（其他欄位名：範圍限制 SCOPE-SENTINEL-UNCOVERED-SHAPES）。
+            if _any_text(payload.get("content")):
+                n_reasoning_content += 1
             if not text.strip():
                 saw_unrendered_ai = True
             if text.strip():
@@ -1832,6 +1884,9 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
         print(f"  ! {path.name}: {n_bad_reasoning_summary} 則 reasoning 的摘要形狀認不得"
               f"（不是 list、或裡面有帶著內容卻沒被收下的元素）——那幾則摘要不會出現在輸出裡",
               file=sys.stderr)
+    if n_reasoning_content:
+        print(f"  ! {path.name}: {n_reasoning_content} 則 reasoning 的 content 帶著文字（推理原文）"
+              f"——本工具只畫摘要，那些文字不會出現在輸出裡", file=sys.stderr)
     if n_str_user_content:
         print(f"  ! {path.name}: {n_str_user_content} 則使用者訊息的 content 是字串（預期是 block 陣列）"
               f"——已原樣收下；若內容看起來像 JSON，可能是上游把 content 序列化了，"
@@ -3234,6 +3289,12 @@ def analyze(s, acct_switches=None):
     for gi, groups in enumerate([s.main_groups] + list(s.subagent_map.values())):
         prev_t = {}
         prev_ttl = {}       # 每條軸上一個**有寫入**的步是哪個 TTL 檔次 → 切換的那一步才標得出來
+        # 同一次呼叫（同一個 message.id）的事件被使用者回合隔開時，`group_turns` 會在兩個回合各畫一個步
+        # ——那是**同一筆寫入**，表頭只能算一次、也不可以拿它當切換點（`v62-fam` #6：表頭寫
+        # 「5m 2 步」，花費組成表只算一次）。
+        # 範圍限制 SCOPE-TTL-SPLIT-CALL-BADGES：只算一次的是表頭這一行（與花費組成）；
+        # 逐步徽章與 MD 的回合標記仍是每個步各畫一個。詳見 planning/scope-limits.md。
+        seen_mid = set()
         for g in groups:
             for b in g.get("blocks", []):
                 if b.get("type") != "_step":
@@ -3241,13 +3302,24 @@ def analyze(s, acct_switches=None):
                 ax = b.get("ax", ("", "")) if gi else ("", "")
                 u = b.get("u")
                 tier = ttl_tier(u)
-                if tier:
+                _mid = b.get("mid")
+                _again = bool(_mid) and (ax, _mid) in seen_mid
+                if _mid:
+                    seen_mid.add((ax, _mid))
+                if _again:
+                    pass
+                elif tier:
                     # 只有「有寫入」的步才更新基準：純讀取的步沒有 TTL 可言，拿它當基準會讓
                     # 下一次寫入被誤標成切換。
-                    p = prev_ttl.get(ax, "")
-                    if p and p != tier:
-                        u["ttl_prev"] = p
-                    prev_ttl[ax] = tier
+                    # ⚠ **沒有時間戳的步不參與切換判定**（不當基準、也不在它身上標切換）：它在時間序裡
+                    #   排第一（`ts_key` 的 AWARE_MIN）是假的位置，拿它當基準會把「1h→5m」講成
+                    #   「5m→1h」（`v62-fam` #6）。它的寫入照樣算進步數。
+                    p = ""
+                    if b.get("t") is not None:
+                        p = prev_ttl.get(ax, "")
+                        if p and p != tier:
+                            u["ttl_prev"] = p
+                        prev_ttl[ax] = tier
                     if gi == 0:      # 表頭只計主對話：子代理預設寫 5m，混進來會讓每一場都掛上這行
                         ttl_n[tier] += 1
                         if p and p != tier:
@@ -4231,10 +4303,13 @@ def ttl_tier(u):
 
 
 TTL_LABELS = {"1h": "1h", "5m": "5m", "both": "5m+1h"}
-_TTL_TIP = ("這一步**寫入**快取時用的 TTL（`usage.cache_creation` 的 5 分／1 小時細分）。"
+# ⚠ tooltip 是純文字 title 屬性：不可以有 `**`／反引號（會原樣露出）。
+# ⚠ 只講資料看得到的事：作者自己機器上的觀察（例如切到 5m 的時機）寫在 docs，不放進每個徽章——
+#   讀的人會把它當成「在我的機器上量到的」，而且等於替資料推斷一個工具不可能知道的成因。
+_TTL_TIP = ("這一步寫入快取時用的 TTL（usage.cache_creation 的 5 分／1 小時細分）。"
             "只描述寫入：同一步仍可能讀到先前用另一種 TTL 寫進去的前綴。"
-            "子代理預設寫 5m（可用 CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h 改掉）；"
-            "主對話中途由 1h 轉 5m：資料本身不帶成因，本機實測的兩次都發生在帳號進入 usage overage 的時候")
+            "子代理預設寫 5m（Claude Code 有設定可改成 1h，見 docs/token-計算原理.md）。"
+            "主對話中途由 1h 轉 5m 時，資料本身不帶成因")
 
 
 def _ttl_meter(u):
@@ -4334,8 +4409,8 @@ def _ttl_head(s):
     """session 表頭的「寫入 TTL」摘要 → (文字, tip)；**全程 1h（最常見）就回 ("", "")**，不佔版面。
 
     只計主對話：子代理預設寫 5m，混進來會讓每一場都掛上這行。**中途從 1h 轉 5m 值得看一眼**
-    ——本機實測兩場（`b61dc0b7`、`515b05fa`）都是帳號進入 usage overage 的那一刻，
-    之後寫進去的快取閒置 5 分鐘就過期。
+    ——之後寫進去的快取閒置 5 分鐘就過期（作者實測過的兩場都是帳號用量進入 overage 的那一刻，
+    寫在 `docs/token-計算原理.md`；那是觀察，不是資料裡的欄位，所以不放進提示文字）。
     `ttl_n`／`ttl_switches` 由 `analyze()` 在算逐步徽章的**同一個迴圈**裡產生（主對話那條軸），
     所以表頭與徽章對「哪幾步、在哪一步切換」必然一致。沒有 `_step` 的呼叫（`ttl_hidden`）
     另列次數：它們的寫入照樣發生，只是畫不出來；「全程 1h 就不顯示」要把它們也算進去。
@@ -4363,10 +4438,12 @@ def _ttl_head(s):
         if uh:
             hp.append(f"TTL 未知 ×{uh}")
         text += f"{'；' if parts else ''}另有 {htot + uh} 次沒有可呈現內容的呼叫（{'／'.join(hp)}）"
-    return text, ("只計主對話（子代理另計，預設寫 5m，可用 CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h 改）。"
+    # ⚠ 子代理的寫入**沒有**在別處彙總（只有逐步徽章）——不可以寫「另計」（`v62-fam` #5）。
+    return text, ("只計主對話；子代理的寫入不在這一行，只標在它們各自的步上"
+                  "（子代理預設寫 5m，Claude Code 有設定可改成 1h，見 docs/token-計算原理.md）。"
                   "步數與逐步徽章同一串；沒有可呈現內容的呼叫沒有徽章，另列次數。"
                   "「TTL 未知」是沒有 5m／1h 細分的舊資料。"
-                  "主對話中途由 1h 轉 5m：資料本身不帶成因，本機實測的兩次都發生在帳號進入 usage overage 的時候。"
+                  "主對話中途由 1h 轉 5m 時，資料本身不帶成因。"
                   "5m 寫入的快取閒置超過 5 分鐘就會過期；之後若再用到那一段，就要重新寫入"
                   "（先前用 1h 寫入、還沒過期的前綴仍可能讀得到）")
 
@@ -7128,8 +7205,35 @@ def turn_meters_md(group):
     extra = f" · 距上一步 {fmt_dur(gap_lead)}" if gap_lead is not None else ""
     if su_lead and su_lead.get("effort"):
         extra += f" · effort {su_lead['effort']}"
+    extra += _turn_ttl_md(group)
     return (f"  ·  ⚡{pct}%{cold}{miss} · ~{cost} · ctx {fmt_tokens(u['ctx_max'])}{pctx}"
             f" · ↑{fmt_tokens(u['output'])}{dur}{extra}")
+
+
+def _turn_ttl_md(group):
+    """MD 回合列的寫入 TTL：這一回合**有切換**就標第一個切換，否則列出不是 1h 的檔次；純 1h 不標。
+
+    ⚠ MD 不畫逐步列，逐步徽章那一份資訊只能放在回合列上——否則「5m 一律要看得到」
+      （HTML 的 5m 不受開關控制）在 MD 上完全不成立，表頭說有切換、每一則卻找不到是哪一則
+      （`v62-fam` #10）。純 1h 是常態，每一則都標只會變成噪音（與表頭「全程 1h 就不顯示」同一條規則）。"""
+    sw, tiers = None, []
+    for b in group.get("blocks", []):
+        if b.get("type") != "_step":
+            continue
+        u = b.get("u")
+        t = ttl_tier(u)
+        if not t:
+            continue
+        p = (u or {}).get("ttl_prev") or ""
+        if p and p != t and sw is None:
+            sw = (p, t)
+        if t != "1h" and t not in tiers:
+            tiers.append(t)
+    if sw:
+        return f" · 寫入 TTL {TTL_LABELS.get(sw[0], sw[0])}→{TTL_LABELS.get(sw[1], sw[1])}"
+    if tiers:
+        return " · 寫入 TTL " + "／".join(TTL_LABELS.get(t, t) for t in tiers)
+    return ""
 
 
 def render_turn_md(group, tmap, ai="Claude"):
@@ -10183,9 +10287,61 @@ def load_manifest_paths(out: Path) -> dict:
 
 
 def save_manifest(out: Path, entries: dict):
-    (out / MANIFEST_NAME).write_text(
-        json.dumps({"renderer_version": RENDERER_VERSION, "entries": entries}, ensure_ascii=False),
-        encoding="utf-8")
+    _write_atomic(out / MANIFEST_NAME,
+                  json.dumps({"renderer_version": RENDERER_VERSION, "entries": entries}, ensure_ascii=False))
+
+
+def _write_atomic(path: Path, text: str):
+    """先寫 `<檔名>.tmp` 再 `os.replace` 換上：中斷（Ctrl+C）或寫到一半失敗時，正式檔永遠是
+    完整的舊版或完整的新版——索引頁、manifest 這類每次都重寫的檔，舊版直接寫正式檔，
+    中斷就留下一個截斷的索引（`v62-fam` #7 實測 `idx_ok=False`）。
+    暫存檔在任何失敗下都收掉；硬終止留下的由下一次建置開頭清掉（`_sweep_stray_tmp`）。
+
+    範圍限制 SCOPE-ATOMIC-WRITE-SHARING-LOCK：換上一律用 `os.replace`。Windows 上正式檔被別的行程
+    以不帶 `FILE_SHARE_DELETE` 的方式開著時換不上，例外照樣往外拋（建置中止，正式檔維持完整的舊版）；
+    本函式不涵蓋重試或退回直接覆寫。詳見 planning/scope-limits.md。"""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+# 輸出目錄根層每次都重寫的檔（`_write_atomic` 的暫存檔就是 `<這些>.tmp`）
+_ROOT_REWRITTEN = ("index.html", "index.md", MANIFEST_NAME,
+                   "cache-report.html", "cache-report.md", "cache-hypotheses.html",
+                   "cache-hypotheses.md", "cache-codex.html", "cache-codex.md")
+
+
+def _sweep_stray_tmp(out: Path) -> int:
+    """清掉上一次建置被**硬終止**留下的暫存檔，回清掉幾個。
+
+    Ctrl+C 那一類各寫入點自己會收；收不到的是行程被砍、斷電——那時 `*.html.tmp` 留在原地，
+    而指定了 `--claude-source`／`--codex-source` 的建置會略過孤兒清理、那一場又被沿用，
+    於是半截的暫存檔**永遠**留著（`v62-fam` #7 實測）。
+    ⚠ 只認本工具自己的命名：`sessions/` 與 `memory/` 底下的 `*.html.tmp`／`*.md.tmp`（兩個目錄都是
+      工具自己的），以及根層那幾個固定檔名的 `.tmp`。`--out` 可能指到別的東西也在的目錄，不掃其他檔。
+    範圍限制 SCOPE-TMP-SWEEP-NAME-OWNERSHIP：所有權只靠「目錄＋檔名樣式」判斷；放在 `sessions/`／`memory/`
+    底下、名字剛好符合樣式的非本工具檔案，也在清理範圍內。詳見 planning/scope-limits.md。"""
+    n = 0
+    cands = [out / (name + ".tmp") for name in _ROOT_REWRITTEN]
+    for sub in ("sessions", "memory"):
+        d = out / sub
+        if d.is_dir():
+            cands += [p for p in d.rglob("*.tmp") if p.name.endswith((".html.tmp", ".md.tmp"))]
+    for p in cands:
+        try:
+            if p.is_file():
+                p.unlink()
+                n += 1
+        except OSError:
+            pass
+    return n
 
 
 def manifest_key(source_kind: str, path: Path) -> str:
@@ -10210,6 +10366,10 @@ def _index_rows(entries: dict, include_empty: bool) -> list:
 
 
 ARCHIVE_MANIFEST = "_archived.jsonl"
+# 封存不碰「最近還有寫入」的 session：它可能還開在 Claude Code 裡（例如正是用 `!` 下這個封存指令的
+# 那一場——那一行 `<bash-input>` 已經落磁、指令還在跑，判定時它只有指令）。
+# 搬走一場還在寫的檔，Claude Code 下一次寫入會在原路徑重建一個新檔，對話就被切成兩半。
+ARCHIVE_MIN_IDLE_SEC = 600
 
 
 def session_content_kind(s) -> str:
@@ -10323,7 +10483,10 @@ def _drop_session_pages(out: Path, key: str) -> tuple:
 def archive_command_only(sessions, dest: Path, scanned_roots, out: Path) -> tuple:
     """把「只有指令、沒有對話」的 session 檔搬到 `dest`，並刪掉它產生的頁面。
 
-    `sessions` ＝ [(kind, acc, proj, path, Session)]，只處理 Claude 側。
+    `sessions` ＝ [(kind, acc, proj, path, Session[, 判定時的內容身分])]，只處理 Claude 側。
+    第 6 欄是 `Session` 被讀出來的那份位元組的 `_file_ident()`（`main()` 在判定時量的）；
+    搬之前會再量一次，對不上（判定之後又被寫過）就不搬。沒給＝呼叫端保證 `Session`
+    就是檔案現在的內容，當場量一次當基準。判定期間就變了的，呼叫端傳 `None`（不搬）。
     回傳 `(搬走的清單, 略過的原因 Counter)`。
 
     ⚠⚠ **這是本工具唯一會動到 `out/` 以外檔案的功能。** 四道安全閘，缺一不可：
@@ -10403,21 +10566,139 @@ def archive_command_only(sessions, dest: Path, scanned_roots, out: Path) -> tupl
     return moved, skipped
 
 
-def _file_digest(p):
-    """檔案內容的 SHA-256；讀不到回 None。
+def _file_digest(p, limit=None):
+    """檔案內容（給了 `limit` 就只看前 `limit` 位元組）的 SHA-256；讀不到、或檔案比 `limit` 短回 None。
 
-    用來回答封存清理唯一要問的問題：「來源路徑上**現在**是不是還保有原本那份位元組」。
+    用來回答封存清理唯一要問的問題：「來源路徑上**現在**還保有搬移前那份位元組嗎」。
     ⚠ 不用 metadata（裝置／inode／大小／mtime）：同長度改寫再把 mtime 設回去就騙得過它，
       而騙過的後果是刪掉唯一完整的副本；反過來只動了 mtime、內容沒變時，它又會誤判成「變了」
-      而留下一個擋住之後每一次執行的半截檔。內容一樣＝刪掉目的地不會少任何東西。"""
+      而留下一個擋住之後每一次執行的半截檔。內容一樣＝刪掉目的地不會少任何東西。
+    ⚠ `limit` 是「**前綴**還在不在」：Claude Code 對 session 檔只會往後追加，追加過的來源
+      仍然完整保有搬移前那份內容（只是多了幾行）——那時目的地是多餘的，刪掉它不會少任何東西。"""
     try:
-        h = hashlib.sha256()
+        h, n = hashlib.sha256(), 0
         with open(p, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
+            while limit is None or n < limit:
+                chunk = fh.read(1 << 20 if limit is None else min(1 << 20, limit - n))
+                if not chunk:
+                    break
                 h.update(chunk)
+                n += len(chunk)
+        if limit is not None and n < limit:
+            return None
         return h.hexdigest()
     except OSError:
         return None
+
+
+def _file_ident(p):
+    """`(位元組數, SHA-256)`——封存用的「內容身分」；讀不到回 None。
+    長度和雜湊在**同一次讀取**裡量，兩者一定描述同一份位元組（分開 stat 會有窗）。"""
+    try:
+        h, n = hashlib.sha256(), 0
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+                n += len(chunk)
+        return (n, h.hexdigest())
+    except OSError:
+        return None
+
+
+def _is_cross_device(e):
+    """這個 `OSError` 是不是「來源與目的地不在同一顆磁碟」（POSIX `EXDEV`／Windows `WinError 17`）。"""
+    return getattr(e, "errno", None) == errno.EXDEV or getattr(e, "winerror", None) == 17
+
+
+def _rename_noreplace(src, dst):
+    """原子改名，**目的地已經存在就失敗**（絕不覆蓋）。
+    Windows 的 `os.rename` 本來就不覆蓋；POSIX 的 `rename` 會靜靜蓋掉，改用 `link`（目的地存在會丟
+    `FileExistsError`）再刪舊名。"""
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+    os.link(src, dst)
+    try:
+        os.unlink(src)
+    except BaseException:
+        try:
+            os.unlink(dst)          # 退回原狀：只剩原名
+        except OSError:
+            pass
+        raise
+
+
+def _restore_staging(staging, path):
+    """跨磁碟搬移中途失敗／中斷時，把凍結的來源改名回原處。
+    原處已經被重建（Claude Code 又寫了一行）時**不覆蓋它**：凍結檔留著，當場印出位置。"""
+    if not os.path.lexists(staging):
+        return
+    try:
+        _rename_noreplace(staging, path)
+    except OSError as e:
+        print(f"  ! ⚠ 封存中斷：{path.name} 搬移前的完整內容留在 {staging}"
+              f"（原處已被重建，沒有覆蓋它：{type(e).__name__}）。"
+              f"確認原處那個新檔的內容之後，再決定要不要把這個檔改回原名", file=sys.stderr)
+
+
+def _archive_move(path, target, src_id, staging):
+    """把來源搬到 `target`（這一趟用 `O_EXCL` 搶到的空佔位檔）。正常回來＝搬完了。
+
+    ⚠⚠ **同一顆磁碟一律用 `os.replace`**（原子地取代我們自己的佔位檔）。舊版用 `shutil.move`：
+      佔位檔讓它內部的 `rename` 失敗（Windows 的 rename 不覆蓋），於是**每一次都退化成「複製＋刪來源」**，
+      而「複製完、刪來源之前」那段時間 Claude Code 寫進來源的那一行會跟著來源一起被刪掉，紀錄還寫 `moved`。
+      原子改名沒有那段窗：之後才依路徑寫入的東西會落在原處一個**新建的檔**，不會被刪。
+    ⚠⚠ **跨磁碟**（這個功能的典型用法：來源在 `C:\\Users\\…\\.claude`，封存目錄在別顆碟）才走複製：
+      ① 先把來源**改名凍結**成同目錄的 `staging`（原子；之後依路徑寫入的落在原處的新檔）；
+      ② 複製凍結檔到目的地；③ **兩邊內容都等於搬移前量的 `src_id`** 才刪凍結檔
+      （凍結檔若被開著的 handle 寫過，對不上 ⇒ 不刪）；④ 唯讀的來源先解除唯讀再刪。
+      任何一步失敗或中斷：把凍結檔改名回原處（`_restore_staging`），原樣拋出——
+      目的地的半截檔由呼叫端的清理判斷能不能刪。
+    """
+    try:
+        os.replace(path, target)
+        return
+    except OSError as e:
+        if not _is_cross_device(e):
+            raise
+    # 範圍限制 SCOPE-ARCHIVE-NO-RESTART-RECONCILE：還原只涵蓋這一趟行程收得到的失敗與中斷。
+    # 行程在凍結之後被硬終止（或中斷落在凍結改名回來、進入 `try` 之前）時，來源以 `staging` 的
+    # 名字留在原處旁，之後的執行不會把它改名回去。詳見 planning/scope-limits.md。
+    _rename_noreplace(path, staging)
+    try:
+        st = os.stat(staging)
+        shutil.copyfile(staging, target)
+        os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))     # 保留原本的時間（`--resume` 清單看它）
+        # 範圍限制 SCOPE-ARCHIVE-OPEN-HANDLE-WINDOW：比對涵蓋到「凍結檔與目的地各量一次」為止；
+        # 經**已經開著的 handle** 寫進凍結檔、而且落在量完凍結檔之後到刪除之間的位元組，
+        # 不在這道比對的涵蓋範圍內。詳見 planning/scope-limits.md。
+        if _file_ident(staging) != src_id or _file_ident(target) != src_id:
+            raise OSError("複製之後的內容與搬移前量的不同（來源在搬移期間被寫入），這一場不搬")
+        try:
+            os.unlink(staging)
+        except PermissionError:
+            os.chmod(staging, stat.S_IREAD | stat.S_IWRITE)      # 唯讀的來源：要刪得先解除唯讀
+            try:
+                os.unlink(staging)
+            except BaseException:
+                try:
+                    os.chmod(staging, st.st_mode)                  # 刪不掉就把唯讀還給它
+                except OSError:
+                    pass
+                raise
+    except BaseException:
+        _restore_staging(staging, path)
+        raise
+
+
+def _move_landed(path, target, staging, src_id):
+    """搬移是不是**已經落地**：來源原處沒有檔、凍結檔也不在，而目的地是搬移前那份的完整內容。
+    中斷（Ctrl+C）可能落在 `os.replace` 回來之後的第一個 bytecode——那時檔案已經在目的地了。
+    ⚠ 原處**有**檔（被別的程式重建、或凍結檔被改名回去）一律不算落地：交給 `_unreserve()`
+      依「來源開頭還是不是那份內容」判斷目的地留不留，訊息也由它照實講。"""
+    return (not os.path.lexists(path) and not os.path.lexists(staging)
+            and _file_ident(target) == src_id)
+
 
 
 def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
@@ -10426,13 +10707,39 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
     抽出來只是為了讓 manifest 的 handle 有一個乾淨的 `finally` 可以關，
     行為與判準全部在這裡，`archive_command_only()` 的 docstring 是它們的說明。
     """
-    for kind, acc, proj, path, s in sessions:
+    _now = datetime.now(timezone.utc).timestamp()
+    for kind, acc, proj, path, s, *_cls in sessions:
         if kind != SOURCE_CLAUDE:
             continue
         if session_content_kind(s) != "command_only":
             continue
+        # ⚠⚠ **還在寫的 session 不搬。** 判定只看得到「那一刻」：用 `!` 下這個封存指令的那一場，
+        # 判定時只有一行 `<bash-input>`（指令還在跑、輸出還沒寫）⇒ 被判成只有指令。
+        # 搬走一場還開著的檔，Claude Code 下一次寫入會在原路徑重建新檔，對話被切成兩半
+        # （`v62-fam` #2 指出的觸發形狀）。
+        try:
+            _idle = _now - path.stat().st_mtime
+        except OSError as e:
+            _skip(f"讀不到來源：{type(e).__name__}: {e}")
+            continue
+        # 範圍限制 SCOPE-ARCHIVE-FUTURE-MTIME：閒置只看「現在減 mtime」；mtime 在未來的來源
+        # （時鐘偏差、從別台機器拷來）也落在這一支、用同一句訊息。詳見 planning/scope-limits.md。
+        if _idle < ARCHIVE_MIN_IDLE_SEC:
+            _skip(f"最近 {ARCHIVE_MIN_IDLE_SEC // 60} 分鐘內還有寫入（可能還開著），這次不搬")
+            continue
+        # ⚠⚠ **判定用的是那一刻的位元組，搬之前要確認還是同一份。** 判定與搬移之間隔著整批的讀取，
+        # 這段時間 Claude Code 往同一場寫了一則真的對話的話，照搬就是把有對話的 session 封存掉
+        # （`v62-fam` #2 實測：`kind: command_only` 之後補上問答，照樣被搬走）。
+        cls_id = _cls[0] if _cls else _file_ident(path)
+        if cls_id is None:
+            _skip("判定期間來源有寫入或讀不到（可能還開著），這次不搬")
+            continue
         target = dest / archive_name(getattr(s, "cwd", ""), path)
         side = path.with_suffix("")
+        side_target = dest / target.stem
+        # 跨磁碟搬移時，來源先改名凍結成這個名字（同目錄、不是 `.jsonl` ⇒ 不會被當成 session 讀到）。
+        # 寫進 pending 那一行：搬到一半被硬砍時，還原的人知道去哪裡找。
+        staging = path.with_name(path.name + ".archiving")
         # ⚠⚠ **來源的絕對路徑要在搬走之前算好。** `--claude-source` 收得下相對路徑，
         # 而舊版寫進紀錄的是未 resolve 的 `str(path)` ⇒ CLI 同時印著「含原始絕對路徑」，
         # 兩者互相矛盾，而還原的人只有那份紀錄（`utf-fix-codex` High#3 實測
@@ -10444,33 +10751,37 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         # ⚠ 頁面**先刪、再搬**：搬完才刪的話，中間若失敗就會留下「來源已經不在、
         # 頁面還在」的孤兒；反過來最壞只是頁面被刪、來源還在，下一次執行會重產。
         # 失敗方向要選可自癒的那一邊。
-        # ⚠⚠ **順序是：原子佔名 → pending 落磁 → 刪頁 → 搬移**，而且**任何一步失敗
-        # 都要把佔位檔收回來**（`utf-fix-codex-r2` 驗收）。
-        # 第一版把「刪頁」排在「佔名」之前、又只有 `shutil.move` 那一段有 cleanup ⇒
+        # ⚠⚠ **順序是：原子佔名 → pending 落磁 → 刪頁 → 確認內容還是判定時那份 → 搬移**，
+        # 而且**任何一步失敗都要把佔位檔收回來**（`utf-fix-codex-r2` 驗收）。
+        # 第一版把「刪頁」排在「佔名」之前、又只有搬移那一段有 cleanup ⇒
         # 注入一次 `fsync` 失敗就實測到：`source=True target=True target_size=0
         # html=False md=False`——**頁面已經刪了、目的地留下 0 位元組的佔位檔，
         # 而下一次執行會撞到「目的地已有同名檔」永遠略過這一場。**
         def _unreserve(tgt=None, src_id=None):
             """把這一趟用 `O_EXCL` 搶到的目的地檔收回來。**每一條失敗路徑都要走它。**
 
-            ⚠⚠ **搬移那一段要帶 `src_id`**（搬之前量的來源內容雜湊，見 `_file_digest`）。
+            ⚠⚠ **搬移那一段要帶 `src_id`**（搬之前量的來源內容身分，見 `_file_ident`）。
             「來源還在」只證明路徑上有一個檔，不證明它還保有原本那份內容：搬移其實已經完成、
             而來源路徑被別的程式重建（例如 Claude Code 又往同一場寫了一行）之後才中斷的話，
             目的地就是**原本那份的唯一完整副本**——只看 `exists()` 會把它刪掉。
-            內容對不上（或讀不到、搬之前也沒量到）就保留目的地，**當場印到 stderr**
+            判準是「來源**開頭**還是不是搬移前那份位元組」：只被追加過的來源仍然完整保有它
+            （目的地多餘、可以刪）；被改寫或重建的就保留目的地，**當場印到 stderr**
             （Ctrl+C 會直接往外拋，排到 `_skip` 的訊息來不及被印），並附上復原方法。
+            ⚠ 訊息要照實講目的地**是不是完整的**（`v62-fam` #4：7 位元組的半截檔被說成
+              「唯一完整副本」）。
 
-            ⚠⚠ **不可以只刪 0 位元組的。** `shutil.move` 跨磁碟會退化成「複製＋刪來源」，
+            ⚠⚠ **不可以只刪 0 位元組的。** 跨磁碟搬移是「複製＋刪來源」，
             複製寫到一半才失敗時目的地是**部分內容**，不是 0 位元組
             （`utf-fix-codex-r3` 實測 `target_size=7`）⇒ 只認 0 的話那個半截檔留下來，
             下一次執行永遠撞「目的地已有同名檔」，這一場再也搬不動。
             ⚠ 判準是**這個名字是我們這一趟建出來的**（`O_EXCL` 保證），
-              而且**來源還在**——兩者都成立時刪掉它是安全的。
+              而且**來源還保有那份內容**——兩者都成立時刪掉它是安全的。
 
             範圍限制 SCOPE-ARCHIVE-NO-RESTART-RECONCILE：本函式只涵蓋
             **這一趟行程內收得到的中斷**（例外與 `KeyboardInterrupt`）。
             硬終止／斷電之後留下的檔沒有跨次的恢復機制，會擋住那一場的後續封存
-            （來源仍安全）。詳見 planning/scope-limits.md。
+            （資料仍在；跨磁碟時來源可能以 `.archiving` 的名字留在原處旁）。
+            詳見 planning/scope-limits.md。
 
             ⚠⚠ **刪不掉要講出來，不可以吞掉。** 舊版 `except OSError: pass` ⇒
             輸出只講「fsync 失敗」，完全沒提「而且佔位檔清不掉」，
@@ -10488,9 +10799,13 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
                     # 還是搶名字時建的空佔位檔：它不可能是任何內容的副本，刪掉一定安全
                     tgt.unlink()
                     return True
-                if src_id is not None and (src_id is False or _file_digest(path) != src_id):
-                    _msg = (f"⚠ 來源的內容與搬移前不同（或讀不到），目的地保留——它可能是原本那份的"
-                            f"唯一完整副本：{tgt}。確認來源 {path} 的內容完整之後，刪掉目的地那個檔再重跑即可")
+                if src_id is not None and _file_digest(path, limit=src_id[0]) != src_id[1]:
+                    _full = _file_ident(tgt) == src_id
+                    _msg = ("⚠ 來源已不再保有搬移前那份內容（被改寫或重建），目的地保留——"
+                            + (f"它是那份內容的完整副本：{tgt}。確認不需要之後刪掉它再重跑即可"
+                               if _full else
+                               f"但它**可能不完整**（搬移途中被中斷）：{tgt}。請先比對它與來源 {path}，"
+                               f"確認之後刪掉目的地那個檔再重跑"))
                     print(f"  ! {_msg}", file=sys.stderr)
                     _skip(_msg)
                     return False
@@ -10500,6 +10815,28 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
                 _skip(f"⚠ 目的地的佔位檔清不掉（下一次會撞「已有同名檔」）："
                       f"{type(e2).__name__}: {e2}")
                 return False
+
+        def _record_cut(exc, side_note="", side_to=""):
+            """主檔**已經在目的地**、這一場卻被中斷：記一行 `moved`（附註中斷與兩處位置），當場印復原說明。
+
+            ⚠⚠ 舊版這裡只接 `Exception`：主檔搬完之後（或子代理目錄搬到一半）按 Ctrl+C ⇒
+              `_archived.jsonl` 停在 `pending`、stderr 一個字都沒有，子代理目錄一半在來源、一半在封存目錄
+              （`v62-fam` #3 實測）——違反本迴圈自己的規矩「主檔一離開來源目錄，下一件事就必須是記帳」。"""
+            _sn = side_note or ("子代理目錄未處理" if side.is_dir() else "")
+            try:
+                _journal({"state": "moved", "moved_at": datetime.now(timezone.utc).isoformat(),
+                          "from": src_abs, "to": str(target),
+                          "cwd": getattr(s, "cwd", ""), "account": acc, "project": proj,
+                          "reason": "command_only", "pages_removed": n_pages,
+                          "sidechain": f"中斷（{type(exc).__name__}）" + (f"：{_sn}" if _sn else ""),
+                          "sidechain_from": str(side) if (side_to or side.is_dir()) else "",
+                          "sidechain_to": side_to})
+            except BaseException:
+                pass                  # 記帳也寫不進去：pending 那一行仍在，下面這行訊息是唯一的線索
+            _two = (f"；子代理目錄可能只搬了一部分，兩處都要看：{side} 與 {side_target}"
+                    if side_to else (f"；子代理目錄還在原處：{side}" if side.is_dir() else ""))
+            print(f"  ! ⚠ 封存中斷：{path.name} 已經搬到 {target}{_two}。"
+                  f"紀錄在 {ARCHIVE_MANIFEST}（含原始絕對路徑，可依它還原）", file=sys.stderr)
 
         # ⚠ `os.open` 與 `os.close` 要包在同一個受保護區：`close` 也可能丟例外，
         #   而那時檔名已經被我們搶走了（`utf-fix-codex-r3` 指出）。
@@ -10530,11 +10867,11 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             raise
 
         # ⚠⚠ **搬之前先記「打算搬」。** 這一行落磁之後，就算下一步整個行程被砍，
-        # 還原的人也知道「有一場正在從 A 搬到 B」——去 A 或 B 找得到它。
+        # 還原的人也知道「有一場正在從 A 搬到 B」——去 A 或 B 找得到它（跨磁碟時還有 staging）。
         # 這是兩段式的第一段；成功之後會再寫一行 `state: "moved"`。
         try:
             _journal({"state": "pending", "moved_at": datetime.now(timezone.utc).isoformat(),
-                      "from": src_abs, "to": str(target),
+                      "from": src_abs, "to": str(target), "staging": str(staging),
                       "cwd": getattr(s, "cwd", ""), "account": acc, "project": proj,
                       "reason": "command_only"})
         except OSError as e:
@@ -10566,49 +10903,48 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             continue
         # ⚠⚠ 「絕不覆蓋」是上面那道 `O_CREAT|O_EXCL`——**原子的**，不是 `exists()` 之後再搬。
         # 兩者之間有窗：另一個 viewer（或任何程序）在中間建出同名檔時，
-        # `shutil.move` 跨磁碟會退化成 copy ⇒ **覆蓋掉先前封存的紀錄**
-        # （`utf-fix-codex` Medium 實測）。搶到名字的只會有一個，搶輸的拿 `FileExistsError`。
-        # 搬之前的來源內容雜湊：中斷後的清理靠它判斷能不能刪目的地。讀不到就記 False
-        # ＝「沒辦法確認」⇒ 清理一律保留目的地（寧可留一個要人工處理的檔，也不冒刪掉唯一副本的險）。
-        # ⚠ 雜湊也要在受保護區裡：這時名字已經搶到、pending 也寫了，在這裡按 Ctrl+C 會留下
+        # 跨磁碟的複製會**覆蓋掉先前封存的紀錄**（`utf-fix-codex` Medium 實測）。
+        # 搶到名字的只會有一個，搶輸的拿 `FileExistsError`。
+        # 搬之前的來源內容身分：①要等於判定時那一份（否則這段時間又被寫過，不搬——頁面已經刪了，
+        # 來源還在，這一次建置就會把它重產回來）；②中斷後的清理靠它判斷能不能刪目的地。
+        # ⚠ 量身分也要在受保護區裡：這時名字已經搶到、pending 也寫了，在這裡按 Ctrl+C 會留下
         #   擋住之後每一次執行的空佔位檔（目的地還沒被寫過，收掉一定安全）。
         try:
-            src_id = _file_digest(path) or False
+            src_id = _file_ident(path)
         except BaseException:
             _unreserve()
             raise
-        try:
-            # ⚠⚠ **一定要用 `shutil.move`，不可以用 `Path.replace()`。**
-            # 後者是 `os.replace`，**跨磁碟機會直接丟 OSError**（Windows WinError 17）——
-            # 而這個功能的典型用法正好就是跨磁碟機：來源在 `C:\Users\…\.claude\projects`，
-            # 使用者指定的封存目錄多半在別的磁碟機。
-            # 實測：第一版用 `replace()`，92 場**全部**失敗，而失敗被 `_skip()` 收成一行
-            # 「搬移失敗：OSError：92」——**跑起來像是「沒有東西需要搬」**。
-            # `shutil.move` 跨裝置時會退化成複製＋刪除，而且目錄也吃得下。
-            shutil.move(str(path), str(target))
-        except KeyboardInterrupt:
-            # ⚠⚠ 跨磁碟複製到一半被 Ctrl+C：目的地是**部分內容**、來源還在。
-            # 不收的話那個半截檔會擋住之後每一次執行
-            # （`utf-fix-codex-r4` 實測 `PARTIAL_INTERRUPT` ＋ `PARTIAL_INTERRUPT_RETRY`）。
-            # ⚠ `_unreserve()` 會判「來源還在、而且還是搬之前那一個才刪」，
-            #   所以搬成功之後才中斷（含來源路徑被重建）不會誤刪。
-            _unreserve(src_id=src_id)
-            raise
-        except Exception as e:
-            # ⚠ 把實際訊息帶出來。只印例外類別名的話，「跨磁碟機」和「權限不足」
-            # 長得一模一樣，而它們的處置完全不同。
-            # ⚠⚠ **佔位檔要收掉**：上面用 `O_EXCL` 搶到的那個名字是我們的，
-            # 搬失敗還留著的話，下一次執行會撞到「目的地已有同名檔」而永遠搬不動。
-            # ⚠ 跨磁碟時它可能是**寫到一半的部分內容**，不是 0 位元組——見 `_unreserve()`。
-            _unreserve(src_id=src_id)
-            try:
-                _journal({"state": "failed", "moved_at": datetime.now(timezone.utc).isoformat(),
-                          "from": src_abs, "to": str(target),
-                          "error": f"{type(e).__name__}: {e}"})
-            except OSError:
-                pass          # 記帳也壞了：上面已經把佔位檔收回，來源仍在原地
-            _skip(f"搬移失敗：{type(e).__name__}: {e}")
+        if src_id != cls_id:
+            _unreserve()
+            _skip("判定之後來源又被寫過（可能還開著），這次不搬")
             continue
+        # 範圍限制 SCOPE-ARCHIVE-RECHECK-TO-MOVE-WINDOW：這道比對涵蓋到「量完 `src_id` 的那一刻」為止；
+        # 量完到搬移之間寫進來的內容（含真的對話）不在涵蓋範圍內，會跟著整份搬走。詳見 planning/scope-limits.md。
+        try:
+            _archive_move(path, target, src_id, staging)
+        except BaseException as e:
+            # ⚠⚠ 搬移**可能已經落地**才收到中斷（`os.replace` 回來之後的下一個 bytecode 就是 Ctrl+C）：
+            # 主檔已經在目的地，這一筆一定要記帳並講出來，不可以當成「沒搬」去收佔位檔。
+            if not _move_landed(path, target, staging, src_id):
+                # ⚠ `_unreserve()` 會判「來源開頭還是搬之前那份才刪」，
+                #   所以搬成功之後才中斷（含來源路徑被重建）不會誤刪。
+                _unreserve(src_id=src_id)
+                if not isinstance(e, Exception):
+                    raise
+                # ⚠ 把實際訊息帶出來。只印例外類別名的話，「跨磁碟機」和「權限不足」
+                # 長得一模一樣，而它們的處置完全不同。
+                try:
+                    _journal({"state": "failed", "moved_at": datetime.now(timezone.utc).isoformat(),
+                              "from": src_abs, "to": str(target),
+                              "error": f"{type(e).__name__}: {e}"})
+                except OSError:
+                    pass          # 記帳也壞了：上面已經把佔位檔收回，來源仍在原地
+                _skip(f"搬移失敗：{type(e).__name__}: {e}")
+                continue
+            if not isinstance(e, Exception):
+                _record_cut(e)
+                raise
+            # 落地之後才冒出來的一般例外：搬移本身已經完成，照成功記帳（下面那段）。
 
         # ⚠⚠⚠ **主檔一離開來源目錄，下一件事就必須是「記帳」。**
         # 舊版把子代理目錄的搬移放在同一個 `try` 裡、失敗就 `continue` ⇒
@@ -10618,40 +10954,47 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         # （`utf-fam` High#1 實測：來源主檔不在、封存目錄有、manifest 0 行）。
         # ⇒ 記帳與 `moved` 都綁在**主檔搬移成功**這一件事上，
         #   子代理目錄的成敗只是這一筆的附註，不可以讓它推翻記帳。
-        side_note, side_to = "", ""
-        if side.is_dir():
-            side_target = dest / target.stem
-            # ⚠ 子代理目錄也要有「絕不覆蓋」閘：直接 `shutil.move` 到已存在的目錄
-            # 會把它塞成**巢狀子目錄**（`utf-fam` Low#2）。
-            # ⚠⚠ 和主檔同一個理由改成原子的：`os.mkdir` 在目的地已存在時丟
-            # `FileExistsError`，中間沒有窗。搶到之後**逐一搬子項**進去
-            # ——`shutil.move` 到一個「已經存在的目錄」正是會巢狀的那個動作。
-            try:
-                os.mkdir(str(side_target))
-            except FileExistsError:
-                side_note = "子代理目錄未搬：目的地已存在"
-                _skip("子代理目錄未搬（目的地已存在）")
-            except OSError as e:
-                side_note = f"子代理目錄未搬：{type(e).__name__}: {e}"
-                _skip(f"子代理目錄未搬：{type(e).__name__}")
-            else:
+        # ⚠⚠ 中斷（Ctrl+C）也一樣：整段包在 `BaseException` 裡，記一行 `moved`（附註中斷）再拋出去。
+        side_note, side_to, _logged = "", "", False
+        try:
+            if side.is_dir():
+                # ⚠ 子代理目錄也要有「絕不覆蓋」閘：直接 `shutil.move` 到已存在的目錄
+                # 會把它塞成**巢狀子目錄**（`utf-fam` Low#2）。
+                # ⚠⚠ 和主檔同一個理由改成原子的：`os.mkdir` 在目的地已存在時丟
+                # `FileExistsError`，中間沒有窗。搶到之後**逐一搬子項**進去
+                # ——`shutil.move` 到一個「已經存在的目錄」正是會巢狀的那個動作。
                 try:
-                    for child in sorted(side.iterdir()):
-                        shutil.move(str(child), str(side_target / child.name))
-                    side.rmdir()
-                    side_note, side_to = "子代理目錄已搬", str(side_target)
-                except Exception as e:
-                    # ⚠ 半搬的狀態要講出來，不可以只說「未搬」——那會讓還原的人
-                    # 去原目錄找一個已經少了幾個檔的目錄。
-                    side_note = f"子代理目錄只搬了一部分：{type(e).__name__}: {e}"
+                    os.mkdir(str(side_target))
+                except FileExistsError:
+                    side_note = "子代理目錄未搬：目的地已存在"
+                    _skip("子代理目錄未搬（目的地已存在）")
+                except OSError as e:
+                    side_note = f"子代理目錄未搬：{type(e).__name__}: {e}"
+                    _skip(f"子代理目錄未搬：{type(e).__name__}")
+                else:
                     side_to = str(side_target)
-                    _skip(f"子代理目錄只搬了一部分：{type(e).__name__}")
-        # 兩段式的第二段：這一行落磁之後，這一筆才算完成。
-        _journal({"state": "moved", "moved_at": datetime.now(timezone.utc).isoformat(),
-                  "from": src_abs, "to": str(target),
-                  "cwd": getattr(s, "cwd", ""), "account": acc, "project": proj,
-                  "reason": "command_only", "pages_removed": n_pages,
-                  "sidechain": side_note, "sidechain_to": side_to})
+                    side_note = "子代理目錄搬移途中"       # 中斷時這一句會進紀錄
+                    try:
+                        for child in sorted(side.iterdir()):
+                            shutil.move(str(child), str(side_target / child.name))
+                        side.rmdir()
+                        side_note = "子代理目錄已搬"
+                    except Exception as e:
+                        # ⚠ 半搬的狀態要講出來，不可以只說「未搬」——那會讓還原的人
+                        # 去原目錄找一個已經少了幾個檔的目錄。
+                        side_note = f"子代理目錄只搬了一部分：{type(e).__name__}: {e}"
+                        _skip(f"子代理目錄只搬了一部分：{type(e).__name__}")
+            # 兩段式的第二段：這一行落磁之後，這一筆才算完成。
+            _journal({"state": "moved", "moved_at": datetime.now(timezone.utc).isoformat(),
+                      "from": src_abs, "to": str(target),
+                      "cwd": getattr(s, "cwd", ""), "account": acc, "project": proj,
+                      "reason": "command_only", "pages_removed": n_pages,
+                      "sidechain": side_note, "sidechain_to": side_to})
+            _logged = True
+        except BaseException as e:
+            if not _logged:
+                _record_cut(e, side_note, side_to)
+            raise
         moved.append((path, target))
 
 
@@ -11247,6 +11590,9 @@ def main():
     out = Path(args.out)
     sess_dir = out / "sessions"
     sess_dir.mkdir(parents=True, exist_ok=True)
+    _n_tmp = _sweep_stray_tmp(out)
+    if _n_tmp:
+        print(f"  （清掉上一次建置中斷留下的暫存檔 {_n_tmp} 個）")
 
     want_html = args.format in ("html", "both")
     want_md = args.format in ("md", "both")
@@ -11278,12 +11624,24 @@ def main():
             if kind != SOURCE_CLAUDE:
                 continue
             try:
+                _st0 = sf.stat()
                 _s = load_session(sf, proj, acc, SOURCE_CLAUDE)
                 analyze(_s)
             except Exception as e:
                 print(f"  ! 封存判定跳過（讀不起來）{sf.name}: {e}", file=sys.stderr)
                 continue
-            _cand.append((kind, acc, proj, sf, _s))
+            # 判定時那份位元組的內容身分（搬之前會再量一次，對不上就不搬；見 `archive_command_only`）。
+            # 讀之前與量完之後的大小／mtime 不同 ＝ 判定期間就被寫過 ⇒ 傳 None（不搬）。
+            _cls = None
+            if session_content_kind(_s) == "command_only":
+                _cls = _file_ident(sf)
+                try:
+                    _st1 = sf.stat()
+                except OSError:
+                    _st1 = None
+                if _st1 is None or (_st1.st_size, _st1.st_mtime_ns) != (_st0.st_size, _st0.st_mtime_ns):
+                    _cls = None
+            _cand.append((kind, acc, proj, sf, _s, _cls))
         _moved, _skipped = archive_command_only(
             _cand, Path(args.archive_command_only), _roots, out)
         _gone = {p for p, _ in _moved}
@@ -11368,16 +11726,14 @@ def main():
             #     （列還在）與 `::test_zero_scan_keeps_cache_report_links`（連結還在）。
             zero_rows = _index_rows(new_entries, args.include_empty)
             zero_cache = build_cache_report(zero_rows, acct_health=acct_health)
-            (out / "index.html").write_text(
-                render_index_html(zero_rows,
-                                  len({r.get("account", "") for r in zero_rows}) > 1,
-                                  zero_cache["has_data"],
-                                  build_codex_survival(zero_rows)["has_data"]),
-                encoding="utf-8")
+            _write_atomic(out / "index.html",
+                          render_index_html(zero_rows,
+                                            len({r.get("account", "") for r in zero_rows}) > 1,
+                                            zero_cache["has_data"],
+                                            build_codex_survival(zero_rows)["has_data"]))
             bx_fallback, _ = prune_gone_sources(load_manifest_paths(out), scanned_roots)
-            (sess_dir / "bookmarks.html").write_text(
-                render_bookmarks_html([], bx_fallback, sess_dir), encoding="utf-8")
-            (sess_dir / "settings.html").write_text(render_settings_html(), encoding="utf-8")
+            _write_atomic(sess_dir / "bookmarks.html", render_bookmarks_html([], bx_fallback, sess_dir))
+            _write_atomic(sess_dir / "settings.html", render_settings_html())
         return
     if n_raw > len(files):
         print(f"  （去重 {n_raw - len(files)} 個跨來源重複的 Claude session）")
@@ -11545,12 +11901,16 @@ def main():
                 staged.append((_t, sess_dir / s.out_md))
                 _t.write_text(render_session_md(s), encoding="utf-8")
             row = session_to_row(s)
-        except Exception as e:
+        except BaseException as e:
+            # ⚠ Ctrl+C 落在寫暫存檔途中也要收：只接 `Exception` 的話半截的 `*.html.tmp` 留在原地，
+            #   而之後的建置會沿用這一場、不會再寫到它（`v62-fam` #7 實測 `('old', 67233, False)`）。
             for _t, _ in staged:
                 try:
                     _t.unlink(missing_ok=True)
                 except OSError:
                     pass
+            if not isinstance(e, Exception):
+                raise
             _broken("渲染失敗", e)
             continue
         # ⚠⚠ **換上是兩個動作，不是一個交易。** HTML 換上了、MD 才換不上（Windows 上目標檔被開著或
@@ -11563,12 +11923,14 @@ def main():
             for _t, _final in staged:
                 os.replace(_t, _final)
                 published.append(_final)
-        except OSError as e:
+        except BaseException as e:
             for _t, _ in staged:
                 try:
                     _t.unlink(missing_ok=True)
                 except OSError:
                     pass
+            if not isinstance(e, OSError):
+                raise                       # Ctrl+C：暫存檔已收，manifest 的情形見 SCOPE-INTERRUPTED-BUILD-MANIFEST
             if not published:
                 _broken("寫出失敗", e)
                 continue
@@ -11612,7 +11974,7 @@ def main():
             dest = out / r["mem_href"]
             dest.parent.mkdir(parents=True, exist_ok=True)
             idx_href = "../" * (len(PureWindowsPath(r["mem_href"]).parts) - 1) + "index.html"
-            dest.write_text(render_memory_html(mem, r["proj"], munged, idx_href), encoding="utf-8")
+            _write_atomic(dest, render_memory_html(mem, r["proj"], munged, idx_href))
             n_mem += 1
         # 清掉已不存在專案的孤兒 memory 頁（縮小範圍模式下不清，避免誤刪未處理範圍）
         mem_root = out / "memory"
@@ -11629,11 +11991,11 @@ def main():
     cache_data = build_cache_report(rows, acct_health=acct_health)
     has_report = cache_data["has_data"]
     if has_report and want_html:
-        (out / "cache-report.html").write_text(render_cache_report_html(cache_data), encoding="utf-8")
-        (out / "cache-hypotheses.html").write_text(render_cache_hypotheses_html(cache_data), encoding="utf-8")
+        _write_atomic(out / "cache-report.html", render_cache_report_html(cache_data))
+        _write_atomic(out / "cache-hypotheses.html", render_cache_hypotheses_html(cache_data))
     if has_report and want_md:
-        (out / "cache-report.md").write_text(render_cache_report_md(cache_data), encoding="utf-8")
-        (out / "cache-hypotheses.md").write_text(render_cache_hypotheses_md(cache_data), encoding="utf-8")
+        _write_atomic(out / "cache-report.md", render_cache_report_md(cache_data))
+        _write_atomic(out / "cache-hypotheses.md", render_cache_hypotheses_md(cache_data))
     if not has_report:                       # 沒有可分析資料：清掉舊報告，避免索引指向過期檔
         for stale in (out / "cache-report.html", out / "cache-report.md",
                       out / "cache-hypotheses.html", out / "cache-hypotheses.md"):
@@ -11647,9 +12009,9 @@ def main():
     codex_data["claude_report"] = has_report
     has_codex_report = codex_data["has_data"]
     if has_codex_report and want_html:
-        (out / "cache-codex.html").write_text(render_codex_survival_html(codex_data), encoding="utf-8")
+        _write_atomic(out / "cache-codex.html", render_codex_survival_html(codex_data))
     if has_codex_report and want_md:
-        (out / "cache-codex.md").write_text(render_codex_survival_md(codex_data), encoding="utf-8")
+        _write_atomic(out / "cache-codex.md", render_codex_survival_md(codex_data))
     if not has_codex_report:
         for stale in (out / "cache-codex.html", out / "cache-codex.md"):
             try:
@@ -11658,7 +12020,7 @@ def main():
                 pass
 
     if want_html:
-        (out / "index.html").write_text(render_index_html(rows, show_account, has_report, has_codex_report), encoding="utf-8")
+        _write_atomic(out / "index.html", render_index_html(rows, show_account, has_report, has_codex_report))
         # 書籤管理頁與設定頁（第 3 期）。⚠ 放 `out/sessions/` **底下**，不是 `out/` 根：
         # 和寫入者（session 頁）同一棵子樹，把「目錄層級」這個變數整個消掉。
         # ⚠ 兩份和 index.html 一樣**每次都無條件重產**，不受 manifest 的版本閘管。
@@ -11670,9 +12032,8 @@ def main():
         #    這裡再被烤回反查表，同一個缺陷換一條路徑進來（跨模型 Medium#5）。
         #    守它的是 `test_bookmark_deleted_source_pruned`。
         bx_fallback, _ = prune_gone_sources(load_manifest_paths(out), scanned_roots)
-        (sess_dir / "bookmarks.html").write_text(
-            render_bookmarks_html(rows, bx_fallback, sess_dir), encoding="utf-8")
-        (sess_dir / "settings.html").write_text(render_settings_html(), encoding="utf-8")
+        _write_atomic(sess_dir / "bookmarks.html", render_bookmarks_html(rows, bx_fallback, sess_dir))
+        _write_atomic(sess_dir / "settings.html", render_settings_html())
     elif want_md:
         # ⚠ 純 md 建置**不重產**這兩頁，留著就是一份**過期的 `BX_SESS`**：
         #   之後某場的檔名變了（專案改名）而該次是純 md 全量建置時，孤兒清理會刪掉舊
@@ -11684,7 +12045,7 @@ def main():
             except OSError:
                 pass
     if want_md:
-        (out / "index.md").write_text(render_index_md(rows, show_account, has_report, has_codex_report), encoding="utf-8")
+        _write_atomic(out / "index.md", render_index_md(rows, show_account, has_report, has_codex_report))
 
     # 清掉已不存在 session 的孤兒輸出檔（縮小範圍模式下不清，以免誤刪未處理的帳號/專案）
     removed = 0

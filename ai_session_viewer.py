@@ -236,7 +236,14 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #    沿用的 row 帶著舊檔名，不重建就不會改名。舊檔名由下一次完整建置的孤兒清理刪掉。Claude 的檔名不變。
 # 68 → 69（2026-10-21）：MD 的壓縮摘要不再畫成「👤 You」，改成 `### 📋 壓縮摘要 · 時刻 · 手動／自動＋壓縮量 {#tN}`
 #    （`render_turn_md`；`_TURN_HEAD_RE` 認得它，`--search` 照樣切成一則）。HTML 不變。
-RENDERER_VERSION = 69
+# 69 → 70（2026-10-21）：① AI 的提問（`AskUserQuestion`）畫成不收合的卡片：每題的標籤、問題、選項（標出選了哪個）、
+#    「👤 你：…」（自己打的標出來）；原本那個摺疊框收在卡片底下（`ask_view`）。卡片佔原本工具框那一格 ⇒ 兩層錨點
+#    都應逐位元不變。HTML 與 MD 都變。② MultiEdit 的 `edits` 裡不是物件的那一筆（或 `edits` 不是陣列）照原值標出來，
+#    原本整場渲染失敗。
+# 70 → 71（2026-10-21）：提問卡片的判讀——複選只認開頭那一段選項、其餘整段是自己打的；分不出是哪一個選項（重疊的選項、
+#    同名的選項、同名的題目）照原文畫、不標；完整版 MD 的卡片照 `splitlines()` 逐行加引用符號（回答裡的 `\r` 這類斷行）。
+#    v70 的頁面在這幾種情形畫錯，升版讓它們重建。
+RENDERER_VERSION = 71
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -4060,8 +4067,24 @@ def usage_int(usage, *keys):
     return 0
 
 
+class ToolResult(tuple):
+    """`tmap` 的值：`(content, is_error)`，另帶 `structured`＝那一則 user 事件的 `toolUseResult`（沒有就是 None）。
+
+    ⚠ 仍然是兩格的 tuple：既有的 `content, is_err = tmap[tid]` 一處都不用改，手寫的 `(content, is_err)` 也照樣能用
+    （讀 `structured` 一律走 `getattr(…, "structured", None)`）。
+    ⚠ `toolUseResult` 是 Claude Code 自己記的結構化結果，不是模型讀到的那段文字——要畫「工具回了什麼」照舊讀 `content`。"""
+
+    def __new__(cls, content, is_err, structured=None):
+        self = super().__new__(cls, (content, is_err))
+        self.structured = structured
+        return self
+
+
 def build_tool_result_map(events):
-    """tool_use_id -> (raw_content, is_error)；保留原始內容，渲染時才處理文字/圖片。"""
+    """tool_use_id -> `ToolResult`；保留原始內容，渲染時才處理文字/圖片。
+
+    `toolUseResult` 掛在整則 user 事件上、不是掛在某一個 `tool_result` 上 ⇒ 只在那一則**恰好一個** `tool_result` 時
+    才帶過去（一則裡有好幾個的話，分不出它是誰的）。"""
     tmap = {}
     for e in events:
         if e.get("type") != "user":
@@ -4069,11 +4092,13 @@ def build_tool_result_map(events):
         content = (e.get("message") or {}).get("content")
         if not isinstance(content, list):
             continue
-        for b in content:
-            if isinstance(b, dict) and b.get("type") == "tool_result":
-                tid = b.get("tool_use_id")
-                if tid:
-                    tmap[tid] = (b.get("content"), bool(b.get("is_error")))
+        trs = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+        tur = e.get("toolUseResult")
+        structured = tur if (isinstance(tur, dict) and len(trs) == 1) else None
+        for b in trs:
+            tid = b.get("tool_use_id")
+            if tid:
+                tmap[tid] = ToolResult(b.get("content"), bool(b.get("is_error")), structured)
     return tmap
 
 
@@ -4239,6 +4264,228 @@ def render_result_html(tmap, tid):
     return f'<div class="{cls}"><div class="lbl">{lbl}</div>{"".join(parts)}</div>'
 
 
+# =========================================================================
+# AI 的提問（`AskUserQuestion`）：畫成不收合的卡片，佔原本工具框那一格
+# =========================================================================
+# 三種輸出（HTML、MD、給 AI 讀的精簡版）都從 `ask_view()` 拿同一份判斷——選了哪個、哪些是自己打的——
+# 各自只管排版。各判一次的話，同一個回答在三份輸出裡會講成不同的話。
+ASK_TOOLS = frozenset(("AskUserQuestion",))
+_ASK_Q_KEYS = frozenset(("question", "header", "options", "multiSelect"))
+_ASK_OPT_KEYS = frozenset(("label", "description", "preview"))
+_ASK_ANN_KEYS = frozenset(("notes", "preview"))
+ASK_TYPED = "✍ 自己打的"
+ASK_UNRESOLVED = "（分不出是哪一個選項，沒有標）"
+_ASK_MAX_TOKENS = 64          # 複選的回答切成這麼多段以上就不判（實測一個回答最多幾段）
+
+
+def _ask_segs(toks, labels):
+    """`segs[i]`＝把 `toks[:i]` 整段切成選項的切法（每一種是選項的 tuple）。只需要分得出 0、1、2 種以上，
+    所以每一格最多留兩種。"""
+    segs = [set() for _ in range(len(toks) + 1)]
+    segs[0].add(())
+    for i in range(1, len(toks) + 1):
+        for j in range(i):
+            cand = ", ".join(toks[j:i])
+            if segs[j] and cand in labels:
+                for s in segs[j]:
+                    segs[i].add(s + (cand,))
+                    if len(segs[i]) > 1:
+                        break
+            if len(segs[i]) > 1:
+                break
+    return segs
+
+
+def _ask_pick(ans, labels, multi):
+    """一題的回答 ⇒ (選了的選項, 自己打的字或 None)；**判不出來回 None**（呼叫端照原文畫、一個選項都不標）。
+
+    - 單選：整個回答等於某個選項 ⇒ 選了它；否則整句都是自己打的（開頭剛好和某個選項一樣也一樣）。
+    - 複選：Claude Code 把選了的選項用 `", "` 接起來、自己打的整段接在最後。所以只認**開頭**那一段：
+      能整段切成選項的最長開頭就是選了的，其餘整段是自己打的——自己打的那一段裡出現選項的名字也不認回來。
+      選項本身也可以帶 `", "` ⇒ 那一段開頭有不只一種切法（例：選項 `A`、`B`、`A, B`，回答 `A, B`）就判不出來。
+    - 陣列（少數舊資料）：每一格各自判。
+    - 回答用到的選項有同名的兩個以上 ⇒ 判不出是哪一個。
+    ⚠ 自己打的字剛好和某個選項（或選項的串接）一模一樣時，資料裡分不出來，算選了那些選項
+      （範圍限制 SCOPE-ASK-TYPED-EQUALS-LABEL）。"""
+    dup = {lb for lb in labels if labels.count(lb) > 1}
+    if isinstance(ans, list):
+        if any(a in dup for a in ans):
+            return None
+        typed = [a for a in ans if a not in labels]
+        return [a for a in ans if a in labels], (", ".join(typed) if typed else None)
+    if not multi:
+        if ans in dup:
+            return None
+        return ([ans], None) if ans in labels else ([], ans)
+    toks = ans.split(", ")
+    if len(toks) > _ASK_MAX_TOKENS:
+        return None
+    segs = _ask_segs(toks, set(labels))
+    k = max(i for i in range(len(toks) + 1) if segs[i])
+    if len(segs[k]) > 1:
+        return None
+    picked = list(next(iter(segs[k])))
+    if any(p in dup for p in picked):
+        return None
+    rest = toks[k:]
+    return picked, (", ".join(rest) if rest else None)
+
+
+def ask_view(block, tmap):
+    """一次 `AskUserQuestion` ⇒ 卡片要畫的東西；**輸入的形狀認不得就回 None**，呼叫端照一般工具畫（不猜）。
+
+    回傳 `{"qs": [每一題], "status": …, "res": 工具回傳的原文}`；每一題是
+    `{question, header, multi, opts: [{label, description, preview, sel}], answered, picked, typed, unresolved, notes,
+    seen_preview}`（`unresolved`：判不出選了哪個時的回答原文，見 `_ask_pick`）。
+
+    `status`：
+    - `"answered"`——有結構化的回答（`toolUseResult.answers`）：每一題照它標選了哪個、哪些是自己打的；
+      那一題在 `answers` 裡沒有就是「沒有回答」（實測有：逾時沒回應、只回了一部分）。
+    - `"none"`——沒有結果：中斷或未完成。
+    - `"error"`——工具回報錯誤（實測幾乎都是使用者拒絕回答）。不剖析那段文字，原樣畫出來。
+    - `"raw"`——有結果、但沒有認得的結構化回答（舊資料、形狀變了、回答對不上任何一題、
+      兩題的題目一模一樣——回答以題目原文當鍵，分不出是哪一題的）：題目照畫、不標選了哪個，工具回傳的原文原樣畫出來。
+
+    ⚠ 回答**以結構化欄位為準，不剖析結果文字**：那段英文至少有三種寫法，而且會隨版本改。
+    ⚠ 題目與選項取**呼叫的輸入**（AI 問了什麼）；`toolUseResult.questions` 是給使用者看的那一份，實測會少欄位。
+    ⚠ `annotations` 的 `preview` 實測都等於選了的那個選項自己的預覽 ⇒ 一樣就不重畫；`notes` 是使用者打的字，一律畫。"""
+    inp = block.get("input")
+    if not (isinstance(inp, dict) and inp.keys() == {"questions"}):
+        return None
+    qs = inp["questions"]
+    if not (isinstance(qs, list) and qs):
+        return None
+    out = []
+    for q in qs:
+        if not (isinstance(q, dict) and q.keys() <= _ASK_Q_KEYS and isinstance(q.get("question"), str)):
+            return None
+        hdr, multi, opts = q.get("header", ""), q.get("multiSelect", False), q.get("options", [])
+        if not (isinstance(hdr, str) and isinstance(multi, bool) and isinstance(opts, list)):
+            return None
+        ol = []
+        for o in opts:
+            if not (isinstance(o, dict) and o.keys() <= _ASK_OPT_KEYS and isinstance(o.get("label"), str)
+                    and isinstance(o.get("description", ""), str) and isinstance(o.get("preview", ""), str)):
+                return None
+            ol.append({"label": o["label"], "description": o.get("description", ""),
+                       "preview": o.get("preview", ""), "sel": False})
+        out.append({"question": q["question"], "header": hdr, "multi": multi, "opts": ol, "answered": False,
+                    "picked": [], "typed": None, "unresolved": None, "notes": "", "seen_preview": ""})
+    tid = block.get("id")
+    if tid not in tmap:
+        return {"qs": out, "status": "none", "res": ""}
+    entry = tmap[tid]
+    content, is_err = entry
+    res = normalize_result(content)
+    if is_err:
+        return {"qs": out, "status": "error", "res": res}
+    st = getattr(entry, "structured", None)
+    answers = st.get("answers") if isinstance(st, dict) else None
+    anns = (st.get("annotations") if isinstance(st, dict) else None) or {}
+    texts = {q["question"] for q in out}
+    ok = (len(texts) == len(out) and isinstance(answers, dict) and isinstance(anns, dict)
+          and all(k in texts and (isinstance(a, str) or (isinstance(a, list) and all(isinstance(x, str) for x in a)))
+                  for k, a in answers.items())
+          and all(k in texts and isinstance(a, dict) and a.keys() <= _ASK_ANN_KEYS
+                  and all(isinstance(x, str) for x in a.values()) for k, a in anns.items()))
+    if not ok:
+        return {"qs": out, "status": "raw", "res": res}
+    for q in out:
+        labels = [o["label"] for o in q["opts"]]
+        if q["question"] in answers:
+            ans = answers[q["question"]]
+            got = _ask_pick(ans, labels, q["multi"])
+            if got is None:
+                q["unresolved"] = ans if isinstance(ans, str) else ", ".join(ans)
+            else:
+                q["picked"], q["typed"] = got
+            q["answered"] = True
+        for o in q["opts"]:
+            o["sel"] = o["label"] in q["picked"]
+        a = anns.get(q["question"]) or {}
+        q["notes"] = a.get("notes", "")
+        pv = a.get("preview", "")
+        if pv and not any(o["sel"] and o["preview"] == pv for o in q["opts"]):
+            q["seen_preview"] = pv
+    return {"qs": out, "status": "answered", "res": res}
+
+
+def ask_marks(q):
+    """選項前面的記號 (選了, 沒選)：單選 ●／○、複選 ☑／☐。"""
+    return ("☑", "☐") if q["multi"] else ("●", "○")
+
+
+def ask_answer_text(q):
+    """一題的回答寫成一行字（MD 與精簡版共用；HTML 照同一個順序排）：選了的選項以「、」接起來，
+    自己打的接在後面、前面標 `ASK_TYPED`；判不出選了哪個的照原文、後面接 `ASK_UNRESOLVED`。"""
+    if not q["answered"]:
+        return "（沒有回答）"
+    if q["unresolved"] is not None:
+        return q["unresolved"] + ASK_UNRESOLVED
+    bits = ["、".join(q["picked"])] if q["picked"] else []
+    if q["typed"] is not None:
+        bits.append(f"（{ASK_TYPED}）" + (q["typed"] if q["typed"].strip() else "（空白）"))
+    return "＋".join(bits) or "（沒有回答）"
+
+
+# 沒有逐題回答時，卡片最底下那一行「👤 你」講什麼（三種輸出共用）
+ASK_STATUS_TEXT = {"none": "（沒有結果：中斷或未完成）", "error": "（沒有作答：工具回報錯誤）",
+                   "raw": "（沒有認得的結構化回答，以下是工具回傳的原文）"}
+
+
+def ask_shows_res(view):
+    """卡片上要不要攤開工具回傳的原文：錯誤、沒有結構化回答、或有題目沒有回答（逾時之類，原因寫在那段原文裡）。"""
+    return (view["status"] in ("error", "raw")
+            or (view["status"] == "answered" and any(not q["answered"] for q in view["qs"])))
+
+
+def render_ask_html(view, raw_box):
+    """提問卡片（HTML）。`raw_box`＝照一般工具畫的那一個摺疊框，收在卡片最底下（輸入與結果的原文都在裡面）。"""
+    qs, st = view["qs"], view["status"]
+    parts = [f'<div class="askhead">❓ 提問{f" · {len(qs)} 題" if len(qs) > 1 else ""}</div>']
+    for q in qs:
+        on, off = ask_marks(q)
+        chips = ((f'<span class="askchip">{esc(q["header"])}</span>' if q["header"] else "")
+                 + ('<span class="askchip">可複選</span>' if q["multi"] else ""))
+        lis = []
+        for o in q["opts"]:
+            desc = f'<span class="askdesc"> — {esc(o["description"])}</span>' if o["description"] else ""
+            prev = (f'<details class="askprev"><summary>預覽</summary>{_pre_text(o["preview"])}</details>'
+                    if o["preview"] else "")
+            lis.append(f'<li class="askopt{" sel" if o["sel"] else ""}">'
+                       f'<span class="askmark">{on if o["sel"] else off}</span>'
+                       f'<span class="asklabel">{esc(o["label"])}</span>{desc}{prev}</li>')
+        ans = ""
+        if st == "answered":
+            if not q["answered"]:
+                val = '<span class="askno">（沒有回答）</span>'
+            elif q["unresolved"] is not None:
+                val = f'<span class="askv">{esc(q["unresolved"])}</span><span class="askno">{ASK_UNRESOLVED}</span>'
+            else:
+                bits = [f'<span class="askv">{esc("、".join(q["picked"]))}</span>'] if q["picked"] else []
+                if q["typed"] is not None:
+                    bits.append(f'<span class="asktag">{ASK_TYPED}</span>'
+                                + (f'<span class="askv">{esc(q["typed"])}</span>' if q["typed"].strip()
+                                   else '<span class="askno">（空白）</span>'))
+                val = "＋".join(bits) or '<span class="askno">（沒有回答）</span>'
+            ans = f'<div class="askans"><span class="askwho">👤 你：</span>{val}</div>'
+            if q["notes"]:
+                ans += (f'<div class="askans"><span class="askwho">👤 你的備註：</span>'
+                        f'<span class="askv">{esc(q["notes"])}</span></div>')
+            if q["seen_preview"]:
+                ans += (f'<details class="askprev"><summary>你看到的預覽</summary>'
+                        f'{_pre_text(q["seen_preview"])}</details>')
+        parts.append(f'<div class="askq"><div class="askqt">{chips}<span class="askqx">{esc(q["question"])}</span></div>'
+                     + (f'<ul class="askopts">{"".join(lis)}</ul>' if lis else "") + ans + "</div>")
+    if st in ASK_STATUS_TEXT:
+        parts.append(f'<div class="askans"><span class="askwho">👤 你：</span>'
+                     f'<span class="askno">{ASK_STATUS_TEXT[st]}</span></div>')
+    if ask_shows_res(view):
+        parts.append(f'<div class="tres{" err" if st == "error" else ""}"><div class="lbl">工具回傳</div>'
+                     f'{_pre_text(view["res"])}</div>')
+    return f'<div class="ask">{"".join(parts)}{raw_box}</div>'
+
+
 def render_tool_html(block, tmap, used_ids):
     name = block.get("name", "tool")
     inp = block.get("input", {})
@@ -4248,10 +4495,21 @@ def render_tool_html(block, tmap, used_ids):
     summary = tool_summary(name, inp)
 
     if name in ("Edit", "MultiEdit") and isinstance(inp, dict):
-        edits = inp.get("edits") or [{"old_string": inp.get("old_string", ""),
-                                      "new_string": inp.get("new_string", "")}]
+        edits, bad = inp.get("edits"), None
+        if not (isinstance(edits, list) and edits):
+            if edits not in (None, [], "", {}):
+                bad = edits                     # 有 `edits` 但不是陣列：畫不出 diff，下面照原值標出來
+            edits = [{"old_string": inp.get("old_string", ""), "new_string": inp.get("new_string", "")}]
         diff = []
-        for ed in edits:
+        if bad is not None:
+            diff.append('<span class="note">' + esc(f"（edits 不是陣列，原值：{json.dumps(bad, ensure_ascii=False)}）")
+                        + "</span>")
+        for i, ed in enumerate(edits):
+            if not isinstance(ed, dict):
+                # 不是物件的那一筆畫不出 diff：在原處照原值標出來（同精簡版的 `edits[i]=…`），整頁照樣畫得出來
+                diff.append('<span class="note">' + esc(f"（edits[{i}] 不是物件，原值：{json.dumps(ed, ensure_ascii=False)}）")
+                            + "</span>")
+                continue
             for ln in str(ed.get("old_string", "")).split("\n"):
                 diff.append('<span class="del">- ' + esc(ln) + "</span>")
             for ln in str(ed.get("new_string", "")).split("\n"):
@@ -4285,8 +4543,13 @@ def render_tool_html(block, tmap, used_ids):
         body = f"<pre>{esc(pretty)}</pre>"
 
     res = render_result_html(tmap, tid)
-    return (f'<details class="tool"><summary><span class="ti">🔧</span> {esc(summary)}</summary>'
-            f'<div class="tbody">{body}{res}</div></details>')
+    view = ask_view(block, tmap) if name in ASK_TOOLS else None
+    if view is not None:
+        summary += " · 原始內容"
+    box = (f'<details class="tool"><summary><span class="ti">🔧</span> {esc(summary)}</summary>'
+           f'<div class="tbody">{body}{res}</div></details>')
+    # 提問：卡片和原本那個摺疊框是**同一個區塊**（呼叫端整個包進同一個 `.blk`）⇒ 區塊錨點一個都不動
+    return render_ask_html(view, box) if view is not None else box
 
 
 # =========================================================================
@@ -7229,6 +7492,38 @@ def render_result_md(tmap, tid):
     return f"\n**{lbl}：**\n\n{_md_fence(text)}\n"
 
 
+def render_ask_md(view):
+    """提問卡片（完整版 MD）：整張是一段引用（`> `），使用者打的字跨行也一行一行加引用符號。
+    回答的寫法與精簡版共用 `ask_answer_text()`。"""
+    qs, st = view["qs"], view["status"]
+    out = [f"**❓ 提問{f' · {len(qs)} 題' if len(qs) > 1 else ''}**"]
+    for q in qs:
+        on, off = ask_marks(q)
+        out += [""] + ((f"**【{q['header']}】** " if q["header"] else "") + ("（可複選）" if q["multi"] else "")
+                       + q["question"]).split("\n")
+        if q["opts"]:
+            out.append("")
+        for o in q["opts"]:
+            out += (f"- {on if o['sel'] else off} " + (f"**{o['label']}**" if o["sel"] else o["label"])
+                    + (f" — {o['description']}" if o["description"] else "")).split("\n")
+        for o in q["opts"]:
+            if o["preview"]:
+                out += ["", f"預覽（{o['label']}）：", ""] + _md_fence(o["preview"]).split("\n")
+        if st == "answered":
+            out += [""] + ("**👤 你：** " + ask_answer_text(q)).split("\n")
+            if q["notes"]:
+                out += [""] + ("**👤 你的備註：** " + q["notes"]).split("\n")
+            if q["seen_preview"]:
+                out += ["", "你看到的預覽：", ""] + _md_fence(q["seen_preview"]).split("\n")
+    if st in ASK_STATUS_TEXT:
+        out += ["", "**👤 你：** " + ASK_STATUS_TEXT[st]]
+    if ask_shows_res(view):
+        out += ["", "工具回傳：", ""] + _md_fence(view["res"]).split("\n")
+    # ⚠ 引用符號照 `splitlines()` 認的每一種斷行加（`\r`、U+2028 這類也算）：讀這份 MD 的 `--search` 就是這樣切行的，
+    #   只照 `\n` 加的話，原文裡的其他斷行會切出一行沒有引用符號的行（例如一行回合標頭）。所以整張組好之後才切。
+    return "\n".join(("> " + ln) if ln else ">" for ln in "\n".join(out).splitlines())
+
+
 def render_tool_md(block, tmap):
     name = block.get("name", "tool")
     inp = block.get("input", {})
@@ -7237,10 +7532,19 @@ def render_tool_md(block, tmap):
     if name == "Bash" and isinstance(inp, dict):
         inner = _md_fence(inp.get("command", ""), "bash")
     elif name in ("Edit", "MultiEdit") and isinstance(inp, dict):
-        edits = inp.get("edits") or [{"old_string": inp.get("old_string", ""),
-                                      "new_string": inp.get("new_string", "")}]
+        # 和 HTML 那一支同一套判斷（不是陣列／不是物件的那一筆照原值標出來）
+        edits, bad = inp.get("edits"), None
+        if not (isinstance(edits, list) and edits):
+            if edits not in (None, [], "", {}):
+                bad = edits
+            edits = [{"old_string": inp.get("old_string", ""), "new_string": inp.get("new_string", "")}]
         diff = []
-        for ed in edits:
+        if bad is not None:
+            diff.append(f"  （edits 不是陣列，原值：{json.dumps(bad, ensure_ascii=False)}）")
+        for i, ed in enumerate(edits):
+            if not isinstance(ed, dict):
+                diff.append(f"  （edits[{i}] 不是物件，原值：{json.dumps(ed, ensure_ascii=False)}）")
+                continue
             for ln in str(ed.get("old_string", "")).split("\n"):
                 diff.append("- " + ln)
             for ln in str(ed.get("new_string", "")).split("\n"):
@@ -7253,8 +7557,11 @@ def render_tool_md(block, tmap):
             inner = _md_fence(json.dumps(inp, ensure_ascii=False, indent=2), "json")
         except Exception:
             inner = _md_fence(inp)
-    return (f"\n<details><summary>🔧 {summary}</summary>\n\n{inner}\n"
-            f"{render_result_md(tmap, tid)}\n</details>\n")
+    view = ask_view(block, tmap) if name in ASK_TOOLS else None
+    box = (f"\n<details><summary>🔧 {summary}{' · 原始內容' if view is not None else ''}</summary>\n\n{inner}\n"
+           f"{render_result_md(tmap, tid)}\n</details>\n")
+    # 提問：卡片在上、原本那個摺疊框（輸入與結果的原文）收在下面——`--search` 的全文索引讀的是這一份，原文照樣搜得到
+    return f"\n{render_ask_md(view)}\n{box}" if view is not None else box
 
 
 def turn_meters_md(group):
@@ -7567,7 +7874,7 @@ _AI_WRITE = {"Write", "NotebookEdit"}
 _AI_EDIT = {"Edit", "MultiEdit"}
 _AI_LOOKUP = {"Grep", "Glob", "LS", "WebFetch", "WebSearch", "ToolSearch"}
 _AI_AGENT = {"Task", "Agent"}
-_AI_ASK = {"AskUserQuestion"}
+_AI_ASK = ASK_TOOLS            # 同一份名單：認不認得是提問，三種輸出不可以各自判
 _AI_PLAN = {"TodoWrite", "update_plan", "TaskCreate", "TaskUpdate"}
 _AI_HEADING_RE = re.compile(r"^(\s{0,3})(#{1,6})(\s|$)")
 # fence 照 CommonMark 認：開頭＝0–3 個空白縮排、三個以上的 ` 或 ~（` 的 fence 後面的資訊字串不可以再有 `）；
@@ -7594,9 +7901,43 @@ def _ai_one_line(text):
 
 def _ai_exact_line(text):
     """放在 fence 外、只該占一行的原文（檔頭的欄位、背景通知的摘要）：本身就是一行就照原樣（空白一個都不動）；
-    有斷行就寫成 JSON 字串——一行、字一個不少，也開不出 fence。"""
+    有斷行就寫成 JSON 字串——一行、字一個不少，也開不出 fence。
+
+    ⚠ JSON 字串裡 `_AI_NL_RE` 認的斷行一個都不能留成原字：`json.dumps(…, ensure_ascii=False)` 只跳脫控制字元，
+    U+0085／U+2028／U+2029 會照原字留著，而整份檔之後一律經過 `_ai_nl` 換成 `\\n` ⇒ 那一行又斷開了。
+    這幾個也寫成 `\\uXXXX`（同一個字串，仍是合法的 JSON）。"""
     t = str(text)
-    return t if "\n" not in _ai_nl(t) else json.dumps(t, ensure_ascii=False)
+    if "\n" not in _ai_nl(t):
+        return t
+    return _AI_NL_RE.sub(lambda m: "".join(f"\\u{ord(c):04x}" for c in m.group(0)),
+                         json.dumps(t, ensure_ascii=False))
+
+
+def _ai_close_code_span(text):
+    """一行原文（檔頭的標題）裡最後一個沒關的 code span，在結尾補上同長度的反引號串。
+
+    標題常是第一則使用者訊息硬切的前 90 字，可能切在 `` `…` `` 中間，留下一個沒關的反引號。
+    照 CommonMark 由左往右認：同長度的反引號串才關得了；code span 外的反斜線跳脫下一個字（`\\``不是開頭），
+    code span 裡的反斜線是字面。結尾本來就是反引號的話先空一格，否則補上去的會和它連成一串更長的。"""
+    i, n, open_len = 0, len(text), 0
+    while i < n:
+        if text[i] == "\\" and not open_len:
+            i += 2
+            continue
+        if text[i] == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            if not open_len:
+                open_len = j - i
+            elif j - i == open_len:
+                open_len = 0
+            i = j
+            continue
+        i += 1
+    if not open_len:
+        return text
+    return text + (" " if text.endswith("`") else "") + "`" * open_len
 
 
 def _ai_guard(text):
@@ -7756,6 +8097,34 @@ def _ai_plan_lines(name, inp):
     return [], set(), []
 
 
+def _ai_ask_text(view):
+    """提問卡片的純文字版（精簡版用；呼叫端整段放進 fence）。跨行的原文，續行一律縮排在它那一格底下。"""
+    lines = []
+
+    def put(lead, text, indent):
+        first, *rest = _ai_nl(text).split("\n")
+        lines.append(lead + first)
+        lines.extend(" " * indent + ln for ln in rest)
+    for i, q in enumerate(view["qs"]):
+        if i:
+            lines.append("")
+        on, off = ask_marks(q)
+        put((f"【{q['header']}】" if q["header"] else "") + ("（可複選）" if q["multi"] else ""), q["question"], 2)
+        for o in q["opts"]:
+            put(f"  {on if o['sel'] else off} ", o["label"] + (f" — {o['description']}" if o["description"] else ""), 4)
+            if o["preview"]:
+                put("    預覽：", "\n" + o["preview"], 6)
+        if view["status"] == "answered":
+            put("  👤 你：", ask_answer_text(q), 4)
+            if q["notes"]:
+                put("  👤 你的備註：", q["notes"], 4)
+            if q["seen_preview"]:
+                put("  你看到的預覽：", "\n" + q["seen_preview"], 6)
+    if view["status"] in ASK_STATUS_TEXT:
+        lines.append("👤 你：" + ASK_STATUS_TEXT[view["status"]])
+    return "\n".join(lines)
+
+
 def render_tool_ai_md(block, tmap):
     """一次工具呼叫 ⇒ 恰好一行 `AI_MD_TOOL`，後面視工具種類接留下來的那一點。"""
     name = str(block.get("name") or "tool")
@@ -7811,7 +8180,16 @@ def render_tool_ai_md(block, tmap):
             # ⚠ 報告是原文，可能有沒關的 fence、像回合標頭的行：一律包進 fence，不可以直接攤在版面上
             body.append(f"交回的報告{'（' + note + '）' if note else ''}：\n{_md_fence(_ai_guard(rep))}")
             res_shown = True
+    elif name in _AI_ASK and (view := ask_view(block, tmap)) is not None:
+        # 提問與使用者的回答全留（不截）：題目、選項（含預覽）、選了哪個、自己打的字都在這一段（整段進 fence）
+        body.append(f"提問與回答：\n{_md_fence(_ai_guard(_ai_ask_text(view)))}")
+        if ask_shows_res(view):
+            body.append(f"{'錯誤輸出' if is_err else '工具回傳'}：\n{_md_fence(_ai_guard(res))}")
+        elif has_res:
+            notes.append(f"結果原文略（{len(res):,} 字；回答照結構化欄位畫在下面）")
+        res_shown, is_err = True, False      # 上面已經照錯誤畫了，下面不再重複
     elif name in _AI_ASK:
+        # 輸入的形狀認不得（`ask_view()` 回 None）：照原樣整份交代，不猜
         try:
             q = json.dumps(inp, ensure_ascii=False, indent=1)
         except (TypeError, ValueError):
@@ -7970,7 +8348,7 @@ def render_session_ai_md(s: Session, full_path=None) -> str:
     # 檔頭的行數跟行號的值無關（行號只出現在單行的列裡）⇒ 先用 0 排一次數行數，再填真的行號。
     # 檔頭裡的原文（標題、路徑、工作目錄、分支…）放在 fence 外：一律 `_ai_exact_line`（一行、字一個不少）。
     def header(nums):
-        h = [f"# {_ai_exact_line(s.title)}", "",
+        h = [f"# {_ai_close_code_span(_ai_exact_line(s.title))}", "",
              "> **給 AI 讀的精簡版。** 雙方講的話全留；每一次工具操作都列成一行 `- 🔧 …`"
              f"（共 {n_tools:,} 次），讀檔內容、寫檔的整檔內容與大部分指令輸出已略去，**略去處都有標記**。"
              "思考區塊、花費與快取等計量、子代理內部的來回不放（子代理交回的報告有留）。",
@@ -8002,7 +8380,10 @@ def render_session_ai_md(s: Session, full_path=None) -> str:
         starts[i] = line
         line += part.count("\n") + 2     # 段與段之間空一行
     nums = [starts[idx] for idx, *_ in toc]
-    return header_text(nums) + "\n" + "\n\n".join(body) + "\n"
+    # 結尾講明紀錄到這裡為止：讀到檔尾的人（或 AI）不必回頭找檔頭那一句，也不會把檔尾當成「事情做完了」
+    tail = (f"---\n\n> **紀錄到這裡為止**（最後一筆 {local_str(s.end, dfmt) or '（不明）'}）。"
+            "這之後發生的事不在紀錄裡：可能是中斷、撞到額度，也可能是做完了——接手前先看工作區的實際狀態。\n")
+    return header_text(nums) + "\n" + "\n\n".join(body + [tail])
 
 
 # =========================================================================
@@ -10399,6 +10780,7 @@ details.tool>summary{color:var(--text);font-family:ui-monospace,Consolas,monospa
 .tres.err pre{border-color:var(--err)}.tres.err .lbl{color:var(--err)}
 .tres.none{color:var(--muted);font-size:12px;font-style:italic}
 pre.diff .del{color:var(--err);display:block}pre.diff .ins{color:var(--assistant);display:block}
+pre.diff .note{color:var(--muted);display:block}
 ul.todos{list-style:none;padding-left:.3em}ul.todos li{margin:2px 0}
 .img-ph,.think-redacted{color:var(--muted);font-size:13px;padding:4px 0}
 /* 指令列 / 背景任務通知：使用者確實送出、或系統確實注入，但都**不是發言**
@@ -10432,6 +10814,24 @@ font-weight:600;color:var(--user);border-bottom:1px solid var(--border)}
 /* 「插話之後」那一段：縮排＋左側細線，表示這些是因為那句話才做的 */
 .ijafter{margin:0 0 8px 10px;padding-left:12px;border-left:2px dashed var(--user);opacity:.98}
 .ijafterhead{color:var(--user);font-size:11.5px;margin:4px 0 2px;opacity:.8}
+/* AI 的提問（AskUserQuestion）：不收合的卡片；「👤 你」那一行用使用者那條藍，和插話同一組語意 */
+.ask{border:1px solid var(--border);border-radius:8px;margin:8px 0;background:var(--panel2)}
+.askhead{padding:6px 12px;font-size:13px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--border)}
+.askq{padding:8px 12px}.askq+.askq{border-top:1px dashed var(--border)}
+.askqt,.askdesc,.askv{white-space:pre-wrap;word-break:break-word}
+.askchip{display:inline-block;font-size:11px;color:var(--muted);background:rgba(127,127,127,.14);
+border-radius:6px;padding:0 6px;margin-right:6px;white-space:nowrap}
+ul.askopts{list-style:none;margin:6px 0;padding-left:.3em}
+.askopt{margin:3px 0;color:var(--muted);padding-left:1.5em;text-indent:-1.5em}
+.askopt.sel{color:var(--text)}.askopt.sel .asklabel{font-weight:600}
+.askmark{display:inline-block;width:1.5em;text-indent:0}
+.askans{margin-top:6px;padding:3px 10px;border-left:3px solid var(--user)}
+.askwho{color:var(--user);font-weight:600}
+.asktag{font-size:11px;color:var(--user);border:1px solid var(--user);border-radius:6px;padding:0 5px;margin-right:6px}
+.askno{color:var(--muted);font-style:italic}
+details.askprev{margin:4px 0 2px 1.5em;border:none;background:none;text-indent:0}.askopt details.askprev{margin-left:0}
+details.askprev>summary{padding:2px 0;font-size:12px;color:var(--muted)}
+.ask>.askans,.ask>.tres{margin:6px 12px 8px}.ask details.tool{margin:6px 12px 10px}
 /* 索引 */
 .filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0}
 .search{flex:1 1 220px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;

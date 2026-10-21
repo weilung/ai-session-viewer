@@ -289,7 +289,7 @@ def test_collect_sources_dedupes_same_realpath():
 def test_command_and_notify_are_escaped():
     """指令輸出／通知原文／指令名／插話——這批新開的四個注入面都要逸出。
 
-    ⚠⚠ 這一格是 `utf-fam` Medium 補的：逸出**當時就是對的**，
+    ⚠⚠ 這一格守的是：逸出**現在是對的**，
     但**沒有任何斷言在守**。「現在是對的」和「壞了會被抓到」是兩件事。
 
     ⚠ 這四個來源都不是使用者打的字，很容易被當成「自己人」而漏掉逸出：
@@ -367,12 +367,12 @@ def test_command_and_notify_are_escaped():
     # ⚠⚠ **涵蓋率先驗要對每個面各驗一次，不可以用一個總數。** 舊寫法是
     # `html.count("alert(1)") >= 5`，而真實計數是 8 ⇒ 把第五個面（圖片的 `media_type`）
     # 整個中和掉、甚至把那一則帶圖排隊句從素材裡刪掉，那一格**照樣通過**
-    # （`qimg-fam` Medium#2 實測：`ALERTCOUNT 8 → 7`，兩種破壞都仍然綠）。
+    # （實測：`ALERTCOUNT 8 → 7`，兩種破壞都仍然綠）。
     # ⇒ 每個面用它自己的指紋，這樣素材沒走到那條路時才會紅在對的地方。
     # ⚠⚠ **每個面要有自己的 marker，不可以共用 DOM class 當指紋。**
     # 第一版用 `class="cmdline"`／`class="cmdout"` 之類，而「只有輸出、沒有指令名」的
     # fallback 也會產出同樣的 class ⇒ 把指令名整個清空、那一格照樣綠
-    # （`qimg-fix-codex` Medium#2 實測）。marker 只會來自那一面自己的素材。
+    # （實測）。marker 只會來自那一面自己的素材。
     for _needle, _face in (
             ("FACEONE", "① 指令名"),
             ("FACETWO", "② 指令輸出"),

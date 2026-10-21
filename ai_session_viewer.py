@@ -51,13 +51,16 @@ AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 MANIFEST_NAME = ".build-manifest.json"
+# `peek_cwd` 的跨建置快取（見 `peek_cwd_cached`）。每次建置都要替**全部** Claude 主檔取 cwd
+# 才算得出專案名；不快取的話成本跟來源檔總數成正比（冷快取時每開一個檔就是幾十 ms）。
+CWD_CACHE_NAME = ".cwd-cache.json"
 # 渲染邏輯版本；改變 session 呈現方式或 row 結構時 +1，會強制全部重建。
 # ⚠⚠ **這一格很容易漏，而漏掉是靜默的**：呈現層改了卻沒 +1，增量建置會沿用既有的
 #    HTML／MD，新的顯示在**既有頁面上永遠不出現**，而快取報告那一頁每次都重建 →
 #    變成「報告說有 N 次，逐步徽章一個都看不到」的不一致，沒有任何錯誤訊息。
 #    2026-08-22 實測抓到這件事：`out/sessions` 的 1037 個頁面只有 1 個是當天寫的，
 #    抽查到的那一份檔案時間停在 08-19，08-19 之後三批呈現層修正
-#    （v36-fam3 F2 單步徽章、v36-fam4 #2 tooltip、v36-fam5 #1 並列標示）全部沒生效。
+#    （單步徽章、tooltip、並列標示）全部沒生效。
 # 39 → 40（2026-08-22）：把上述三批補上。**動到 render_turn_html／render_turn_md／
 #    _cold_cause_label／_cold_cause_title 的改動，都要記得動這裡。**
 # 40 → 41（2026-08-22）：耐久回合錨點（`durable_anchor`）＋每輪標頭的 # 直達連結。
@@ -83,19 +86,19 @@ MANIFEST_NAME = ".build-manifest.json"
 #    包裝＋自己的 `#`／☆，錨點 `k…[-tb<n>][-s<步epoch>]-b<n>`（見 `block_anchor()`）；
 #    多步回合的步驟列掛上 `k…-s<ep>`（退化階梯的中間一階）；`bkSummary()` 改成先剔掉
 #    控制項的文字再取摘要。⚠ **HTML＋CSS＋頁面 JS 三樣都變＝呈現層，一定要升。**
-# 52 → 53（2026-08-23）：**第 4 期的冷眼輪處置**（`bookmarks-p4-fam`）——
+# 52 → 53（2026-08-23）：**第 4 期的冷眼輪處置**——
 #    ① 區塊錨點的 `-s` 段改用**毫秒**（新增 `_epoch_ms`／`_step.tms`），
 #      並加一道底線：同一輪內 `tms` 撞號的那些步，整步不給錨點。
 #      ⚠ **錨點字串改了**，但第 4 期未出貨，沒有人存過這種書籤。
 #    ② `.blk-ctls` 容器改成透明＋`pointer-events:none`（背景移到按鈕自己身上）。
 #    ⚠ CSS 與錨點值都變了 ＝呈現層，一定要升。
-# 53 → 54（2026-08-23）：**跨模型輪的處置**（`bookmarks-p4-codex`）——
+# 53 → 54（2026-08-23）：**跨模型輪的處置**——
 #    新增 `bmGrammarOk()`：文法不合的子定位符一律走未命中，**不准走退化階梯**
 #    （舊版 `-s`、`-b`、`|`、引號、超長垃圾都會被剝成基底回合並框起來）。
 #    另把區塊錨點的計算抽成 `turn_block_anchors()`，與探針共用。
 #    ⚠ 頁面 JS 變了 ＝呈現層。
 # 54 → 55（2026-08-25）：**使用者回合忠實度**——三種「使用者確實送出、但過去看不到或被
-#    誤標成他的發言」的東西補回來（設計與全語料量測見 `planning/user-turn-fidelity.md`）：
+#    誤標成他的發言」的東西補回來：
 #    ① **排隊送出的提示詞**：檔案裡沒有 `type:user` 事件，只有 `queue-operation` 與
 #      `attachment.queued_command` ⇒ 過去是**答案在、問題不在**。`synth_queued_user_events()`
 #      補成 user 事件，時刻取 `remove`（真正被讀到的一刻），按 Enter 的時刻進游標提示。
@@ -140,7 +143,7 @@ MANIFEST_NAME = ".build-manifest.json"
 #    ⚠ 順帶修掉一個幽靈回合：沒有輸出的指令會另寫一則空的
 #      `<local-command-stdout></local-command-stdout>`，它渲染成空字串**但已經佔掉一個回合**
 #      （`t{n}` 序號往後推）。判空條件收斂到 `user_special_blocks()` 一處。
-# 58 → 59（2026-08-26）：**跨模型收斂輪 `utf-fix-codex` 的處置**。呈現層真的變了三處，
+# 58 → 59（2026-08-26）：**使用者回合呈現的修正**。呈現層真的變了三處，
 #    所以一定要升（不升的話本機既有的 `out/` 會靜默沿用舊版）：
 #    ① **通知的摺疊改回完整原文**（原本 `event or raw` ⇒ 帶 `<event>` 的 Monitor 型會
 #       把 `<task-id>`／`<output-file>` 從 HTML 與 MD 全文索引裡弄不見，**比 v54 還差**）；
@@ -151,7 +154,7 @@ MANIFEST_NAME = ".build-manifest.json"
 #    另外：控制碼補上 DCS／SOS／PM／APC 與 C1 單位元組形式（先前只認 CSI 與 OSC，
 #    `ESC P …payload… ESC \` 的 payload 會原樣進頁面）。
 #    ⚠ 錨點集合仍逐字不變：`probe_user_turns.py anchors <開工前的 commit>` 現撈。
-#    ⭐ **驗收輪 `utf-fix-codex-r2` 又補了五處**（同一個版本號，59 尚未出貨）：
+#    ⭐ **又補了五處**（同一個版本號，59 尚未出貨）：
 #    ④ 未知內容的保守否決**只豁免 `str`**——`content` 是單一個 dict、或 list 裡混了
 #       非 dict 的非空元素，第一版都當「認得」⇒ 照樣被搬走。
 #    ⑤ `_turn_done` **在新的 assistant 內容抵達時要清掉**：只設不清的話，
@@ -219,7 +222,21 @@ MANIFEST_NAME = ".build-manifest.json"
 #    那一步原本沒有徽章、總額也漏掉整次。⚠ 動到算錢的路徑。會變的有兩種場次：①拆成多筆、各筆產出不同
 #    ⇒ 產出與金額變多；②某次呼叫的第一筆沒有 usage ⇒ 那次呼叫的輸入、快取寫入／讀取、快取步驟與報告
 #    也一起補進來（原本整次記成 0）。其餘場次的總額、脈絡峰值，以及所有場次的兩層錨點都應逐位元不變。
-RENDERER_VERSION = 64
+# 64 → 65（2026-10-07）：**只改註解**——頁面內嵌的 JS／CSS 註解改寫成規則本身的講法（拿掉內部代號與
+#    不存在於公開 repo 的檔案指標）。行為、錨點、金額都不變；升版只是因為內嵌註解屬於頁面輸出，
+#    而釘版測試要求「頁面輸出變了就升版」。驗法是全語料新舊對照（剝掉 `/* … */` 之後應逐位元相同）。
+# 65 → 66（2026-10-10）：Codex 工具結果的 content item 陣列（`input_text`／`input_image`）照文字與圖片畫
+#    （`_codex_result_text`、`render_input_image`）；原本整格 `json.dumps` 成一整行、換行全變成 `\n`，
+#    圖片則是一長串 base64。Claude 的 `text`／`image` 兩個分支不變；所有場次的總額與兩層錨點都應
+#    逐位元不變。
+# 66 → 67（2026-10-20）：那兩種格只認已知欄位（`_CODEX_TEXT_KEYS`／`_CODEX_IMAGE_KEYS`），多一個欄位就照原樣印
+#    JSON；manifest 每一筆多記 `turns`（.md 真的寫出的回合標頭，`--search` 用）——升版讓舊建置整批重建、補上這一欄。
+# 67 → 68（2026-10-21）：Codex 輸出檔名的 id 段改取 sid 的**最後 8 碼**（`out_id_part`）：Codex 的 id 是 UUIDv7，
+#    前 8 碼是時間戳，同一分鐘、同一專案開的幾場原本組出同一個檔名、互相蓋掉。頁面內容不變；升版是因為
+#    沿用的 row 帶著舊檔名，不重建就不會改名。舊檔名由下一次完整建置的孤兒清理刪掉。Claude 的檔名不變。
+# 68 → 69（2026-10-21）：MD 的壓縮摘要不再畫成「👤 You」，改成 `### 📋 壓縮摘要 · 時刻 · 手動／自動＋壓縮量 {#tN}`
+#    （`render_turn_md`；`_TURN_HEAD_RE` 認得它，`--search` 照樣切成一則）。HTML 不變。
+RENDERER_VERSION = 69
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -461,7 +478,7 @@ API_MISS_NOTES = {
 # **範圍限制 SCOPE-UNMAPPED-MISS-CODE**：沒有列在這裡、也不在 API_OTHER_CAUSE 的自報碼，
 # 在成因判定裡不參與——那一步會照「邊界／間隔」推論走完，推論的結果可能落進人因桶。
 # `previous_message_not_found` 不列是刻意的：它是「快取沒中」的症狀本身，實測橫跨各種成因
-# 都出現，不是成因。詳見 planning/scope-limits.md 的 SCOPE-UNMAPPED-MISS-CODE。
+# 都出現，不是成因。範圍限制 SCOPE-UNMAPPED-MISS-CODE。
 API_MISS_CAUSE = {"tools_changed": "tools", "system_changed": "system",
                   "messages_changed": "msgs", "model_changed": "model"}
 # **非前綴變動**的自報成因：同一步的直接證據，優先於由「間隔」推論出來的 expiry／acct／evict／intra。
@@ -545,13 +562,13 @@ def rewrite_waste_usd(model, missed, c5=0, c1h=0, wrote=None):
 
 # Markdown（無 CSS 著色）用的短成因標籤，與 REPORT_CAUSES 對齊。
 _COLD_CAUSE_LABEL = {k: lbl for k, lbl, _ in REPORT_CAUSES}
-# (v36-fam5 #1) **顯示層專用的並列條件**：不是成因，刻意不進 `REPORT_CAUSES`／`_COLD_CAUSE_LABEL`
+# **顯示層專用的並列條件**：不是成因，刻意不進 `REPORT_CAUSES`／`_COLD_CAUSE_LABEL`
 # ——那兩者是成因表與分割測試的母體，塞一個假成因進去會多出一列永遠是 0 的成因。
 # 這些鍵只會出現在 `masked`（並列顯示）裡，不記帳、不計次、不影響任何統計。
 _COLD_EXTRA_LABEL = {"limit_earlier": "同場稍早撞過 limit"}
 # ⚠ 這些補述會排在**成因說明之後**（見 `_cold_cause_title`）：它們的作用是修正前一句，
 #   排在前面就會與後面那句互相否定——`acct` 的說明本文寫著「沒撞 limit」，而這一句正好在說
-#   「同場稍早撞過」。順序反了就是 v36-fam4 #2 那個「同一個 tooltip 兩句話互相否定」。
+#   「同場稍早撞過」。順序反了就會出現「同一個 tooltip 兩句話互相否定」。
 # ⚠ 不要用 `**`：tooltip 是純文字 title 屬性，星號會原樣露出（既有的 `_COLD_CAUSE_NOTE`
 #   一個都沒有用）。
 _COLD_EXTRA_NOTE = {
@@ -582,7 +599,7 @@ def _cold_cause_title(cause, masked=None, head="此步驟未命中快取"):
     parts = [_COLD_CAUSE_NOTE[c] for c in masked if c in _COLD_CAUSE_NOTE]
     if note:
         parts.append(note)
-    # (v36-fam5 #1) 顯示層的補述排在**最後**：它們是對成因說明的修正（例：`acct` 的本文寫
+    # 顯示層的補述排在**最後**：它們是對成因說明的修正（例：`acct` 的本文寫
     # 「沒撞 limit」，而 `limit_earlier` 正好在說同場稍早撞過）。排在前面兩句就會互相否定。
     parts += [_COLD_EXTRA_NOTE[c] for c in masked if c in _COLD_EXTRA_NOTE]
     return (head + "——" + _cold_cause_label(cause, masked) + "。" + "；".join(parts)
@@ -1029,7 +1046,7 @@ def _unify_call_usage(events):
     沒有任何一筆帶 usage 的呼叫維持原樣。鍵帶來源檔（`_srcf`）：不同子代理轉錄檔裡的 id
     各算各的。
     範圍限制 SCOPE-USAGE-LAST-EVENT-WHOLE：取的是最後一筆的**整份** usage，不逐欄合併、也不取各筆最大值；
-    涵蓋的是「各筆的輸入與快取欄位相同、事件依寫入順序排列」的資料形狀。詳見 planning/scope-limits.md。"""
+    涵蓋的是「各筆的輸入與快取欄位相同、事件依寫入順序排列」的資料形狀。"""
     last = {}
     for e in events:
         if e.get("type") != "assistant":
@@ -1137,7 +1154,7 @@ def _nested_text(v, _depth=0):
         if isinstance(t, str) and t.strip():
             return True
         # 巢狀裡**名字就是內容容器**的欄位也算（`{"output": {"value": "…"}}`）：只認 `text` 鍵的話，
-        # 內容換一層、換個名字就整則消失而沒有任何哨兵出聲（`v62-fam` #8）。
+        # 內容換一層、換個名字就整則消失而沒有任何哨兵出聲。
         if any(k in _TEXTY_KEYS and _any_text(x) for k, x in v.items()):
             return True
         return any(_nested_text(x, _depth + 1) for x in v.values() if isinstance(x, (list, dict)))
@@ -1151,7 +1168,7 @@ _TEXTY_KEYS = ("content", "parts", "value", "body")   # 名字就是「內容容
 # 內容放在其他名字的鍵底下（例 `{"delta": {"answer": …}}`、巢狀的 `{"image_url": {"url": …}}`）、或 reasoning
 # 的原文放在 `content` 以外的欄位（例 `reasoning_content`），不在哨兵的涵蓋範圍內。反方向同樣有邊界：
 # 頂層的字串欄位一律當成內容，分不出是 metadata（例 `language: "en"`）；使用者那一側，沒被收下的 block
-# 一律計入（含空字串的 text block）。詳見 planning/scope-limits.md。
+# 一律計入（含空字串的 text block）。
 
 
 def _any_text(v, _depth=0):
@@ -1193,7 +1210,7 @@ def _jsonish_nontext_blocks(s):
     ⚠ **只用來出聲，不改寫原文**：從字串內容分不出那是上游序列化的 content 還是使用者
     貼的原文，所以原文一律照收；這裡只回答「若真是序列化的，有沒有東西（圖片…）沒被畫出來」。
     ⚠ 「每個元素都帶 `type`」不夠：使用者貼一段 Slack Block Kit（`section`／`divider`）也長那樣，
-      於是一則正常的提問被報成「上游可能把 content 序列化了」（`v62-fam` #8 的誤報）。
+      於是一則正常的提問被報成「上游可能把 content 序列化了」。
       ⇒ 要嘛裡面有**帶字串 `text` 的文字 block**，要嘛**每個型別都是 content block 的型別**，才算數。"""
     t = s.strip() if isinstance(s, str) else ""
     if not t.startswith("["):
@@ -1249,7 +1266,7 @@ def _codex_content_text(content, text_type="output_text"):
 def _codex_block_loses(b, text_type="output_text"):
     """這個 block 有沒有內容**沒被畫出來**：沒被收下而且帶著東西（`_codex_carries_unread`），
     **或是**收下了 `text`、別的欄位卻還帶著字——`{"type":"output_text","text":"See chart:","image_url":…}`
-    只收 `text` 會把圖片連結整個丟掉；`text:" "` 而真正的內容搬到別欄位時也一樣（`v62-fam` #8）。"""
+    只收 `text` 會把圖片連結整個丟掉；`text:" "` 而真正的內容搬到別欄位時也一樣。"""
     if _codex_consumed(b, text_type):
         return _block_text_elsewhere(b)
     return _codex_carries_unread(b, text_type)
@@ -1312,7 +1329,7 @@ def _json_obj_maybe(text):
 
 def _codex_usage(usage):
     # 範圍限制 SCOPE-CODEX-CACHE-WRITE-UNREAD：只讀輸入／快取讀取／產出三個欄位；
-    # `cache_write_input_tokens` 不在換算範圍內。詳見 planning/scope-limits.md。
+    # `cache_write_input_tokens` 不在換算範圍內。
     if not isinstance(usage, dict):
         return {}
     total_in = usage_int(usage, "input_tokens")
@@ -1402,7 +1419,7 @@ def load_codex_thread_names(sessions_root: Path) -> dict:
 # event_msg 這一層我們實際處理的型別；其餘一律不認得。哨兵用它當「已知」白名單，
 # 不認得又長得像使用者發言時才出聲（見 _codex_event_user_like）。
 _CODEX_HANDLED_EVENTS = ("task_started", "user_message", "item_completed", "token_count")
-# (v36-fam5 #2) `response_item` 的 `payload.type` 白名單。**已知**＝處理過的 ＋ 刻意不處理的，
+# `response_item` 的 `payload.type` 白名單。**已知**＝處理過的 ＋ 刻意不處理的，
 # 兩類都要列：這是「認不認得」的清單，不是「有沒有用」的清單。不在清單上就是上游加了新型別
 # 或改了名，而 `response_item` 是助理訊息／reasoning／工具呼叫的唯一入口——改名之後那些內容
 # 會整批解析不出來，頁面變成「N 則提問、零則回答」，而既有哨兵一個都接不到
@@ -1416,9 +1433,9 @@ _CODEX_HANDLED_RESPONSE_ITEMS = frozenset((
     "function_call_output", "custom_tool_call_output",
     "web_search_call", "tool_search_call", "tool_search_output", "agent_message",
 ))
-# (v36-fam6 #2) `response_item:message` 的已知 `role`。上游改名或拿掉 role，`role != "assistant"`
+# `response_item:message` 的已知 `role`。上游改名或拿掉 role，`role != "assistant"`
 # 那一行會**直接吞掉**整則助理訊息——症狀與型別改名一模一樣（頁面「N 則提問、零則回答」、
-# stderr 全靜），而 v36-fam5 #2 補的三條哨兵一條都接不到。
+# stderr 全靜），而 `payload.type`、content 元素型別等三條哨兵一條都接不到。
 # 實測 516 份 rollout：role 只有 developer 999／user 1203／assistant 6712，這三個蓋滿。
 _CODEX_KNOWN_MESSAGE_ROLES = frozenset(("assistant", "user", "developer"))
 
@@ -1436,14 +1453,14 @@ def _codex_dual_shape(pending, text, kind):
     **範圍限制 SCOPE-DUAL-SHAPE-UNMARKED**，兩格：
     (a) 出聲的管道只有 stderr；兩則在**輸出頁面上不帶任何標記**，讀的人看到的是兩則相鄰的
         普通提問。
-    (b) ⚠ **這個哨兵本身也幾乎恆為 False**（2026-08-21 登記，來源 `v36-fam3` F5）：它只認
+    (b) ⚠ **這個哨兵本身也幾乎恆為 False**（2026-08-21 登記）：它只認
         **緊鄰**，而 `pending_user` 會被**任何** `response_item` 無條件清掉。本機 516 份 rollout、
         672 則使用者紀錄，**672 則的前一筆事件全部都是 `response_item`** → 實跑觸發 0 次。
         所以就算上游開始雙發，中間夾一筆 `response_item` 就完全無聲。
         **不要再把「等 stderr 告警」當成回頭處理的觸發器**——要重掃 corpus 才看得到。
         放寬的作法是改成在同一個**回合窗**內比對（窗已有 `turn_prompts` 在記帳），
         但本機沒有正例可驗證，Will 2026-08-21 選擇不動。
-    詳見 planning/scope-limits.md 的 SCOPE-DUAL-SHAPE-UNMARKED。"""
+    範圍限制 SCOPE-DUAL-SHAPE-UNMARKED。"""
     if not pending or not text or not text.strip():
         return False
     return pending[0] == text and pending[2] != kind
@@ -1509,7 +1526,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     # 收尾兩條哨兵的「有助理內容」原本只數助理事件，而那種 reasoning 一個事件都不產生 ⇒
     # 只有它的那一場會被當成「沒有助理內容」而整條哨兵閉嘴。
     saw_unrendered_ai = False
-    # (v36-fam5 #2) `response_item` 的 payload.type 認不得的則數，與「content 元素型別漂掉、
+    # `response_item` 的 payload.type 認不得的則數，與「content 元素型別漂掉、
     # 抽不出助理文字」的則數。兩者都是助理內容整批消失的入口，而容器那條哨兵只認 payload 不是
     # dict 的情形，接不到這兩種。
     n_unhandled_response_items = 0
@@ -1519,7 +1536,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     # reasoning 摘要的形狀認不得（不是 list、或 list 裡有帶著內容卻沒被收下的元素）。
     n_bad_reasoning_summary = 0
     n_reasoning_content = 0        # reasoning 的推理原文放在 `content`（只畫摘要 ⇒ 不會出現）
-    # (v36-fam6 #2) 同一條路徑上另外兩格漂移：`role` 認不得、`content` 欄形狀不對。
+    # 同一條路徑上另外兩格漂移：`role` 認不得、`content` 欄形狀不對。
     n_unknown_message_role = 0
     n_bad_message_content = 0
     # 新格式 `UserMessage.content` 是字串（正常形狀是 block 陣列）：原樣收下，但那是上游換了形狀，要出聲。
@@ -1527,7 +1544,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     # 舊格式 `user_message.message` 的字串本身是一段含**非文字 block** 的 JSON 陣列：原文照收，
     # 但若那是上游序列化的內容，圖片等不會被畫出來——講「可能」，不講「一定」。
     n_legacy_jsonish_nontext = 0
-    # (v36-fam5 #3) 整場收到幾則 prompt。⚠ **不可以**改用 `s.events` 裡 type=="user" 的則數
+    # 整場收到幾則 prompt。⚠ **不可以**改用 `s.events` 裡 type=="user" 的則數
     # ——工具結果也是以 `user` 存的（見下方 `function_call_output` 那一支），一場有工具呼叫、
     # prompt 卻全丟時它不會是 0。獨立計數器才是「真的被當成 prompt 收下」的則數。
     n_prompts_total = 0
@@ -1537,7 +1554,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
         payload = raw_payload if isinstance(raw_payload, dict) else {}
         if not isinstance(raw_payload, dict):
             outer = str(e.get("type") or "")
-            # (v36-fam4 #4) `response_item` 的容器漂了 → **助理內容整批靜默消失**：那一支是
+            # `response_item` 的容器漂了 → **助理內容整批靜默消失**：那一支是
             # 助理訊息、reasoning、工具呼叫的唯一入口，清成 `{}` 之後頁面會是「N 則提問、
             # 零則回答」，而收尾那條形狀無關的哨兵被 `n_ai_turns` 擋住（助理事件正好是 0）
             # → 完全無聲。下面那條哨兵只在容器「看起來像使用者發言」時才計數，接不到助理樣態。
@@ -1573,13 +1590,13 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
         if (e.get("type") == "compacted"
                 or (e.get("type") == "event_msg" and ptype == "context_compacted")):
             turn_systemic = True
-        # ⚠⚠ **`error` 不可以無條件豁免。** 第一版把任何 `error` 都當成「系統自己起的」，
-        # 而跨模型 reviewer 實測示範了它的代價：`task_started` → prompt 事件**改名（沒收到）**
+        # ⚠⚠ **`error` 不可以無條件豁免**：把任何 `error` 都當成「系統自己起的」的話，
+        # 代價是：`task_started` → prompt 事件**改名（沒收到）**
         # → 助理照常回答 → `error`，這個窗**真的漏收了一則 prompt**，哨兵卻完全靜默。
         # 分界線在**這個窗有沒有產出助理內容**：
         #   · 壓縮失敗那種只有 `task_started` → `error` → `task_complete`，**沒有助理內容**；
         #   · 使用者真的送出了什麼、模型也回了，然後才失敗的那種**有**。
-        # ⇒ 只有前者豁免。這樣兩個 reviewer 的實測形狀同時成立，也不必去讀 error 的訊息文字。
+        # ⇒ 只有前者豁免。這樣兩種實測形狀同時成立，也不必去讀 error 的訊息文字。
         if e.get("type") == "event_msg" and ptype == "error":
             turn_error = True
 
@@ -1619,7 +1636,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             user_text = None
             if ptype == "user_message":
                 raw_msg = payload.get("message")
-                # ⚠ (v36-fam3 F3) **非字串一律走與新格式同一組檢查**，兩側對稱。
+                # ⚠ **非字串一律走與新格式同一組檢查**，兩側對稱。
                 # 原本是 `str(payload.get("message") or "")`：`message` 從字串漂成 content block
                 # 陣列時，`str()` 會把 Python 的 repr 整包當成 prompt 收下——實測收到的是
                 # "[{'type': 'text', 'text': '…'}, {'type': 'image', …}]"，而三層哨兵全靜：
@@ -1704,7 +1721,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                 n_unhandled_user_events += 1
             if user_text is not None:
                 turn_prompts += 1
-                n_prompts_total += 1         # (v36-fam5 #3) 收尾那條底線哨兵要用；與窗無關
+                n_prompts_total += 1         # 收尾那條底線哨兵要用；與窗無關
                 # Codex also emits response_item role=user, but those can include injected context
                 # （實測 0.147 那些就是注入的 AGENTS.md 全文）。event_msg 這一則才是使用者可見的 turn。
                 s.events.append({
@@ -1751,14 +1768,14 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
         # 內容事件把「同一則的兩種表述」隔開：之後再出現同文字的 UserMessage 就是真的重打了。
         pending_user = None
 
-        # (v36-fam5 #2) 型別改名／新型別：容器沒漂（payload 仍是 dict）、但 `payload.type` 認不得。
+        # 型別改名／新型別：容器沒漂（payload 仍是 dict）、但 `payload.type` 認不得。
         # 歷史上真正發生過的漂移（0.147）就是改名，不是容器換型，而既有的容器哨兵只認後者。
         if str(ptype or "") not in _CODEX_HANDLED_RESPONSE_ITEMS:
             n_unhandled_response_items += 1
 
         if ptype == "message":
             role = payload.get("role")
-            # (v36-fam6 #2) 兩格與型別改名同症狀、但既有哨兵都接不到的漂移：
+            # 兩格與型別改名同症狀、但既有哨兵都接不到的漂移：
             #   ① `role` 改名／缺欄 → 下一行直接 `continue`，助理內容整批消失、完全無聲。
             #   ② `content` 欄改名／型別不對 → `_codex_content_text` 取到 None 而回空字串，
             #      而 `n_empty_assistant_items` 的守門要求它是**非空 list**，於是那一格也不出聲。
@@ -1773,7 +1790,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                 continue
             text = _codex_content_text(payload.get("content"), "output_text")
             if not text.strip():
-                # (v36-fam5 #2) content **元素**型別改名（`output_text` → 別的名字）：型別白名單
+                # content **元素**型別改名（`output_text` → 別的名字）：型別白名單
                 # 接不到（`payload.type` 還是 `message`），這裡是唯一看得見的地方。
                 # ⚠⚠ **判準是「這個元素還有沒有沒被讀到的東西」**，不是「list 空不空」，
                 # 也不是「型別對不對」。三種形狀要同時處理好（前兩種都實測過）：
@@ -1831,7 +1848,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
                     _codex_block_loses(b, "summary_text") for b in _sm)):
                 n_bad_reasoning_summary += 1
             # 推理**原文**放在 `content`（`[{"type":"reasoning_text","text":…}]`）：本工具只畫摘要，
-            # 那段文字不會出現在輸出裡，而摘要是空的 list 時上面那條完全安靜（`v62-fam` #8）。
+            # 那段文字不會出現在輸出裡，而摘要是空的 list 時上面那條完全安靜。
             # 加密的 reasoning 這一欄是 null／不存在 ⇒ 正常資料不會出聲。
             # 只看 `content` 這一欄（其他欄位名：範圍限制 SCOPE-SENTINEL-UNCOVERED-SHAPES）。
             if _any_text(payload.get("content")):
@@ -1871,7 +1888,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             }
             # ⚠⚠ **工具呼叫也算助理內容。** 只認 `message` 的話，
             # 「漏收 prompt → function_call → error」那個窗會被 `error` 錯誤豁免
-            # （`qimg-fix-codex` Medium#5）。判準是「這個窗有沒有產出助理事件」，
+            # 。判準是「這個窗有沒有產出助理事件」，
             # 而不是「有沒有助理**文字**」。
             turn_ai = True
             s.events.append(ev)
@@ -1981,18 +1998,18 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     #   `function_call_output` 那一支），一場有工具呼叫、prompt 卻全丟時它不會是 0。
     # ⚠ **範圍限制 SCOPE-PARTIAL-TURN-LOSS**：這一條只認「整窗零則」，窗內只要還收到一則就
     #   不出聲 → 一個窗裡**只丟掉部分 prompt** 時，連同上面五個形狀哨兵一共六個全靜。
-    #   ⚠ (v36-fam5 #3) 下面那條底線哨兵**也接不到這一格**：它的判準是整場零則，窗內漏收時
+    #   ⚠ 下面那條底線哨兵**也接不到這一格**：它的判準是整場零則，窗內漏收時
     #   `n_prompts_total` 仍大於 0。哨兵從六個變七個，這個洞沒有變小。
     #   一個窗連送多則本來就合法（本機語料上是少數），所以不能把門檻從「零則」直接放寬——
     #   會在正常資料上吵。可靠的修法要「窗內宣告的則數 vs 收到的則數」相比，而那個欄位
-    #   不確定存不存在。實測數字與回頭處理的條件見 planning/scope-limits.md。
+    #   不確定存不存在。
     n_ai_turns = sum(1 for e in s.events if e.get("type") == "assistant")
     # 「有助理內容」也算進沒有產生事件的那種（加密 reasoning），見 `saw_unrendered_ai`。
     n_ai_turns = n_ai_turns or int(saw_unrendered_ai)
     if n_empty_turns and n_ai_turns and not subagent_thread:
         print(f"  ! {path.name}: 有 {n_empty_turns} 個回合開始了卻沒收到任何使用者 prompt"
               f"——不論形狀漂成什麼樣，這都代表使用者那一側有東西沒解析出來", file=sys.stderr)
-    # (v36-fam5 #3) **底線哨兵：不依賴任何事件名。** 上面那條雖然改看「結果」，卻仍要先有
+    # **底線哨兵：不依賴任何事件名。** 上面那條雖然改看「結果」，卻仍要先有
     # `event_msg:task_started` 才數得出窗——上游若在同一版把 prompt 事件與 `task_started` 一起
     # 改名／拿掉，`turn_open` 永遠是 False，連同五個形狀哨兵**六個會一起歸零**，而那正是它們
     # 要擋的樣態。實測（真實 rollout 施加漂移）：prompt 改名但留著 `task_started` → 上面那條
@@ -2114,8 +2131,7 @@ def clean_user_text(t):
 # =========================================================================
 # 使用者實際送出、但過去被靜默丟掉或誤標的三種東西
 # -------------------------------------------------------------------------
-# 判準一律走**結構標籤／結構欄位**，不猜文字。設計、量測與取捨見
-# `planning/user-turn-fidelity.md`；每一個數字都由
+# 判準一律走**結構標籤／結構欄位**，不猜文字。每一個數字都由
 # `scripts/probe_user_turns.py inventory` 現產，**不要照抄文件裡的數字**。
 #
 # ⚠ 這三種都是**回合會變多**的改動 ⇒ 序號錨點 `t{n}` 會位移（那本來就不耐久，
@@ -2133,7 +2149,7 @@ def clean_user_text(t):
 # ⚠⚠ **第二版又漏一層**：OSC 以外還有四種「控制字串」——DCS（`ESC P`）、SOS（`ESC X`）、
 # PM（`ESC ^`）、APC（`ESC _`），它們同樣是「引導字元 … 終止字元」中間夾任意 payload。
 # 只認 OSC 的話，`ESC P …payload… ESC \` 會被最後那條「兩字元跳脫序列」吃掉 `ESC P`，
-# **payload 原封不動留在頁面上**（`utf-fix-codex` 實測 `payload_left=True`）。
+# **payload 原封不動留在頁面上**（實測 `payload_left=True`）。
 # 每一種都還有 C1 單位元組形式（CSI=\x9b、OSC=\x9d、DCS=\x90、SOS=\x98、PM=\x9e、APC=\x9f）。
 # ⚠ 未終止的控制字串一路吃到字串結尾（`\Z`）：留著 payload 比多吃一段更糟——
 #   這是終端輸出，不是使用者的散文。
@@ -2145,7 +2161,7 @@ _ANSI_RE = re.compile(
     r"|\x1b[@-Z\\-_]")                     # 其餘兩字元跳脫序列
 # 剝完控制碼還要濾掉裸的控制字元（NUL/BS/VT/FF 等）。⚠ 保留 \t \n \r。
 # ⚠⚠ **範圍要含 C1（`\x80`–`\x9f`），不是只到 `\x7f`。** 第一版漏掉 C1，實測
-# `remaining_c1=['0x80', '0x91', '0x99']` 原樣進頁面（`utf-fix-codex-r2` 驗收）。
+# `remaining_c1=['0x80', '0x91', '0x99']` 原樣進頁面。
 # ⚠ 守它的斷言要放**裸的 C1** 當素材——舊素材只有 OSC／NUL／BS，
 #   而突變 ⑥b 是把整條規則關掉，抓不到「只漏幾個 C1」這種半修（教訓 55）。
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
@@ -2189,7 +2205,7 @@ def parse_notify(txt):
     「文字裡有沒有 `<task-notification>` 這幾個字」，於是**使用者自己打的字只要提到
     這個標籤，整則就變成一列通知**——而通知在封存分類器裡**不算對話**
     ⇒ 一場「下過任一指令 ＋ 問了一句關於這個標籤的話」的 session 會被判成
-    `command_only` **搬離 `~/.claude/projects/`**（`utf-fix-codex` High#2 實測）。
+    `command_only` **搬離 `~/.claude/projects/`**。
     「量到 0」講的是這份語料，不是這個判準的定義域。
 
     現在的判準是**整則都是通知**，機械定義：
@@ -2279,7 +2295,7 @@ def user_special_blocks(ev):
         # ⚠ **這個指令是從哪一種存法來的。** 呈現層不用它，`probe_user_turns.py render`
         # 用它當身分：兩種存法在同一秒出現同一個指令名時，只比「名字＋秒」的話
         # **user 側畫出來的那一個會被 SYSCMD 那格冒領**，於是 system 側整批沒畫也照樣全綠
-        # （`utf-fix-codex-r2` 實測 `[✓] CMDWRAP 1/1` ＋ `[✓] SYSCMD 1/1`，而產品只畫了一個）。
+        # （實測 `[✓] CMDWRAP 1/1` ＋ `[✓] SYSCMD 1/1`，而產品只畫了一個）。
         c["src"] = "system" if ev.get("_synth") == "local_command" else "user"
     # ⚠ 三格都空的指令區塊要在這裡就丟掉（例：`<local-command-stdout></local-command-stdout>`
     # ——`/rc` 那種沒有輸出的指令會另外寫一則空的結果事件）。留著的話 `render_command_html()`
@@ -2340,7 +2356,7 @@ def _has_unknown_content_block(s) -> bool:
     ⚠⚠ **為什麼不能只看 `s.main_groups`**：`group_turns()` 會把不認得的區塊**先丟掉**，
     於是「一場有新型內容 ＋ 下過一個指令」的 session 在渲染管線的產物裡看起來
     **就只有一列指令** ⇒ 分類成 `command_only` ⇒ **被搬離 `~/.claude/projects/`**
-    （`utf-fix-codex` High#1 實測：塞一個 `{"type":"document"}` 的 user 區塊，
+    （實測：塞一個 `{"type":"document"}` 的 user 區塊，
     `kind=command_only`、`source_exists=False`——檔案真的被搬走了）。
 
     ⇒ **破壞性的分類不可以對未知 schema fail-open。** CLI 之後新增 audio / document /
@@ -2353,7 +2369,7 @@ def _has_unknown_content_block(s) -> bool:
         content = (ev.get("message") or {}).get("content")
         # ⚠⚠ **只有 `str` 可以豁免。** 第一版寫「不是 list 就是純字串，認得」——
         # 那句話不成立：`content` 也可能是**單一個 dict**、或是別的形狀。
-        # 實測（`utf-fix-codex-r2` 驗收）：`single_dict_block`、`scalar_inside_list`
+        # 實測：`single_dict_block`、`scalar_inside_list`
         # 都讓 `has_unknown=False`、分類成 `command_only` ⇒ **檔案照樣被搬走**。
         # 保守方向只有一個：**看不懂的一律當對話。**
         if isinstance(content, str):
@@ -2396,14 +2412,13 @@ def block_is_renderable(b, role):
         # 第一版讓它算（理由是「插話是對話內容，該標得到書籤」），結果是：
         # `_interject` 被插進 `cur["blocks"]` **中間**，於是**同一步之內它後面每一個區塊
         # 的序號 +1** ⇒ 既有的區塊書籤 `-b3` 不會失效、不會退化，
-        # **它會指到別的內容**——那是最壞的失敗方向（`utf-fam` High#3 實測）。
+        # **它會指到別的內容**——那是最壞的失敗方向。
         # ⚠ 這一版宣告的相容性保證原本只涵蓋**回合**錨點 `k…`；區塊錨點
         #   `k…-s<ep>-b<n>` 同樣是使用者按 ☆ 存得下來的身分，而且**數量多一個數量級**
         #   （全語料 116758 個區塊 vs 9047 個回合）。
         # ⇒ 和指令列／通知列同一個決定：**新長出來的東西一律不進序號**，
         #   那是「既有錨點逐字不變」唯一能機械保證的做法。
-        # 代價：插話本身標不到書籤（範圍限制 SCOPE-INTERJECT-NO-BLOCK-ANCHOR，
-        #      詳見 planning/scope-limits.md）。它仍然畫得出來、仍然進 MD、仍然搜得到。
+        # 代價：插話本身標不到書籤（範圍限制 SCOPE-INTERJECT-NO-BLOCK-ANCHOR）。它仍然畫得出來、仍然進 MD、仍然搜得到。
         return False
     return False
 
@@ -2441,7 +2456,7 @@ def _epoch_ms(e):
     改它的解析度會同時動到那三處，而區塊錨點只需要「同一輪內能不能分辨兩步」。
     兩個值各自都對，語意不同，所以分開存。
 
-    ⚠⚠ **為什麼區塊錨點不能用秒**（`bookmarks-p4-fam` High，實測）：同一輪裡兩次 API 呼叫
+    ⚠⚠ **為什麼區塊錨點不能用秒**（實測）：同一輪裡兩次 API 呼叫
     落在同一秒時，兩步底下的區塊會拿到**完全相同**的錨點 ⇒ 頁面 id 重複、
     `getElementById` 取第一個 ⇒ 在第二塊按 ☆ 存下來的是第一塊的摘要，
     而跳回去時 `openSub()` 回「精確命中」、`.hl` 框在第一塊、沒有橫幅、還改寫網址列。
@@ -2562,7 +2577,7 @@ def synth_queued_user_events(events, name=""):
     #   ① 同一句排隊送出兩次（「繼續」這種），第二次的**按 Enter 時刻**是錯的；
     #   ② 整場任何一則真 user 事件曾出現同一句，**所有**同文字的排隊句都不補
     #      ⇒「先正常送一次、後來排隊再送一次」的第二次整句消失
-    #      （`utf-fix-codex` Medium 實測 `QUEUED_REPEAT synth=0`）。
+    #      （實測 `QUEUED_REPEAT synth=0`）。
     # 真實語料量測（2026-08-25，594 個檔／133 個 remove）：同檔同句 remove **全部只有 1 次**、
     # 132 個沒有對應的真 user 事件、**1 個有而且落在 remove 之後**、sidechain 裡 0 個。
     # ⇒ 重複那一格目前語料命中 0，但結構上會發生（教訓 44），照修；
@@ -2618,7 +2633,7 @@ def synth_queued_user_events(events, name=""):
         if p or imgs:
             # ⚠⚠ **鍵要帶來源檔。** 只用 prompt 的話，附件在子代理轉錄檔、`remove`
             # 在主檔時會**跨來源配對**，於是主檔憑空多出一句話
-            # （`utf-fix-codex-r2` 實測 `QUEUED cross_source: count=1 src=['main.jsonl']`）。
+            # （實測 `QUEUED cross_source: count=1 src=['main.jsonl']`）。
             human.setdefault((e.get("_srcf") or "", p), []).append(
                 (a.get("timestamp") or e.get("timestamp"), imgs))
     if n_bad_prompt:
@@ -2656,7 +2671,7 @@ def synth_queued_user_events(events, name=""):
         # ⚠⚠ **每一個對得上的 `remove` 都要消耗一個 attachment 時刻**，
         # 不管它最後是由合成事件還是由真 user 事件呈現。舊版只在「真的合成」時才前進，
         # 於是「第一次被真 user 代表、第二次才合成」的那一句拿到**第一次**的按 Enter 時刻
-        # （`utf-fix-codex-r2` 實測 `queued_at=['…10:00:01Z']`，實際是 `10:00:10`）。
+        # （實測 `queued_at=['…10:00:01Z']`，實際是 `10:00:10`）。
         queued_at, queued_imgs = _take_queued_at(human, used, hkey)
         # ⚠⚠ **只消耗「同一個來源檔、而且排在這個 remove 之後」的真 user 事件。**
         # 那是實測到的唯一形狀（撤回後又重送：真事件寫在 remove 後面）。
@@ -2687,7 +2702,7 @@ def synth_queued_user_events(events, name=""):
             "timestamp": e.get("timestamp"),
             "uuid": f"_queued:{e.get('_i')}",
             # ⚠⚠ **不可以硬寫 `False`。** 排隊句也可能發生在子代理的轉錄檔裡，
-            # 硬寫的話它會被塞進主對話（`utf-fix-codex` Medium）。
+            # 硬寫的話它會被塞進主對話。
             # ⚠ 真實語料目前 0 則落在 sidechain——照樣沿用來源事件的身分，
             #   因為「量到 0」講的是這份語料，不是這個判準（教訓 44）。
             "isSidechain": bool(e.get("isSidechain")),
@@ -2760,7 +2775,7 @@ def synth_local_command_events(events):
 
     範圍限制 SCOPE-CMD-DUAL-STORAGE-DUP：去重只依 `uuid`。同一次指令若被兩種存法
     **各寫一則**（同時戳、同名、同參數），會畫成兩列。本函式不做跨形狀的語意去重——
-    那個判準會誤殺「真的連下兩次同一個指令」。詳見 planning/scope-limits.md。
+    那個判準會誤殺「真的連下兩次同一個指令」。
     """
     out = []
     for e in events:
@@ -2824,7 +2839,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
                 # 的述詞，而下面那條路靠它決定**要不要切輪**：指令包裝的文字被
                 # `clean_user_text()` 清成空 ⇒ 舊資料一律 `rest == []` ⇒ 掛進回合內部、不切輪。
                 # 排隊句帶圖之後那個 image block 會讓 `rest` 變成非空 ⇒ 條件失效 ⇒ 自成一輪
-                # ⇒ **那一輪被切成兩半、同一步後面的區塊錨點整批改指**（`qimg-fam` Low#5 實測：
+                # ⇒ **那一輪被切成兩半、同一步後面的區塊錨點整批改指**（實測：
                 # 少掉 `-b3`／`-b4`，內容搬到新回合的 `-b1`／`-b2`）。那正是這個 repo
                 # 花最多力氣在擋的失敗方向。
                 # ⇒ 圖片改掛在特殊區塊自己身上（和 `_interject` 的 `imgs` 同一套做法），
@@ -2854,7 +2869,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
                 #   合併同時是「畫得對」與「不動到既有書籤」，兩件事指向同一個做法。
                 # ⚠ 指令列現在有**兩個落點**（掛在開著的回合內部／自成一列 metarow），
                 # 所以「把結果併回上一列」要**兩邊都找**。只找 metarow 那一邊的話，
-                # 掛在回合內部的那些指令，結果會自己另起一輪（`utf-fam` 之後新增的落點）。
+                # 掛在回合內部的那些指令，結果會自己另起一輪。
                 if sp["type"] == "_command" and not sp.get("name") and sp.get("out"):
                     prev = None
                     # ⚠⚠ **只認「上一個區塊就是它」**——`cur["blocks"][-1]`。
@@ -2948,7 +2963,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
             # ⚠⚠ **靠的是 `_turn_done`，不是「沒有開著的回合」。** 本註解第一版寫的是後者，
             #   那是錯的：`cur` 在 `turn_duration` 之後**仍然開著**（它要等下一則 assistant
             #   事件才換），所以真正把它擋下來的是中間剛好有一則真 user 事件
-            #   ——沒有那一則時就會掛錯（`utf-fix-codex` Medium 實測）。
+            #   ——沒有那一則時就會掛錯。
             if (blocks and e.get("_queued_at") and cur is not None
                     and cur["role"] == "assistant"):
                 cur["blocks"].append({
@@ -2959,7 +2974,6 @@ def group_turns(events, per_step=True, step_by_usage=False):
                     # `_interject` 在 `block_is_renderable()` 回 False ＝ 不佔 `-b<n>`；
                     # 圖片跟著它走才保得住那條保證。當成獨立 block 塞進去的話，
                     # **同一步之後每一個區塊的序號 +1**，既有的區塊書籤會安靜指到別的內容
-                    # （`utf-fam` High#3 實測過的失敗方向）。
                     "imgs": [b for b in blocks if b.get("type") == "image"],
                     "dt": e.get("_dt"),
                     "queued_at": e.get("_queued_at"),
@@ -3012,7 +3026,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
             # 只設不清的話，`turn_duration → 下一輪 assistant → 這一輪跑到一半的插話`
             # 會被誤標成「上一輪結束後才讀到」——實測 `interject_after_turn_flags=
             # [('read after first turn', True), ('interjected during second turn', True)]`
-            # （`utf-fix-codex-r2` 驗收）。⚠ 清在這裡、設在本分支最後的 `_turn_ms` 那格，
+            # 。⚠ 清在這裡、設在本分支最後的 `_turn_ms` 那格，
             # 順序不可以顛倒。
             cur["_turn_done"] = False
             msg = e.get("message") or {}
@@ -3053,7 +3067,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
                 # 而 `cur` 會一直開著等下一則 assistant 事件 ⇒ 不標記的話，
                 # 落在這之後的排隊句仍然會被掛成「這一輪內部的插話」，
                 # 畫面上變成他在一個**已經結束**的回合裡插話
-                # （`utf-fix-codex` Medium 實測 `interject_hosts=[('assistant', …)]`）。
+                # （實測 `interject_hosts=[('assistant', …)]`）。
                 cur["_turn_done"] = True
     if cur:
         turns.append(cur)
@@ -3064,8 +3078,8 @@ def _tiebreak_key(g):
     """撞號組內的決定性排序鍵＝**來源檔行序**。**這不是身分**，只是讓「誰拿到無後綴的錨點」
     有一個與呈現結構無關的依據。
 
-    ⚠⚠ 前一版用 `(bool(side), role, 首個 block 前 200 字)`，三個問題全被 `durable-anchor-r2`
-    抓到，**而且它的註解宣稱修掉了其中一個、實際上沒有**：
+    ⚠⚠ 排序鍵**不可以**用 `(bool(side), role, 首個 block 前 200 字)`，它有三個問題
+    （而且註解不可以宣稱修掉了其中一個卻實際沒有）：
 
     1. `bool(side)` 是第一個鍵，而 `False < True` ⇒ **主回合永遠排在子代理之前**，
        與 `s.main_groups + s.side_groups` 的 list 位置完全同序——它宣稱修掉的「主搶子」原封不動。
@@ -3083,8 +3097,7 @@ def _tiebreak_key(g):
     **鍵是 `(來源檔識別, 逐檔行序)`。** 只有行序不夠：`enumerate(fh)` 每個檔從 0 重新起算，
     而一場 session 的事件來自**多個檔**（主檔 ＋ `<sid>/**/*.jsonl` 子代理轉錄，見
     `load_session`）。單拿行序比會打平，而 `list.sort` 是穩定排序 ⇒ 退回
-    `s.main_groups + s.side_groups` 的位置 ⇒ 主搶子。⚠ **這個錯我犯過三次**
-    （`durable-anchor-y1` #2 → `r2` #3 → `r4` #1），每次都是註解宣稱了保證卻沒人在守。
+    `s.main_groups + s.side_groups` 的位置 ⇒ 主搶子。⚠ **註解宣稱了保證卻沒人在守，這個錯很容易重犯**。
     現在守它的是 `tests/test_smoke.py::test_anchor_tiebreak_main_vs_side`。
 
     **它保證什麼**：主檔的事件（`src_f` 為空字串）排在所有子代理檔之前。
@@ -3098,14 +3111,14 @@ def _tiebreak_key(g):
     那會把「撞號組只有 4 個」換成「正規化一改、全部書籤同時失效」。
 
     ⚠ 兩邊 loader 的 `_i` 語意不同：Claude 是 `load_events` 的**逐檔行序**；
-    Codex 是 `load_codex_session` 重新 `enumerate(raw)` 的**解析成功序**（`durable-anchor-r4` #7）。
+    Codex 是 `load_codex_session` 重新 `enumerate(raw)` 的**解析成功序**。
     兩者都對 append 穩定，覆蓋率實測皆 100%（Claude 36368 回合／Codex 1323 回合都沒缺）。
     取不到時退回 `-1`（排在最前），至少是決定性的。
 
     ⚠ 它仍**解不掉插入不穩定**：原本獨佔某毫秒的回合拿無後綴錨點，之後若有新輪撞進同一毫秒
     且行序更前，就會換人。要完全免疫只有「每個錨點一律帶內容雜湊後綴」，那等於把
     「9166 分之 1」換成「正規化一改、全部書籤同時失效」。
-    **範圍限制 SCOPE-BOOKMARK-TIEBREAK-INSERT**：詳見 planning/scope-limits.md。
+    **範圍限制 SCOPE-BOOKMARK-TIEBREAK-INSERT**。
     """
     i = g.get("src_i")
     return (str(g.get("src_f") or ""), i if isinstance(i, int) else -1)
@@ -3229,13 +3242,11 @@ def analyze(s, acct_switches=None):
         # ⚠ **撞號組「內」用來源檔行序排，不看 list 位置。** 用位置的話，
         # `s.main_groups + s.side_groups` 這個「主回合全排在子代理之前」的人為順序，
         # 會讓一個**新出現的主回合**直接搶走某個子代理回合原本的無後綴錨點
-        # （`durable-anchor-y1` #2 實測過）。行序至少與訊息內文脫鉤。
+        # （實測過）。行序至少與訊息內文脫鉤。
         # ⚠⚠ **但它「沒有」解掉主/子互搶**——`_i` 是逐檔行號，主檔與子代理檔不可比，
-        # 打平時穩定排序會退回 list 位置。這句話我在這裡寫錯過三次
-        # （y1 #2 → r2 #3 → r4 #1），**現在是誠實版，不要再往上加保證**。
-        # 未修，見 SCOPE-BOOKMARK-TIEBREAK-INSERT〈第四輪〉。
+        # 打平時穩定排序會退回 list 位置。        # **這句話只能講到「行序與訊息內文脫鉤」，不要再往上加保證**（見 SCOPE-BOOKMARK-TIEBREAK-INSERT）。
         # ⚠⚠ **但這解不掉「插入新輪可能換人拿無後綴錨點」**——那取決於撞號組的成員，
-        # 不是排序法。**範圍限制 SCOPE-BOOKMARK-TIEBREAK-INSERT**，詳見 planning/scope-limits.md。
+        # 不是排序法。**範圍限制 SCOPE-BOOKMARK-TIEBREAK-INSERT**。
         if len(_grp) > 1:
             _grp.sort(key=_tiebreak_key)
         for _i, g in enumerate(_grp, 1):
@@ -3244,7 +3255,7 @@ def analyze(s, acct_switches=None):
             # `k<時戳>[-tb<n>][-s<步時戳>][-b<區塊序>]`，**每一段都要自帶前綴**才分得開哪一段
             # 是什麼。裸數字會讓退化規則只能靠「最後一段是不是數字」猜——而第 4 期一旦讓
             # 子定位符自己帶 tiebreak（`k…-s…-2`），那種錨點就**永遠退化不了**
-            # （`durable-anchor-r2` #9）。
+            # 。
             g["kanchor"] = _ka if _i == 1 else f"{_ka}-tb{_i}"
     # 子代理數量：優先用不重複的 agentId（外部檔），否則退回分組數
     agent_ids = {e.get("agentId") for e in side if e.get("agentId")}
@@ -3331,10 +3342,10 @@ def analyze(s, acct_switches=None):
         prev_t = {}
         prev_ttl = {}       # 每條軸上一個**有寫入**的步是哪個 TTL 檔次 → 切換的那一步才標得出來
         # 同一次呼叫（同一個 message.id）的事件被使用者回合隔開時，`group_turns` 會在兩個回合各畫一個步
-        # ——那是**同一筆寫入**，表頭只能算一次、也不可以拿它當切換點（`v62-fam` #6：表頭寫
-        # 「5m 2 步」，花費組成表只算一次）。
+        # ——那是**同一筆寫入**，表頭只能算一次、也不可以拿它當切換點（否則表頭寫
+        # 「5m 2 步」，花費組成表卻只算一次）。
         # 範圍限制 SCOPE-TTL-SPLIT-CALL-BADGES：只算一次的是表頭這一行（與花費組成）；
-        # 逐步徽章與 MD 的回合標記仍是每個步各畫一個。詳見 planning/scope-limits.md。
+        # 逐步徽章與 MD 的回合標記仍是每個步各畫一個。
         seen_mid = set()
         for g in groups:
             for b in g.get("blocks", []):
@@ -3354,7 +3365,7 @@ def analyze(s, acct_switches=None):
                     # 下一次寫入被誤標成切換。
                     # ⚠ **沒有時間戳的步不參與切換判定**（不當基準、也不在它身上標切換）：它在時間序裡
                     #   排第一（`ts_key` 的 AWARE_MIN）是假的位置，拿它當基準會把「1h→5m」講成
-                    #   「5m→1h」（`v62-fam` #6）。它的寫入照樣算進步數。
+                    #   「5m→1h」。它的寫入照樣算進步數。
                     p = ""
                     if b.get("t") is not None:
                         p = prev_ttl.get(ax, "")
@@ -3616,7 +3627,7 @@ def load_account_switches(config_dirs, health=None) -> dict:
     為什麼需要它：快取按 organization 隔離，Claude API 上另外還按 workspace 再隔一層；換帳號等於
     把整段前綴丟掉。本模組的判別粒度是**config 目錄**（history.jsonl 一列只有 sessionId 與時刻，
     沒有任何帳號／組織／workspace 身分欄位），涵蓋的是「不同 config 目錄＝不同登入」這個假設；
-    範圍限制見 planning/scope-limits.md 的 SCOPE-CFG-PATH-IDENTITY。但沒撞 limit 的自願切換
+    範圍限制 SCOPE-CFG-PATH-IDENTITY。但沒撞 limit 的自願切換
     **不會**留下 429/401，transcript 裡沒有任何欄位標示帳號 → 那一步只會被看成「1h TTL 內卻冷啟」
     而歸成 evict（實測本機 22 個切換邊界有 10 次落在 evict，佔 evict 總數的 38%）。
 
@@ -3632,7 +3643,7 @@ def load_account_switches(config_dirs, health=None) -> dict:
     `health`：呼叫端可傳入一個 dict 收集涵蓋率（掃了幾個目錄／幾個檔／幾列／幾列認不得）。
     刻意用「傳入被填寫」而不是改回傳值——回傳值有多個呼叫端與測試在用，形狀不動。
     """
-    # `files_blank`（v36-fam6 #5）：有列、卻一列都認不得的 history 份數。
+    # `files_blank`：有列、卻一列都認不得的 history 份數。
     h = {"dirs": 0, "files": 0, "rows": 0, "bad_rows": 0, "read_errors": 0, "files_blank": 0}
     by_sid: dict[str, list] = {}
     for cfg in config_dirs:
@@ -3647,7 +3658,7 @@ def load_account_switches(config_dirs, health=None) -> dict:
             label = str(Path(cfg).resolve()).casefold()
         except OSError:
             label = str(cfg).casefold()
-        # (v36-fam6 #5) `files` 在 `open()` **成功之後**才加：舊寫法開檔失敗時 `files` 與
+        # `files` 在 `open()` **成功之後**才加：舊寫法開檔失敗時 `files` 與
         # `read_errors` 會同時加一，於是 `_acct_scope_note` 的「讀到 N 份 history」把讀不到的
         # 那幾份也算進去了——揭露涵蓋率的句子本身高估涵蓋率，方向剛好相反。
         try:
@@ -3657,7 +3668,7 @@ def load_account_switches(config_dirs, health=None) -> dict:
             print(f"  ! 讀取失敗 {hist}: {e}", file=sys.stderr)
             continue
         h["files"] += 1
-        # (v36-fam6 #5) 逐檔記「這一份有沒有貢獻任何認得的列」。舊哨兵的條件是
+        # 逐檔記「這一份有沒有貢獻任何認得的列」。舊哨兵的條件是
         # `h["files"] and not by_sid`＝**全部**檔案都認不得才出聲；而切帳號偵測本來就要靠
         # **跨帳號比對**才成立，少掉一邊等於這條路徑實質失效，回傳值卻與「真的沒切過」同形。
         rows_here = ok_here = 0
@@ -3722,7 +3733,7 @@ def load_account_switches(config_dirs, health=None) -> dict:
         print(f"  ! 切帳號偵測：讀了 {h['files']} 個 history.jsonl／{h['rows']} 列，"
               f"認得的列 0 筆——列格式可能變了，切帳號歸因這一輪等於沒有作用", file=sys.stderr)
     elif h["files_blank"]:
-        # (v36-fam6 #5) **部分**檔案認不得。上面那條只在全部都認不得時出聲，而切帳號是
+        # **部分**檔案認不得。上面那條只在全部都認不得時出聲，而切帳號是
         # 靠**跨帳號比對**成立的：少掉一邊，這條路徑就實質失效，而回傳值仍與「真的沒切過」同形。
         print(f"  ! 切帳號偵測：{h['files']} 份 history 裡有 {h['files_blank']} 份有列、"
               f"卻一列都認不得——那幾個帳號的切換偵測不到，跨帳號比對會少一邊；"
@@ -3816,7 +3827,7 @@ def collect_cache_steps(s, acct_switches=None):
     # 的切換符合那條規則而被整組丟掉，該步的成因就從 acct 掉成 intra／evict。
     # ⚠ 步驟那一側刻意維持整秒：`cache_steps` 存進 manifest，改它的型別等於改存檔格式。
     # **範圍限制 SCOPE-ACCT-EVENT-SUBSEC**：兩側精度不同的涵蓋範圍寫在 `classify_cache_causes`
-    # 消費事件那一段；詳見 planning/scope-limits.md 的 SCOPE-ACCT-EVENT-SUBSEC。
+    # 消費事件那一段。
     for t in (acct_switches or {}).get(s.session_id, ()):
         events.append([float(t), "acct"])
     events.sort()
@@ -3858,8 +3869,7 @@ def _resets_lineage(api_cause, srv_cause, boundary, acct):
 
     `classify_cache_causes` 與 `build_cache_report` 是刻意的雙胞胎，**必須用同一份判準**：
     兩邊各寫一份的話，同一步會在報告端與逐步徽章端落進不同的 cohort（一邊 `expiry` 記人因錢、
-    一邊 `evict` 不記錢），同一頁上兩個地方對同一步講相反的話。這正是 `v36-fam3` F1 抓到的分岔
-    ——`srv_cause` 只有報告端算進去。
+    一邊 `evict` 不記錢），同一頁上兩個地方對同一步講相反的話。這種分岔就是「`srv_cause` 只有報告端算進去」。
 
     四個入口都代表「邊界前那次寫入的 TTL 對後續步不再適用」：
       - `api_cause`：API 自報前綴被改掉（工具／系統提示／前文／換模型）——前綴已經不是同一個。
@@ -3933,7 +3943,7 @@ def classify_cache_causes(raw, models, events, masked=None):
             fc = "compact"                             # 同下方配對迴圈：壓縮邊界比通稱 msgs 更準
         causes[ckeys[0]] = fc or "first"      # steps[0][0] == 0 已保證這是原始第 0 步
     ei, n_ev = 0, len(events)
-    # (v36-fam5 #1) 這一場出現過 limit/auth 的時刻，供「人因勝出但可能是被迫」的並列顯示用。
+    # 這一場出現過 limit/auth 的時刻，供「人因勝出但可能是被迫」的並列顯示用。
     # ⚠ 刻意**不**用上面那個會前進的事件游標：游標會先跳過第一步之前的事件（那些永遠進不了
     # 任何一對的 `kinds`），而「同場稍早撞過 limit」問的是整條時間軸，不是某一對的窗。
     limit_ts = sorted(float(t) for t, k in events if k in ("limit", "auth"))
@@ -3949,12 +3959,12 @@ def classify_cache_causes(raw, models, events, masked=None):
         # ⚠ 事件與步驟的時間精度不同：步驟時刻是整秒（存進 manifest 的型別），acct 事件保留
         # 毫秒。兩側同秒時，這條比較把事件視為落在該步**之後**——涵蓋到「切換與前一步同秒、
         # 但實際更晚」為止；反向那一格（切換其實早於前一步、只是同一秒）仍會歸給這一對。
-        # **範圍限制 SCOPE-ACCT-EVENT-SUBSEC**，詳見 planning/scope-limits.md。
+        # **範圍限制 SCOPE-ACCT-EVENT-SUBSEC**。
         while ei < n_ev and events[ei][0] <= prev[0]:
             ei += 1
         kinds = set()
         j = ei
-        # ⚠ (v36-fam6 #4) 這個上界還有**另一個方向**沒被上面那段講到：切換落在當前這一步
+        # ⚠ 這個上界還有**另一個方向**沒被上面那段講到：切換落在當前這一步
         #   自己那一秒（步在 T+300、切換在 T+300.6）時，它會被算給 (prev, cur) 這一對並**記錢**，
         #   而 `ei = j` 又把標記消費掉，真正在切換之後的那一步反而拿不到。實測三種次秒位置
         #   （T+299.4／T+300.0／T+300.6）結果完全相同 → tie-break 一律往「算在使用者頭上」倒。
@@ -3982,8 +3992,7 @@ def classify_cache_causes(raw, models, events, masked=None):
             # 前綴在中間就被改掉了。不看的話結構性實據會被分析門檻吃掉，下游冷啟被誤判成 evict
             # （實測 ctx 差 1 個 token 結論就翻轉）。ctx 門檻只該管「由命中率推論」，不管前綴事實。
             # **範圍限制 SCOPE-FILTERED-STEP-CAUSE**：借來的成因掛在**後一步**上，而它描述的是
-            # 中間那一步。兩步的成因不同時，後一步顯示的是中間步的成因。詳見
-            # planning/scope-limits.md 的 SCOPE-FILTERED-STEP-CAUSE。
+            # 中間那一步。兩步的成因不同時，後一步顯示的是中間步的成因。
             api_cause = next((c for r in raw[ip + 1:ic]
                               if (c := API_MISS_CAUSE.get(_step_miss(r)[0]))), None)
         if api_cause == "msgs" and boundary == "compact":
@@ -4018,7 +4027,7 @@ def classify_cache_causes(raw, models, events, masked=None):
             if masked is not None:
                 also = _masked_human(causes[ckeys[ic]], (api_cause, srv_cause, boundary),
                                      kinds, gap, ttl_bound)
-                # (v36-fam5 #1) 反方向的並列：**人因勝出、但結構性條件也可能成立**。
+                # 反方向的並列：**人因勝出、但結構性條件也可能成立**。
                 # `boundary` 的「被迫/自願」只看**同一對相鄰步之間**的事件，429 與切換中間夾了
                 # 任何一次 API 呼叫，那次被迫切換就會落成 `acct`（人因、記錢、紅色 🔥）。
                 # 全語料實測：10 個 `acct` 標籤裡有 3 個同場稍早出現過 limit/auth
@@ -4068,6 +4077,50 @@ def build_tool_result_map(events):
     return tmap
 
 
+def _codex_result_text(b):
+    """Codex 工具結果陣列裡的文字格（`{"type":"input_text","text":"…"}`）回它的字；不是就回 None。
+
+    Codex 新版 `exec` 的結果（`custom_tool_call_output`／`function_call_output` 的 `output`）是
+    content item 陣列：第一格是 `Script completed`／`Wall time` 那段標頭，後面幾格才是指令輸出，
+    中間可能夾 `input_image`。不認得這一格的話，整段會被 `json.dumps` 成一整行、換行全變成 `\\n`。
+    ⚠ Claude 的 `text` 不走這裡——呼叫端先處理它，那兩個分支照舊。
+    ⚠ 不分來源：認的是格的形狀。Claude 的工具結果不會有這兩種型別；真的出現時照文字畫也是對的讀法。
+    ⚠ `text` 一定要是字串，理由同 `_codex_consumed()`：不是字串就是上游換了形狀，
+      交回呼叫端照原樣印成 JSON，不要 `str()` 成 Python 的 repr。
+    ⚠ 欄位只能是 `_CODEX_TEXT_KEYS` 裡的：多一個就不認、交回去印 JSON。認了的話，多出來的欄位
+      在頁面上不會以任何形式出現，上游加了東西也沒有人看得到。空字串照認（輸出本來就是空的）。"""
+    ty = b.get("type")
+    if (ty != "text" and ty in _TEXT_BLOCK_TYPES and isinstance(b.get("text"), str)
+            and b.keys() <= _CODEX_TEXT_KEYS):
+        return b["text"]
+    return None
+
+
+# Codex 工具結果陣列裡認得的兩種格各自可以帶的欄位（多一個就照原樣印 JSON，理由見 `_codex_result_text`）
+_CODEX_TEXT_KEYS = frozenset(("type", "text"))
+_CODEX_IMAGE_KEYS = frozenset(("type", "image_url", "detail"))
+
+
+def _is_codex_input_image(b):
+    """`input_image` 格，而且只帶 `_CODEX_IMAGE_KEYS` 裡的欄位。"""
+    return b.get("type") == "input_image" and b.keys() <= _CODEX_IMAGE_KEYS
+
+
+_DATA_IMAGE_RE = re.compile(r"data:([\w.+-]+/[\w.+-]+);base64,(.*)\Z", re.S)
+
+
+def render_input_image(b):
+    """OpenAI 形狀的圖片（`{"type":"input_image","image_url":"data:image/png;base64,…"}`）。
+
+    轉成 Claude 的 `source` 形狀交給 `render_image_block()`，格式白名單與大小上限都沿用那一支。
+    ⚠ **只收 `data:` 網址**：http 網址或檔案路徑一律佔位——離線頁面不替對話去外連抓圖。"""
+    u = b.get("image_url")
+    m = _DATA_IMAGE_RE.match(u.strip()) if isinstance(u, str) else None
+    if not m:
+        return '<div class="img-ph">🖼️ 圖片</div>'
+    return render_image_block({"source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)}})
+
+
 def normalize_result(content):
     if content is None:
         return ""
@@ -4079,8 +4132,10 @@ def normalize_result(content):
             if isinstance(b, dict):
                 if b.get("type") == "text":
                     parts.append(str(b.get("text") or ""))
-                elif b.get("type") == "image":
+                elif b.get("type") == "image" or _is_codex_input_image(b):
                     parts.append("[圖片]")
+                elif (t := _codex_result_text(b)) is not None:
+                    parts.append(t)
                 else:
                     parts.append(json.dumps(b, ensure_ascii=False))
             else:
@@ -4169,6 +4224,10 @@ def render_result_html(tmap, tid):
                 parts.append(render_image_block(b))
             elif isinstance(b, dict) and b.get("type") == "text":
                 parts.append(_pre_text(b.get("text", "")))
+            elif isinstance(b, dict) and _is_codex_input_image(b):
+                parts.append(render_input_image(b))
+            elif isinstance(b, dict) and (t := _codex_result_text(b)) is not None:
+                parts.append(_pre_text(t))
             elif isinstance(b, dict):
                 parts.append(_pre_text(json.dumps(b, ensure_ascii=False)))
             else:
@@ -4480,7 +4539,7 @@ def _ttl_head(s):
         if uh:
             hp.append(f"TTL 未知 ×{uh}")
         text += f"{'；' if parts else ''}另有 {htot + uh} 次沒有可呈現內容的呼叫（{'／'.join(hp)}）"
-    # ⚠ 子代理的寫入**沒有**在別處彙總（只有逐步徽章）——不可以寫「另計」（`v62-fam` #5）。
+    # ⚠ 子代理的寫入**沒有**在別處彙總（只有逐步徽章）——不可以寫「另計」。
     return text, ("只計主對話；子代理的寫入不在這一行，只標在它們各自的步上"
                   "（子代理預設寫 5m，Claude Code 有設定可改成 1h，見 docs/token-計算原理.md）。"
                   "步數與逐步徽章同一串；沒有可呈現內容的呼叫沒有徽章，另列次數。"
@@ -4540,7 +4599,7 @@ def render_turn_meters(group):
     """assistant 回合的小徽章：快取% / 花費 / (可勾) 新輸入·寫入·讀取 / 脈絡 / 產出。
     冷啟著色分兩級：真失效（閒置過期/異常逐出）紅標、結構性或未歸因（首呼叫/回合內斷點/換模型…）中性灰，
     避免把「本來就不會命中」誤讀成快取失效；多步回合另以 ❄ 揭露被彙總藏住的最冷步，同樣依成因決定紅或灰。
-    **單步回合**不畫逐步列也不畫 ❄，成因改由這裡的 ⚡ 徽章直接帶（v36-fam3 F2）。"""
+    **單步回合**不畫逐步列也不畫 ❄，成因改由這裡的 ⚡ 徽章直接帶。"""
     u = group.get("u")
     if group.get("role") != "assistant" or not u:
         return ""
@@ -4557,7 +4616,7 @@ def render_turn_meters(group):
         ctitle = ("整段命中率低，且含真正的快取失效（閒置過期或異常提早失效）" if kind == "cold"
                   else "整段命中率低，但屬結構性/預期內（首呼叫、回合內斷點等）——非快取失效")
         if group.get("n_steps", 0) <= 1:
-            # (v36-fam3 F2) 單步回合**兩者都不畫**：沒有逐步分隔列（下面刻意省略），也不符合
+            # 單步回合**兩者都不畫**：沒有逐步分隔列（下面刻意省略），也不符合
             # 下方 ❄ 的 `n_steps >= 2` → 成因與並列標籤在頁面上一個字都看不到。而
             # `_masked_human_note`／`_srv_excluded_note` 對讀者寫的正是「逐步徽章會兩個都標」，
             # 那句話在這種回合上是假的——本機有**一成左右**的並列步落在單步回合，
@@ -4571,7 +4630,7 @@ def render_turn_meters(group):
                 # ⚠ 上面那句（紅/灰兩級的判讀：是不是真失效）**照留**，成因接在後面。
                 # 整句換掉會把既有資訊換走——那是回歸，不是修正（test_cold_cause_badges 守著它）。
                 if mmask:
-                    # (v36-fam4 #2) **但有並列人因條件時它會與後半句打架**：`turn_cold_class`
+                    # **但有並列人因條件時它會與後半句打架**：`turn_cold_class`
                     # 只看勝出的那個成因（`unavail` 不在 `_COLD_GENUINE` → 灰、寫「非快取失效」），
                     # 而後半句正好在說「閒置過期，快取已過期（可避免）」——同一個 tooltip
                     # 兩句話互相否定。這種步改用不預判的措辭，讓成因自己講。
@@ -4653,7 +4712,7 @@ def block_anchor(kanchor, step_ep, n, in_step):
     「失效時讀得出是哪一刻」；而區塊錨點失效時 `openSub()` 一定會退到回合，橫幅印的是
     **回合**的時刻，`-s` 這一段從來不會單獨拿給人看。省下來的是每個區塊 6 個字元。
 
-    ⚠⚠ **負的 `step_ep` 一律不給**（`bookmarks-p4fix-codex` Medium）。理由不是
+    ⚠⚠ **負的 `step_ep` 一律不給**。理由不是
     「1970 年前不會發生」——是 **`-` 就是段落分隔符**，所以 `k…-s-500-b1` 對每一個
     用 `-` 切字串的消費者都是畸形：`bmGrammarOk()` 判它不合法（合法錨點被宣告未命中），
     `openSub()` 的 `lastIndexOf('-')` 退化階梯也會切在錯的地方。
@@ -4672,8 +4731,8 @@ def step_anchor(kanchor, step_ep):
     """一次 API 呼叫（「步」）的錨點 `k<回合時戳>[-tb<n>]-s<步epoch毫秒>`。不給就回 `""`。
 
     ⚠⚠ **`-s<ep>` 有兩個產出端**：步驟列自己的 `id`，以及區塊錨點的中段。
-    **兩邊一律走這一支**，不可以各寫一份判斷（`bookmarks-p4fix-codex-r2` Low：
-    第一版只在 `block_anchor()` 擋負值，於是同一個 group 裡區塊錨點正確消失、
+    **兩邊一律走這一支**，不可以各寫一份判斷（例：
+    只在 `block_anchor()` 擋負值，於是同一個 group 裡區塊錨點正確消失、
     步驟列照樣輸出 `k…-s-900`——而那正是 `bmGrammarOk()` 會拒絕的字串，
     使用者點了只會得到「找不到」）。**同一條規則寫兩次就會分岔**，這條線為此付過三次。
 
@@ -4693,8 +4752,7 @@ def step_anchor(kanchor, step_ep):
 def turn_block_anchors(group):
     """這一輪每個 block 的區塊錨點，回一個**與 `group["blocks"]` 等長**的 list（沒有就是 `""`）。
 
-    ⚠⚠ **產品碼與探針共用這一支，不可以各抄一份**（`bookmarks-p4-fam` Low ＋
-    `bookmarks-p4-codex` Low，同一課付了兩次）：`scripts/probe_turn_identity.py` 的
+    ⚠⚠ **產品碼與探針共用這一支，不可以各抄一份**（兩邊各抄一份就會分岔）：`scripts/probe_turn_identity.py` 的
     `blocks` 模式要統計「實際可標記的區塊有幾個」，而那個條件**不只是「渲染得出來」**——
     還要求該輪有 `kanchor`、所在步有 `tms`、且 `tms` 在同一輪內沒撞號。
     探針自己抄一份的話，統計出來的是「可渲染」而不是「可標記」，
@@ -4747,7 +4805,7 @@ def wrap_block(inner, anchor):
     ⚠ **這段標記是逐區塊展開的靜態文字**，每個可標記區塊約 475 bytes（全語料 1068 頁／116758
     區塊＝總量的 7.92%；⚠ 最大的幾頁只佔 1–2%，平均是被中小型頁面拉上來的）。這裡刻意**與整輪那組按鈕沿用同一套寫法**（`onclick` 直掛、
     錨點字串出現三次），不為了壓體積另開一條事件委派的路徑——**範圍限制
-    `SCOPE-BOOKMARK-BLOCK-CTL-BYTES`：詳見 planning/scope-limits.md**。
+    `SCOPE-BOOKMARK-BLOCK-CTL-BYTES`**。
     """
     if not anchor:
         return inner
@@ -4772,7 +4830,7 @@ def render_step_meters(idx, u, cause=None, gap=None, t=None, masked=None, anchor
     標上時刻，頁面上才找得到「某個時間點發生了什麼事」。
 
     ⚠ **逐步時刻常比正上方的回合標頭更早**（本機語料上多數多步回合都如此；精確筆數隨語料
-    浮動，重量測的口徑見 `planning/cache-attribution-next.md`），那不是 bug：
+    浮動），那不是 bug：
     步驟列所在的是 assistant 回合，它的標頭時間是**第一筆有可呈現內容的事件**，而呼叫起點在
     那之前——一次呼叫往往先產生思考或工具呼叫，之後才有可呈現的內容。兩個值各自都對。"""
     stamp = epoch_str(t, "%H:%M:%S")
@@ -4906,7 +4964,7 @@ def render_notify_html(b):
     那個「或」是**只修一半**：帶 `<event>` 的那種（Monitor 型）於是只剩 event 內容，
     同一則的 `<task-id>`、`<output-file>` **從頁面和 MD 全文索引裡消失**
     ——而那些欄位在 v55 之前是搜得到的（整則原文就畫在頁面上）
-    ⇒ 這一版把它變成**比舊版更差**（`utf-fix-codex` Medium 實測 `task_in_md=False`）。
+    ⇒ 這一版把它變成**比舊版更差**（實測 `task_in_md=False`）。
     現在的做法：event 當摘要用，摺疊裡永遠是完整原文。
     """
     summ = b.get("summary") or ""
@@ -4939,12 +4997,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         # /compact 壓縮點：標示分隔線（手動/自動＋壓縮量），摘要收進摺疊（此摘要即下次送模型 context 的起點）
         summ = "".join(md_to_html(b.get("text") or "")
                        for b in group["blocks"] if b.get("type") == "text" and (b.get("text") or "").strip())
-        m = group.get("compact_meta") or {}
-        trig = {"manual": "手動 /compact", "auto": "自動壓縮"}.get(m.get("trigger"), "壓縮 (compact)")
-        bits = [trig]
-        pre, post = m.get("preTokens"), m.get("postTokens")
-        if pre and post:
-            bits.append(f"{fmt_tokens(pre)} → {fmt_tokens(post)} tokens")
+        bits = _compact_bits(group)
         when = local_str(group.get("dt"), "%H:%M:%S")
         if when:
             bits.append(when)
@@ -4960,9 +5013,8 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
     #   `bn`＝目前作用域內的可標記區塊序號，**每進一步就歸零**
     kanc = group.get("kanchor") or ""     # 只給步驟列的 `-s` 錨點用
     # ⚠⚠ **區塊錨點一律由 `turn_block_anchors()` 算，這裡不重算一份。**
-    # 探針要統計「實際可標記的區塊」，兩邊各算一份就會分岔——這條線為此付過兩次
-    # （`bookmarks-p4-fam` Low：探針抄了 `block_is_renderable`；
-    #   `bookmarks-p4-codex` Low：統計把「可渲染」誤稱「可標記」）。
+    # 探針要統計「實際可標記的區塊」，兩邊各算一份就會分岔（例：探針自抄 `block_is_renderable`，
+    # 或把「可渲染」誤稱「可標記」）。
     # 那一支也負責同一輪內 `tms` 撞號時整步不給錨點的底線
     # （由 `test_bookmark_block_anchor_same_second` 第 2 節在守）。
     _anchors = turn_block_anchors(group)
@@ -4980,8 +5032,8 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         """收掉「插話之後」那個縮排框；**裡面什麼都沒有的話連開啟標籤一起撤掉**。
 
         ⚠ 插話是那一輪**最後一個**區塊時（他打完字、助手沒有再回任何東西），
-        舊版照樣開框 ⇒ 頁面上出現一個寫著「↳ 回應這句」、底下空無一物的框
-        （`utf-fix-codex` Low 實測）。標籤是平衡的，但那句話在說謊。
+        照樣開框的話，頁面上會出現一個寫著「↳ 回應這句」、底下空無一物的框
+        ——標籤是平衡的，但那句話在說謊。
         ⇒ 空的就整個撤掉；真的沒有後續回應時，畫面上就只有插話本身。
         """
         if len(parts) == ij_at + 1:
@@ -5138,7 +5190,7 @@ def acct_marks(s):
     # ⚠ 判準是**上面還有沒有回合**，不是「早於第一個有時間的回合」——開頭那幾則沒有時間時
     # 兩者不是同一件事：線會畫在第一個有時間的回合之前，而那上面仍有可隔的內容。
     # 範圍限制 SCOPE-ACCT-MARK-AFTER-LAST-TURN：涵蓋到「畫或不畫」為止——上下真的空無一物的
-    # 標記兩端都不畫，輸出上也不另外標示被略過了幾筆。詳見 planning/scope-limits.md。
+    # 標記兩端都不畫，輸出上也不另外標示被略過了幾筆。
     groups = getattr(s, "main_groups", []) or []
     first_i = next((i for i, g in enumerate(groups) if g.get("dt")), None)
     if first_i is None or first_i > 0:
@@ -5166,7 +5218,7 @@ def pending_acct(marks, i, group):
     **範圍限制 SCOPE-ACCT-SEP-HEAD-BASIS**：定位只看回合標頭的 `dt`（＝該回合第一筆**可呈現**
     事件的時刻）。同一次呼叫的**起點**可能更早——`_step` 的 `t` 印的就是那個，兩者常差幾十秒。
     切換時刻落在這兩者之間時，線收在整個回合之前，而該回合的首步其實在切換之前就開始了。
-    詳見 planning/scope-limits.md 的 SCOPE-ACCT-SEP-HEAD-BASIS。"""
+    範圍限制 SCOPE-ACCT-SEP-HEAD-BASIS。"""
     dt = group.get("dt")
     if dt is None:
         return [], i
@@ -5235,9 +5287,9 @@ var BK_MORE=false;      /* 對話窗的類別 chip 展開了沒 */
 var BK_UNDO=null;       /* 剛移除的那一筆，讓「復原」不必再打一次備註 */
 
 /* ── 匯入檔的型別閘（**進得來的東西一律先過這裡**）────────────────────
-   ⚠⚠ 舊版對字串欄位一律 `String(v)`，於是 `String({})` ＝ `'[object Object]'`
-   ⇒ 造得出 id 為 `[object Object]|[object Object]` 的**幽靈書籤**
-   （跨模型 Medium#7）。`String()` 不是驗證，它是**強制轉型**——把「不是字串」
+   ⚠⚠ 字串欄位不可以一律 `String(v)`：`String({})` ＝ `'[object Object]'`
+   ⇒ 造得出 id 為 `[object Object]|[object Object]` 的**幽靈書籤**。
+   `String()` 不是驗證，它是**強制轉型**——把「不是字串」
    悄悄變成一個看起來像字串的東西，正是驗證要擋的那件事。 */
 function bkStr(v,max){
  if(typeof v==='number'&&isFinite(v))v=String(v);   /* 舊資料的 sid 可能是數字 */
@@ -5264,8 +5316,7 @@ function bkSpanOk(v){
 function bkDueOk(v){
  var n=Number(v);
  return (isFinite(n)&&n>0&&n<=8.64e15)?n:0;}
-/* ⚠⚠ 匯入檔的**時間戳**：缺漏或垃圾＝「未知」，權重 0，**不可以退回「匯入當下」**
-   （跨模型 High#2）。退回當下有兩個後果：①同一份檔案匯入兩次結果不同（不冪等）；
+/* ⚠⚠ 匯入檔的**時間戳**：缺漏或垃圾＝「未知」，權重 0，**不可以退回「匯入當下」**。退回當下有兩個後果：①同一份檔案匯入兩次結果不同（不冪等）；
    ②那個值永遠比本機大 ⇒ 一份舊備份可以**反覆**把本機後來的編輯壓掉。
    未知（0）在 `mtI>bkWhen(cur)` 這個比較裡一定輸 ⇒ 只會補本機缺的欄位，不會蓋掉。
    「什麼時候拿到的」另外記在 `im`，只給排序與顯示用，**絕不參與合併比較**。 */
@@ -5280,7 +5331,7 @@ function bkTs(v,now){
 /* ⚠⚠ **「讀不到」和「確定沒有書籤」是兩種狀態，不可以混成同一種。**
    舊版解析失敗就回空陣列，於是**下一次任何寫入**（加一筆、移除、匯入）都把那個空
    狀態寫回原鍵，把還救得回來的原始字串**永久輾掉**——等於所有書籤自動消失
-   （跨模型 High#4）。現在壞掉時帶 `bad:1` ＋ `raw`，由 `bkStore()` 一律拒寫，
+   現在壞掉時帶 `bad:1` ＋ `raw`，由 `bkStore()` 一律拒寫，
    footer 給一條「⛑ 匯出原始資料」的救援路。
    守它的是探針的 `corrupt_store_not_overwritten`／`corrupt_store_drop_also_blocked`。 */
 function bkLoad(){
@@ -5291,7 +5342,7 @@ function bkLoad(){
  try{o=JSON.parse(r);}catch(e){return {v:1,items:[],bad:1,raw:r};}
  if(!o||!Array.isArray(o.items))return {v:1,items:[],bad:1,raw:r};
  /* ⚠ items 裡的**每一筆**也要驗。`{items:[null]}` 是合法 JSON、根形狀也對，
-    但 `bkCatsAll()` 一碰就 `TypeError` ⇒ **整頁死掉**（跨模型 Medium#7）。
+    但 `bkCatsAll()` 一碰就 `TypeError` ⇒ **整頁死掉**。
     ⚠ 個別壞掉的紀錄直接丟掉、**不封鎖寫入**：它們連 sid/anchor 都沒有，
     沒有任何可救的內容，而一個 null 不該讓使用者從此不能再加書籤。
     這和上面那個「整份讀不到」是**不同等級**的壞，處置也不一樣。 */
@@ -5316,7 +5367,7 @@ function bkLoad(){
   /* ⚠⚠ **逐欄位正規化，不是只驗 sid／anchor 就把原物件塞回去。** 舊版 `out.push(x)`
      ⇒ `{sid:'s',anchor:'k',cat:{}}` 過得了這一關，然後 `bkCatsUsed()` 的
      `(cat||'').replace` 直接 `TypeError`＝**整頁死掉**。那正是 `{items:[null]}`
-     那一條（跨模型 Medium#7）的同一個病，只是換到欄位層——當時只補了最外層。
+     那一條的同一個病，只是換到欄位層——當時只補了最外層。
      ⚠ **`url` 刻意不在這裡過 `bkSafeRel`**：那會讓匯出端那道閘再也沒有素材走得到
      （手改進去的絕對路徑會在載入時就被清掉），縱深就變成只剩一道而且量不到。
      形狀驗證留給匯出端（`export_gate_drops_hand_edited_url` 在守）。
@@ -5388,7 +5439,7 @@ function bkRescue(){
     ⚠⚠ **但訊息要跟著實際狀態走。** 舊版一律說「瀏覽器拒絕存取 localStorage」，
     理由寫的是「`lsGet` 丟例外時 `bkLoad()` 回 `{bad:1,raw:''}`」——**那個狀態到不了**：
     `lsGet` 自己就 try/catch 回 `null`，`bkLoad` 的 `if(!r)` 先把它接走 ⇒ 永遠不是 `bad`。
-    ⚠⚠ **訂正（`bookmarks-p4-fam` Low）：整個 `if(!raw)` 分支從 UI 都到不了，不只 `st.bad` 那半。**
+    ⚠⚠ **訂正：整個 `if(!raw)` 分支從 UI 都到不了，不只 `st.bad` 那半。**
     `bkFoot()` 的救援鈕**只在 `st.bad` 為真時**畫得出來，而 `bkLoad()` 在 `st.bad` 時
     `raw` 必定非空（`if(!r)` 先把 null 接走了，JSON 壞掉那條一定帶著原字串）
     ⇒ 按得到鈕的時候 `raw` 一定有東西。
@@ -5487,7 +5538,7 @@ function bkFindId(st,id){
  for(var i=0;i<st.items.length;i++)if(st.items[i].id===id)return st.items[i];
  return null;}
 /* ⚠ 匯入檔的數字欄位一律過這一層：`Number('1e999')` 是 `Infinity`，
-   拿它當「比較新」的依據就會**永遠贏過任何本機值**（`bookmarks-p23` 的 High #2 順帶項）。
+   拿它當「比較新」的依據就會**永遠贏過任何本機值**。
    守它的是探針的 `infinite_ct_clamped`／`infinite_due_clamped`。 */
 function bkNum(v,def){var n=Number(v);return isFinite(n)?n:def;}
 /* 合併時的「時刻」：優先用 `mt`（最後修改），沒有就退回 `ct`（建立）。
@@ -5511,15 +5562,14 @@ function bkWhen(x){
  var c=bkNum(x&&x.ct,0); return c>0?c:0;}
 /* 排序用的「時刻」：`ct` 未知（匯入檔沒帶時間戳）時退回 `im`＝什麼時候匯進來的。
    ⚠⚠ **`im` 只給排序與顯示，絕不參與 `bkWhen()` 的合併比較**——「拿收到的時間當
-   修改時間」正是跨模型 High#2 的成因。兩個用途分開，才不會又混回去。 */
+   修改時間」正是「匯入時間戳退回匯入當下」的成因。兩個用途要分開。 */
 function bkOrd(x){return bkNum(x&&x.ct,0)||bkNum(x&&x.im,0);}
 
 /* ── 合併一筆（匯入 ↔ 本機，兩個方向共用同一段）─────────────────────
    ⚠⚠ **「只增不減」是這一套的最高不變量**，而它一度是假的：舊版是**整筆勝者制**
    ——較新那一筆的非空欄位直接取代本機，輸家的 note/cat/sum **原地消失、不留痕跡**；
-   反向分支自稱「只補缺欄位」卻漏掉 `url`／`town`／獨立的 `due`（跨模型 High#3）。
-   上一輪的 commit 訊息寫「兩個方向都改成逐欄位、只增不減」，**那句話對非空衝突是假的**，
-   而且沒有任何測試在守它。這次連測試一起補（探針 ⑭c）。
+   反向分支自稱「只補缺欄位」卻漏掉 `url`／`town`／獨立的 `due`。
+   「兩個方向都逐欄位、只增不減」這個保證**對非空衝突不成立**，所以要有測試守它（探針 ⑭c）。
 
    欄位分兩類，處置不同：
    · **使用者自己寫的**（`note`／`cat`）：一個字都不可以掉。兩邊都有而且不同、
@@ -5600,7 +5650,7 @@ function bkOverdue(x){return !!(x&&x.due&&x.due<=Date.now());}
 function bkDate(ms){
  /* ⚠ 匯入檔的 `due` 可能超出 JS Date 的 ±8.64e15（`1e999` ⇒ Infinity）。
     超界就是 Invalid Date、`getFullYear()` 回 NaN，畫面會印出「複查 NaN-NaN-NaN」。
-    **算不出來就什麼都不印**——和 `bmWhen` 那條（`durable-anchor-r4` #8）是同一課：
+    **算不出來就什麼都不印**——和 `bmWhen` 那條是同一課：
     不要自信地印一個不存在的日期。守它的是探針的 `overflow_due_no_nan`。 */
  if(!ms||!isFinite(ms)||Math.abs(ms)>8.64e15)return '';
  var d=new Date(ms);
@@ -5671,7 +5721,7 @@ function bkCatsRecent(st){
     但**剛建好的下一秒就被收進「更多…」是最糟的**。
     ⚠⚠ 舊版把**所有**沒被用到的類別都給 `Infinity`：於是它們全部同分，
     穩定排序保留 `bkCatsAll` 的順序（設定頁的手動順序），而新類別是**接在尾端**的
-    ⇒ 已經有六個未使用類別時，剛建好的那顆排第七、直接被藏起來（跨模型 Low#10）。
+    ⇒ 已經有六個未使用類別時，剛建好的那顆排第七、直接被藏起來。
     ⚠ 而舊探針只造了**一個**未使用類別，所以它必定排第一——**那一格是空心的**。
     改法：用 `cta`（什麼時候建的）當它的時刻，和「什麼時候用過」**同一把尺**比。
     沒有建立時刻的（舊資料、匯入來的）給 0：那種類別本來就不算「最近」。
@@ -5758,7 +5808,7 @@ function bkCatAdd(){
  if(!c){bkCatDraw();return;}
  /* 順手寫進設定的類別清單，設定頁那邊立刻看得到、可以改名／排序。
     ⚠ 同時記下**建立時刻**（`cta`）：`bkCatsRecent` 靠它讓剛建好的那顆排第一，
-    否則六個未使用類別在前時它會被藏進「更多…」（跨模型 Low#10）。 */
+    否則六個未使用類別在前時它會被藏進「更多…」。 */
  var s=bkSet(), i, has=false;
  for(i=0;i<s.cats.length;i++)if(s.cats[i]===c)has=true;
  if(!has){s.cats.push(c);s.cta[c]=Date.now();
@@ -5824,7 +5874,7 @@ function bkEditRec(seed){
     ——只有前者才該重算到期日，見那裡的說明。
     ⚠⚠ `mt0` ＝**開窗那一刻這一筆的修改時刻**。四個頁面吃同一份 localStorage，
     開著窗的時候別的分頁可能改過同一筆；沒有 `mt0` 就沒有任何辦法察覺
-    ⇒ 存回去等於拿開窗時的表單**整筆覆寫**掉對方剛寫的東西（跨模型 Medium#8）。
+    ⇒ 存回去等於拿開窗時的表單**整筆覆寫**掉對方剛寫的東西。
     `null` ＝這一筆本來就不存在（新建），那沒有衝突可言。
     ⚠⚠ **光有 `mt0` 不夠。** `bkMerge()` 補缺欄位（`cat`／`url`／`due`）時
     **不會動 `mt`**——那是刻意的（`mt` 是合併排序用的尺，一動就會改變誰比較新）。
@@ -5850,7 +5900,7 @@ function bkCommit(){
  var rec=bkFindId(st,BK_EDIT.id), now=Date.now(), isNew=!rec;
  var span=bkPicked();
  var note=(document.getElementById('bkNote')||{}).value||'';
- /* ⚠⚠ 開窗到現在，**別的分頁可能改過同一筆**（跨模型 Medium#8）。
+ /* ⚠⚠ 開窗到現在，**別的分頁可能改過同一筆**。
     偵測到就把兩邊的備註都留著——和匯入衝突走**同一個 `bkKeepLost()`**，
     不要在這裡另寫一套（同一條規則寫兩次就會分岔）。 */
  var clash=(!isNew&&BK_EDIT.mt0!==null
@@ -5930,7 +5980,7 @@ function bkUndo(){
  var st=bkLoad();
  if(st.bad){bkRefresh(BK_BADMSG);return;}
  if(!bkFindId(st,BK_UNDO.id))st.items.push(BK_UNDO);
- /* \u26a0\u26a0 **\u5beb\u5165\u6210\u529f\u4e86\u624d\u53ef\u4ee5\u6e05\u6389 `BK_UNDO`**\uff08\u8de8\u6a21\u578b Medium#6\uff09\u3002
+ /* \u26a0\u26a0 **\u5beb\u5165\u6210\u529f\u4e86\u624d\u53ef\u4ee5\u6e05\u6389 `BK_UNDO`**\u3002
     \u5148\u6e05\u7684\u8a71\u5beb\u5165\u4e00\u5931\u6557\uff0c\u552f\u4e00\u9084\u539f\u5f97\u56de\u4f86\u7684\u90a3\u4efd\u8cc7\u6599\u5c31\u6c92\u4e86\u3001\u800c\u4e14**\u7121\u6cd5\u91cd\u8a66**
     \u2014\u2014\u90a3\u9846\u300c\u5fa9\u539f\u300d\u9215\u4e5f\u8ddf\u8457\u6d88\u5931\uff0c\u4f7f\u7528\u8005\u9023\u518d\u6309\u4e00\u6b21\u7684\u6a5f\u6703\u90fd\u6c92\u6709\u3002
     \u5b88\u5b83\u7684\u662f\u63a2\u91dd\u7684 `undo_survives_write_failure`\uff0f`undo_retry_restores`\u3002 */
@@ -5980,7 +6030,7 @@ function bkFoot(st){
      使用者自己改過名的（town=1）才留著。
    · **路徑要過形狀閘** ——⚠⚠ 原本這裡寫的是「`url` 本來就是相對路徑，沒有絕對路徑
      可洩漏」。**那句話對「本機自己存的」成立，對「匯入進來的」不成立**
-     （跨模型 High#1）：匯入端原樣收下 `url`，遮蔽匯出又無條件把它吐回去。
+     匯入端若原樣收下 `url`，遮蔽匯出又無條件把它吐回去。
      現在匯入端擋一次（`bkSafeRel`）、這裡再擋一次——**入口與出口各一道**，
      因為「只寫一條分支」正是這條線上重複踩的那個坑。
    ⚠ **設定也要一起匯出**（含類別清單）：只在 localStorage 裡＝一次「清除瀏覽資料」就沒了。 */
@@ -5995,7 +6045,7 @@ function bkExport(full){
   var o={id:x.id,sid:x.sid,anchor:x.anchor,url:bkSafeRel(x.url),
          note:x.note||'',cat:x.cat||'',
          ct:x.ct||0,mt:bkWhen(x),span:x.span||'0',due:x.due||0,town:x.town?1:0};
-  /* ⚠⚠ **`id`／`sid`／`anchor` 也要有出口閘**（收斂確認輪 Medium）。上面那道
+  /* ⚠⚠ **`id`／`sid`／`anchor` 也要有出口閘**。上面那道
      `bkSafeRel` 把 `url` 顧到了，但這三個欄位**入口與出口都沒有任何形狀檢查**：
      `bkIdPart` 只擋 `|`／空白／控制字元（那是對的——錨點文法 `k<ts>-tb<n>-s<ts>-b<n>`
      需要 `-`），`bkLoad` 又明著保留任何非空字串 `id`。於是手改過的 localStorage、
@@ -6091,7 +6141,7 @@ function bkImport(inp){
     if(!x||typeof x!=='object'){skip++;continue;}
     /* ⚠⚠ **型別要真的是字串**，不可以 `String()` 硬轉——見 `bkIdPart` 的說明。
        `{sid:{},anchor:{}}` 原本會造出 id 為 `[object Object]|[object Object]`
-       的幽靈書籤（跨模型 Medium#7）。 */
+       的幽靈書籤。 */
     var sidI=bkIdPart(x.sid), anchI=bkIdPart(x.anchor);
     if(!sidI||!anchI){skip++;continue;}
     /* ⚠⚠ **`id` 一律重算，不吃檔案裡的那個。** `id` 是可導出的（`sid|anchor`），
@@ -6103,7 +6153,7 @@ function bkImport(inp){
     /* ⚠⚠ 缺漏／垃圾時間戳＝**未知（0）**，不是「匯入當下」。理由見 `bkTs`。 */
     var ctI=bkTs(x.ct,nowI), mtI=bkTs(x.mt,nowI)||ctI;
     var rec={id:ridI,sid:sidI,anchor:anchI,
-             /* ⚠⚠ **`url` 一律過 `bkSafeRel()`**（跨模型 High#1）。匯入檔可以塞
+             /* ⚠⚠ **`url` 一律過 `bkSafeRel()`**。匯入檔可以塞
                 絕對路徑，而「只匯書籤」原本無條件把 `url` 再吐出去 ⇒「可以拿給別人」
                 這個保證整個破掉，而且 `bkSafeRel()` 在這條路上**完全沒被用到**。
                 對不到形狀就丟掉——那個路徑本來就是可以用 sid 重算的快取
@@ -6120,7 +6170,7 @@ function bkImport(inp){
                 裡會被遮掉——直到你在該場 session 頁開一次書籤為止。
                 保守的方向是對的：認不出來時寧可多遮，不可以少遮。
                 範圍限制 SCOPE-BOOKMARK-IMPORTED-TITLE-OWNERSHIP：這個函式對
-                「標題是誰取的」只認本機刷新過的那一份，詳見 planning/scope-limits.md。 */
+                「標題是誰取的」只認本機刷新過的那一份。 */
              town:0,
              note:bkStr(x.note,20000),
              /* ⚠ 類別在**匯入這條路**也要正規化（trim ＋ 60 字，和 `bkCatsClean` 同一條規則）。
@@ -6142,8 +6192,8 @@ function bkImport(inp){
         同一段——這條線上同一個保證已經因為「只寫了一條分支」錯過三次）。 */
      if(bkMerge(st.items[by[rec.id]],rec,mtI))upd++; else skip++;}}
    /* 設定：**類別清單取聯集**（那是清單，只增不減），`rv` 這種單值偏好**本機優先**
-      ——本機已經有設定就代表使用者刻意選過（跨模型 High#3：舊版在本機已有設定時
-      把匯入的類別**整份忽略**，於是「換機器還原」只還原得到一半）。
+      ——本機已經有設定就代表使用者刻意選過（若在本機已有設定時
+      把匯入的類別**整份忽略**，「換機器還原」就只還原得到一半）。
       ⚠ 這裡只算出要寫什麼，**先不寫**：寫入順序見下面那一段。 */
    var nset=null, os=(o&&o.settings&&typeof o.settings==='object')?o.settings:null;
    if(os){
@@ -6164,7 +6214,7 @@ function bkImport(inp){
      var merged=bkCatsClean(mine.cats), inc=bkCatsClean(os.cats), j;
      for(j=0;j<inc.length;j++)if(merged.indexOf(inc[j])<0)merged.push(inc[j]);
      if(merged.length!==mine.cats.length)nset={rv:mine.rv,cats:merged,cta:mine.cta};}}
-   /* ⚠⚠ **先寫書籤，成功了才寫設定**（跨模型 Medium#6）。反過來的話 bookmark 那把
+   /* ⚠⚠ **先寫書籤，成功了才寫設定**。反過來的話 bookmark 那把
       鎖被拒時設定已經改掉＝**半套匯入**：類別清單多了一批、書籤一筆也沒進來。
       兩個 key 之間沒有交易可用，能做的就是**把會失敗的那一邊放前面**。 */
    if(!bkStore(st)){bkRefresh(bkWhyFail(st));return;}
@@ -6183,8 +6233,7 @@ addEventListener('keydown',function(ev){if(ev.key==='Escape')bkClose();});
 /* ── 別的分頁改了資料，這一頁要跟著重畫 ─────────────────────────────
    ⚠⚠ 四個頁面（session／索引／管理／設定）吃**同一個** `file://` origin 的
    localStorage，而靜態頁沒有任何其他同步管道。沒有這一段的話：在 session 頁加了書籤，
-   已經開著的索引頁與管理頁**永遠不會知道**——畫面停在舊狀態，而且沒有任何跡象
-   （跨模型 Medium#8）。
+   已經開著的索引頁與管理頁**永遠不會知道**——畫面停在舊狀態，而且沒有任何跡象。
    ⚠ **這一段只涵蓋三頁**（session／管理／設定）——索引頁不內嵌 core，
    它自己那一份在 `_INDEX_BOOKMARK_JS` 尾端。改同步行為時**兩邊都要改**。
    ⚠ `storage` 事件**只在別的分頁**觸發，自己的寫入不會叫到它 ⇒ 不會遞迴。
@@ -6338,7 +6387,7 @@ bkMark();
 #
 # 建置期唯一能給的是 `BX_SESS`＝「這次輸出裡有哪些 session、現在的檔名是什麼」
 # ——那正是〈網址本身不耐久〉要的反查表：檔名由**本地時間＋專案名＋帳號名**組出來
-# （`main()` 的 `base = f"{date}__{proj}__{sid[:8]}"`），專案改名或機器換時區就全變。
+# （`main()` 的 `base = f"{date}__{proj}__{out_id_part(s)}"`），專案改名或機器換時區就全變。
 # 所以記錄裡的 `url` 只是快取，**每次開這一頁都拿 sid 重算一次**。
 # ⚠ 不用 fetch 去讀 `.build-manifest.json`：`file://` 下 Chrome 擋 XHR／fetch，讀不到。
 _MANAGE_JS = r"""
@@ -6543,7 +6592,7 @@ function bkPick(btn){        /* ⚠ 覆寫 core 的版本：這一頁的 chip �
  btn.setAttribute('aria-checked','true');
  var s=bkSet(); s.rv=btn.getAttribute('data-v');
  /* ⚠⚠ **寫入的回傳值一定要看。** 這一頁原本改名／刪除／復原／排序／預設值
-    幾乎全部忽略回傳值，然後照樣宣稱成功（跨模型 Medium#6）——
+    幾乎全部忽略回傳值，然後照樣宣稱成功——
     使用者以為存好了，重新整理才發現什麼都沒變。 */
  if(!bkSaveSet(s)){bsRender();bkSay(bkWhySetFail());return;}
  bsRender();
@@ -6566,7 +6615,7 @@ function bsRenCommit(i){
  if(old===undefined||!nu||nu===old){bsRender();return;}
  if(st.bad){bsRender();bkSay(BK_BADMSG);return;}
  var n=0,j,now=Date.now(),snap=bkRawSnap();
- /* ⚠⚠ 動到書籤的 `cat` 就**一定要更新它的 `mt`**（跨模型 Medium#8）。
+ /* ⚠⚠ 動到書籤的 `cat` 就**一定要更新它的 `mt`**。
     不更新的話，之後匯入一份「改名前」的備份會被判成比本機新，把舊類別壓回來
     ——而畫面上沒有任何跡象。守它的是探針的 `rename_bumps_mt`。 */
  for(j=0;j<st.items.length;j++)if((st.items[j].cat||'')===old){
@@ -6621,7 +6670,7 @@ function bsDel(i){
  BS_UNDO={cat:c,at:(at<0?s.cats.length:at),wasManaged:(at>=0),
           cta:s.cta[c],ids:[]};
  var n=0,now=Date.now(),snap=bkRawSnap();
- /* ⚠ 和改名同一條規則：動到 `cat` 就要更新 `mt`（跨模型 Medium#8）。 */
+ /* ⚠ 和改名同一條規則：動到 `cat` 就要更新 `mt`。 */
  for(j=0;j<st.items.length;j++)if((st.items[j].cat||'')===c){
   BS_UNDO.ids.push(st.items[j].id); st.items[j].cat=''; st.items[j].mt=now;
   st.items[j].lr=bkNum(st.items[j].lr,0)+1; n++;}
@@ -6644,7 +6693,7 @@ function bsUndoCat(){
  for(j=0;j<st.items.length;j++)if(ids[st.items[j].id]){
   st.items[j].cat=BS_UNDO.cat; st.items[j].mt=now;
   st.items[j].lr=bkNum(st.items[j].lr,0)+1;}
- /* ⚠⚠ 和 `bkUndo()` 同一條：**寫入成功了才可以清掉 BS_UNDO**（跨模型 Medium#6）。
+ /* ⚠⚠ 和 `bkUndo()` 同一條：**寫入成功了才可以清掉 BS_UNDO**。
     先清的話寫入一失敗，那顆「復原」鈕就消失、而類別再也救不回來。 */
  if(!bkStore(st)){bsRender();bkSay(bkWhyFail(st));return;}
  /* ⚠ 只有本來就被管理的才放回清單——否則復原不是回到原狀，是升格。 */
@@ -7018,7 +7067,7 @@ function isK(id){{                          /* 嚴格認 k<8碼日期>T<9碼時�
 /* ⚠⚠ **文法驗證器**：`isK()` 只驗前 20 字，之後只要求第一個字元是 `-`
    ⇒ `-s`、`-b`、裸 `-tb`、`-s1-b1-b2`、`|`、引號、超長垃圾**全部**會被 `openSub()`
    的 `lastIndexOf('-')` 一段段剝掉、最後框住基底回合並顯示「退化命中」
-   （`bookmarks-p4-codex` Medium，六種輸入實測全中）。
+   （六種輸入實測全中）。
    那不是靜默指錯（有橫幅、不改網址），但它把**根本不合文法**的輸入表現成一次成功的
    粗略定位——而那個回合跟輸入毫無關係。
    ⇒ 只有**完整合法**的錨點才准走退化階梯，其餘一律走未命中。
@@ -7033,7 +7082,7 @@ function bmGrammarOk(id){{
  /* 槽位是**有序**的：回合 tiebreak → 步 → 區塊 → 子定位符自己的 tiebreak。
     ⚠ 最後那一格不是多餘的：第 1 期的逐段退化規則就設計成「`k…-s…-tb2` 的 tb 屬於
     子定位符、要連它一起退」，而 `probe_anchor_js.js` 的第 ④ 組一直在守那個保證。
-    ⚠⚠ **但它只准接在 `s` 後面**（`bookmarks-p4fix-codex` Medium）：原本只靠「槽位往後走」
+    ⚠⚠ **但它只准接在 `s` 後面**：原本只靠「槽位往後走」
     這一條，於是 `b → tb` 也被放行 ⇒ `-b1-tb2` 通過守門、退化後框住基底回合＝**安靜指錯**，
     而上面那段註解自己寫著「`-b1-tb2`（順序反）必須被拒」——**實作與註解當時是相反的**。
     差別在**前一段是誰**，不在「有沒有末尾 tb」，所以這裡要記住上一個吃掉的槽位。
@@ -7075,7 +7124,7 @@ function bmWhen(id){{                       /* 可讀式錨點的用處：失效
  if(!isK(id))return id;                     /* 形狀不對就原樣印，不要拼出 '2026-01-01 :: UTC' */
  var mo=+id.substr(5,2),d=+id.substr(7,2),h=+id.substr(10,2),mi=+id.substr(12,2),se=+id.substr(14,2);
  /* ⚠ isK 只驗「是不是數字」，`k99999999T999999999Z` 照樣通過。範圍不合理就原樣印，
-    不要自信地講一個不存在的時刻（`durable-anchor-r4` #8）。 */
+    不要自信地講一個不存在的時刻。 */
  if(mo<1||mo>12||d<1||d>31||h>23||mi>59||se>59)return id;
  return id.substr(1,4)+'-'+id.substr(5,2)+'-'+id.substr(7,2)+' '
        +id.substr(10,2)+':'+id.substr(12,2)+':'+id.substr(14,2)+' UTC';}}
@@ -7115,7 +7164,7 @@ function openSub(id){{var el=document.getElementById(id);
   id=id.slice(0,id.lastIndexOf('-'));el=document.getElementById(id);deg=true;}}
  if(!el){{
   /* ⚠ 未命中也要清掉上一次留下的 .hl：不清的話畫面會同時有「某一輪被框起來」＋
-     「找不到」橫幅，讀者讀不出到底跳了沒（`durable-anchor-r3` #1）。 */
+     「找不到」橫幅，讀者讀不出到底跳了沒。 */
   document.querySelectorAll('.hl').forEach(function(x){{x.classList.remove('hl');}});
   bmMiss(id);return true;}}
  /* t{{n}} 掛在標頭的零尺寸 span 上 → 往上提到所屬回合，讓 #t7 與 #k…Z 行為完全一致
@@ -7137,7 +7186,7 @@ function openSub(id){{var el=document.getElementById(id);
  if(deg){{bmBanner('\u2139 原連結指向這一輪裡更細的位置，那個位置在這份輸出裡找不到，'
   +'已改為跳到該回合（'+bmWhen(id)+'）。');}}
  /* ⚠⚠ 精確命中要**主動撤掉**橫幅。沒撤的話一次 miss 之後，**每一次成功跳轉都長得像失敗**
-    ——橫幅是 fixed、捲不掉，會一直說「找不到」直到重新載入（`durable-anchor-r3` #1）。 */
+    ——橫幅是 fixed、捲不掉，會一直說「找不到」直到重新載入。 */
  else{{bmClear();history.replaceState(null,'',  '#'+id);}}
  return false;}}
 function bmGo(){{if(location.hash.length>1)openSub(location.hash.slice(1));}}
@@ -7146,7 +7195,7 @@ setTimeout(bmGo,0);
    已經開在同一個分頁裡」是**同文件 fragment 導覽、不會重新載入** → openSub 一次都不會
    被呼叫 → 沒有 .hl、沒有橫幅，「找不到」又變回徹底靜默。而那正是本功能的主要使用情境。
    （頁內連結走 onclick→openSub 並回 false，不觸發導覽；replaceState 也不觸發，不會重複跑。） */
-/* ⚠ **已知限制**（`durable-anchor-r4` #6）：`hashchange` 只在 hash **有變**時觸發，
+/* ⚠ **已知限制**：`hashchange` 只在 hash **有變**時觸發，
    所以「網址列已經是 #k…、再點一次同一個我的最愛」完全靜默。頁內連結不受影響
    （走 onclick→openSub）。這是瀏覽器行為，靜態頁擋不到；不做假的修補。 */
 addEventListener('hashchange',bmGo);
@@ -7225,7 +7274,7 @@ def turn_meters_md(group):
         if group.get("n_steps", 0) >= 2:
             cold = f" · ❄最低 {mp}%（步驟{mi}{('·' + tag) if tag else ''}）{warn}"
         elif tag or warn:
-            # (v36-fam3 F2) 單步回合：MD 一律不畫逐步列，而上面那條又要求 n_steps >= 2
+            # 單步回合：MD 一律不畫逐步列，而上面那條又要求 n_steps >= 2
             # → 成因在 MD 上完全看不到（HTML 至少還有顏色，MD 連顏色都沒有）。
             # 不寫「最低／步驟 N」——只有一步，那兩個詞沒有意義。
             # MD 沒有 title 可掛，所以成因一律攤在版面上（與多步那條同樣的理由）。
@@ -7256,8 +7305,7 @@ def _turn_ttl_md(group):
     """MD 回合列的寫入 TTL：這一回合**有切換**就標第一個切換，否則列出不是 1h 的檔次；純 1h 不標。
 
     ⚠ MD 不畫逐步列，逐步徽章那一份資訊只能放在回合列上——否則「5m 一律要看得到」
-      （HTML 的 5m 不受開關控制）在 MD 上完全不成立，表頭說有切換、每一則卻找不到是哪一則
-      （`v62-fam` #10）。純 1h 是常態，每一則都標只會變成噪音（與表頭「全程 1h 就不顯示」同一條規則）。"""
+      （HTML 的 5m 不受開關控制）在 MD 上完全不成立，表頭說有切換、每一則卻找不到是哪一則。純 1h 是常態，每一則都標只會變成噪音（與表頭「全程 1h 就不顯示」同一條規則）。"""
     sw, tiers = None, []
     for b in group.get("blocks", []):
         if b.get("type") != "_step":
@@ -7278,8 +7326,30 @@ def _turn_ttl_md(group):
     return ""
 
 
+def _compact_bits(group):
+    """壓縮點的說明：手動／自動＋壓縮量（HTML 的分隔線與 MD 的標頭共用）。"""
+    m = group.get("compact_meta") or {}
+    bits = [{"manual": "手動 /compact", "auto": "自動壓縮"}.get(m.get("trigger"), "壓縮 (compact)")]
+    pre, post = m.get("preTokens"), m.get("postTokens")
+    if pre and post:
+        bits.append(f"{fmt_tokens(pre)} → {fmt_tokens(post)} tokens")
+    return bits
+
+
 def render_turn_md(group, tmap, ai="Claude"):
     role = group["role"]
+    if group.get("compact"):
+        # 壓縮摘要是 Claude Code 自己寫的、不是使用者打的字 ⇒ 不畫成「👤 You」（HTML 畫成分隔線＋摺疊）。
+        # 標頭仍是 `### … · 時刻 … {#tN}`：`_TURN_HEAD_RE` 認得 `MD_COMPACT_WHO`，`--search` 照樣切得到這一則。
+        summ = "\n\n".join(str(b.get("text") or "") for b in group["blocks"]
+                           if b.get("type") == "text" and (b.get("text") or "").strip())
+        if not summ:
+            return ""
+        mark = ((f" {{#{group['anchor']}}}" if group.get("anchor") else "")
+                + (f" {{#{group['kanchor']}}}" if group.get("kanchor") else ""))
+        when = local_str(group.get("dt"), "%H:%M:%S")
+        return (f"\n### {MD_COMPACT_WHO} · {when} · {' · '.join(_compact_bits(group))}{mark}\n\n"
+                "_先前對話已壓縮為這份摘要，以下即下次送模型 context 的起點。_\n\n" + summ + "\n")
     parts = []
     for b in group["blocks"]:
         t = b.get("type")
@@ -7329,7 +7399,7 @@ def render_turn_md(group, tmap, ai="Claude"):
             # ⚠⚠ **是 `raw or event`，不是 `event or raw`。** 寫成後者的話，帶 `<event>`
             # 的那種（Monitor 型）只會留下 event 內容，同一則的 `<task-id>` 與
             # `<output-file>` **從全文索引消失**——那是 v55 之前搜得到的東西
-            # （`utf-fix-codex` Medium 實測）。原文是超集，摘要另外那一行已經給了。
+            # 。原文是超集，摘要另外那一行已經給了。
             # ⚠ 和 HTML 走同一個表示式（`_strip_ansi(raw or event)`），兩邊不可以各取各的。
             _detail = _strip_ansi(b.get("raw") or b.get("event") or "")
             if _detail.strip():
@@ -7356,10 +7426,14 @@ def render_turn_md(group, tmap, ai="Claude"):
     # **結尾那一個**——用 pandoc 算繪這份 MD 時，被當成 id 的會是耐久錨點，`{#tN}` 會變成
     # 標題裡的可見文字。本工具自己的 `_TURN_HEAD_RE` 吃得下兩者（實測 `--search` 仍正常），
     # 而 `--search` 結果頁的連結仍走 `t{n}`，所以 MD 裡的耐久錨點目前只是給人 `rg` 用。
-    # 順序不可對調：`{#tN}` 必須在前，`_TURN_HEAD_RE` 靠它切回合（`durable-anchor-r2` #13）。
+    # 順序不可對調：`{#tN}` 必須在前，`_TURN_HEAD_RE` 靠它切回合。
     if group.get("kanchor"):
         mark += f" {{#{group['kanchor']}}}"
     return f"\n### {side}{icon} · {when}{meters}{mark}\n\n" + "\n\n".join(parts) + "\n"
+
+
+# MD 的壓縮摘要標頭裡「誰」那一格。**渲染端與搜尋端（`_TURN_HEAD_RE`）共用同一份定義**。
+MD_COMPACT_WHO = "📋 壓縮摘要"
 
 
 # MD 的切帳號分隔線。**渲染端與搜尋端共用同一份定義**：那行不屬於任何一則回合，
@@ -7413,6 +7487,7 @@ def render_session_md(s: Session) -> str:
     # ⚠ 這裡**不傳日期基準**：MD 全篇沒有日期可對照（回合標頭只有時分秒），任何基準都會有
     # 一格裸奔成沒有日期的時分。不傳＝一律帶日期，理由見 `acct_sep_label` 的 docstring。
     parts = []
+    heads = []          # 真的寫出的回合標頭：(在 parts 裡的位置, 錨點, 耐久錨點或 None)，最後換算成 s.md_turns
     for g in s.main_groups:
         md = render_turn_md(g, s.tmap, ai)
         # 與 HTML 同一條推進規則（理由見 render_session_html），兩邊條數與位置才會一致。
@@ -7433,14 +7508,501 @@ def render_session_md(s: Session) -> str:
             parts.append("\n" + sep)
         if not md:
             continue
+        if g.get("anchor"):
+            heads.append((len(parts), g["anchor"], g.get("kanchor") or None))
         parts.append(md)
-    out = "\n".join(x for x in head if x is not None) + "\n" + "\n".join(parts)
+    out = "\n".join(x for x in head if x is not None) + "\n"
+    offs = []                                   # 每一個真標頭那一行在 out 裡的起點
+    _pos = {i: None for i, _, _ in heads}
+    for i, p in enumerate(parts):
+        if i in _pos:
+            _pos[i] = len(out) + (len(p) - len(p.lstrip("\n")))
+        out += p + ("\n" if i < len(parts) - 1 else "")
+    offs += [(_pos[i], a, k) for i, a, k in heads]
     if s.side_groups:
-        sparts = [render_turn_md(g, s.tmap, ai) for g in s.side_groups]
-        sparts = [p for p in sparts if p]
+        sparts, sheads = [], []
+        for g in s.side_groups:
+            md = render_turn_md(g, s.tmap, ai)
+            if md:
+                if g.get("anchor"):
+                    sheads.append((len(sparts), g["anchor"], g.get("kanchor") or None))
+                sparts.append(md)
         if sparts:
-            out += "\n\n---\n\n## ↳ 子代理（subagent）對話\n" + "\n".join(sparts)
+            out += "\n\n---\n\n## ↳ 子代理（subagent）對話\n"
+            _pos = {i: None for i, _, _ in sheads}
+            for i, p in enumerate(sparts):
+                if i in _pos:
+                    _pos[i] = len(out) + (len(p) - len(p.lstrip("\n")))
+                out += p + ("\n" if i < len(sparts) - 1 else "")
+            offs += [(_pos[i], a, k) for i, a, k in sheads]
+    # 真的寫出的回合標頭，依序 [錨點, 耐久錨點或 None, 序號]：`--search` 拿它分辨標頭與內文（`iter_turn_chunks`）。
+    # 序號＝這一行是全檔第幾個長得像回合標頭的行（`_TURN_HEAD_RE`，從 0 起算）。⚠ 不記行號：.md 寫出時換行會被
+    # 轉換（Windows 的 `\n`→`\r\n`、讀回時 `\r` 也算換行），行號會位移；但只會多出空行或在同一處斷行，
+    # 長得像標頭的行一行都不會多也不會少，序號不變。
+    s.md_turns, n, prev = [], 0, 0
+    for off, a, k in offs:
+        n += sum(1 for ln in out[prev:off].splitlines() if _TURN_HEAD_RE.match(ln))
+        s.md_turns.append([a, k, n])
+        prev = off
     return out
+
+
+# =========================================================================
+# 給 AI 讀的精簡版（`--ai-md`）
+# =========================================================================
+# 用途：人把一段對話交給 AI 看，或撞到額度後換一個 AI 接手。雙方講的話全留；每一次工具操作
+# 留一行「做了什麼」，大宗的工具輸出只留判斷進度用得到的那一點。
+# ⚠⚠ **省略一定在原處標出來**：讀的人不知道有東西被拿掉，就會把「沒看到」當成「沒發生」。
+#   每一次工具呼叫都恰好有一行 `AI_MD_TOOL`（`test_ai_md` 拿它的行數對工具呼叫數）。
+AI_MD_TOOL = "- 🔧 "
+AI_MD_TAIL = 15            # 指令輸出留最後幾行（錯誤、測試結果通常在那裡）
+AI_MD_TAIL_ERR = 40        # 出錯的留多一點：錯誤訊息常常不只最後幾行
+AI_MD_HEAD = 40            # diff／patch 留前幾行
+AI_MD_CMD = 20             # 指令本身（含 heredoc 寫進去的內容）留前幾行
+AI_MD_CHARS = 4000         # 上面任何一段的字數上限（一行就很長的輸出，例如壓成一行的 JSON）
+AI_MD_REPORT = 8000        # 子代理交回的報告：留前幾個字（提問與使用者的回答不截）
+AI_MD_FRESH_SEC = 30       # `--ai-md last`：這幾秒內還在寫的那幾場，視為呼叫者自己那一場
+_AI_READ = {"Read", "NotebookRead", "view_image"}
+_AI_WRITE = {"Write", "NotebookEdit"}
+_AI_EDIT = {"Edit", "MultiEdit"}
+_AI_LOOKUP = {"Grep", "Glob", "LS", "WebFetch", "WebSearch", "ToolSearch"}
+_AI_AGENT = {"Task", "Agent"}
+_AI_ASK = {"AskUserQuestion"}
+_AI_PLAN = {"TodoWrite", "update_plan", "TaskCreate", "TaskUpdate"}
+_AI_HEADING_RE = re.compile(r"^(\s{0,3})(#{1,6})(\s|$)")
+# fence 照 CommonMark 認：開頭＝0–3 個空白縮排、三個以上的 ` 或 ~（` 的 fence 後面的資訊字串不可以再有 `）；
+# 結尾＝同一種字元、長度不短於開頭、後面只能有空白。認得比 CommonMark 寬，補關的那一行反而會開出新的 fence。
+_AI_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_AI_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+
+
+_AI_RESERVED = ("### ", AI_MD_TOOL)      # 本檔行首是這兩種的，只有回合標頭與工具那一行
+# `str.splitlines()` 認的每一種斷行（`\r`、U+2028、U+0085…）。本檔的「行」一律是 `\n`：擋保留的行首、
+# 算目錄的行號之前都先換成 `\n`，不論讀的人用哪一種斷行規則，看到的行與行號都一樣。
+_AI_NL_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _ai_nl(text):
+    return _AI_NL_RE.sub("\n", str(text))
+
+
+def _ai_one_line(text):
+    """空白（含各種斷行）壓成一格。只用在工具那一行（算「畫出來了」的值都先檢查經得起它）與欄位名這類標籤；
+    要原樣保留的原文用 `_ai_exact_line`。"""
+    return " ".join(str(text).split())
+
+
+def _ai_exact_line(text):
+    """放在 fence 外、只該占一行的原文（檔頭的欄位、背景通知的摘要）：本身就是一行就照原樣（空白一個都不動）；
+    有斷行就寫成 JSON 字串——一行、字一個不少，也開不出 fence。"""
+    t = str(text)
+    return t if "\n" not in _ai_nl(t) else json.dumps(t, ensure_ascii=False)
+
+
+def _ai_guard(text):
+    """原文裡行首是 `_AI_RESERVED` 的那幾行前面加反斜線（fence 裡的也一樣）：
+    `grep '^### '` 數得到的只有回合、`grep '^- 🔧 '` 數得到的只有工具呼叫。"""
+    text = _ai_nl(text)                     # 先統一斷行，`\r`、U+2028 這類才繞不過去
+    return "\n".join(("\\" + ln) if ln.startswith(_AI_RESERVED) else ln for ln in text.split("\n"))
+
+
+def _ai_demote_headings(text):
+    """訊息原文：fence 外的 `#` 標題與 `- 🔧 ` 開頭的行前面加反斜線（只有回合標頭是 `### ` 開頭）；
+    fence 裡的是程式碼（`#` 是註解），只擋 `_AI_RESERVED` 那兩種行首（`_ai_guard`）。
+    原文自己沒關上的 fence 在結尾補關：一則訊息開的 fence 不可以吞掉後面的回合。"""
+    out, fence = [], None
+    for ln in _ai_nl(text).split("\n"):
+        if fence is None:
+            fm = _AI_FENCE_OPEN_RE.match(ln)
+            if fm and not (fm.group(1)[0] == "`" and "`" in fm.group(2)):
+                fence = fm.group(1)
+                out.append(ln)
+                continue
+            m = _AI_HEADING_RE.match(ln)
+            if m:
+                ln = m.group(1) + "\\" + ln[len(m.group(1)):]
+            elif ln.startswith(AI_MD_TOOL):
+                ln = "\\" + ln
+        else:
+            fm = _AI_FENCE_CLOSE_RE.match(ln)
+            if fm and fm.group(1)[0] == fence[0] and len(fm.group(1)) >= len(fence):
+                fence = None
+                out.append(ln)
+                continue
+            ln = _ai_guard(ln)
+        out.append(ln)
+    if fence is not None:
+        out.append(fence)
+    return "\n".join(out)
+
+
+def _ai_cut(text, n, tail):
+    """留頭或尾 n 行（再受 AI_MD_CHARS 限制）。回傳 (留下的文字, 省略說明或 "")。"""
+    text = "" if text is None else str(text)
+    lines = text.splitlines()
+    keep = lines[-n:] if tail else lines[:n]
+    kept = "\n".join(keep)
+    cut_chars = len(kept) > AI_MD_CHARS
+    if cut_chars:
+        kept = kept[-AI_MD_CHARS:] if tail else kept[:AI_MD_CHARS]
+    if len(keep) == len(lines) and not cut_chars:
+        return text, ""
+    where = "最後" if tail else "前"
+    note = f"共 {len(lines):,} 行，只留{where} {len(keep)} 行" if len(keep) < len(lines) else f"共 {len(text):,} 字"
+    if cut_chars:
+        note += f"，再截到{where} {AI_MD_CHARS:,} 字"
+    return kept, note
+
+
+def _ai_block(label, text, n, tail, info=""):
+    kept, note = _ai_cut(text, n, tail)
+    return f"{label}{'（' + note + '）' if note else ''}：\n{_md_fence(_ai_guard(kept), info)}"
+
+
+_AI_SUMMARY_KEYS = {"Bash": {"command"}, "Edit": {"file_path"}, "MultiEdit": {"file_path"},
+                    "Write": {"file_path"}, "Read": {"file_path"}, "Grep": {"pattern"}, "Glob": {"pattern"},
+                    "Task": {"subagent_type", "description"}, "Agent": {"subagent_type", "description"},
+                    "WebFetch": {"url"}, "WebSearch": {"query"}}
+
+
+_AI_SUMMARY_FIRST_LINE = {"command", "description"}     # `tool_summary()` 只畫第一行、而且截到 70 字的欄位
+
+
+def _ai_summary_keys(name, inp):
+    """`tool_summary()` 那一行**原樣**畫出了哪些輸入欄位（兩邊要同步：那張表多一種工具，這裡也要多一列）。
+    `- 🔧` 那一行最後會把空白壓成一格（`render_tool_ai_md`）⇒ 值是字串、壓過不變才算畫了；
+    只畫第一行、會截斷的欄位（`_AI_SUMMARY_FIRST_LINE`）還要沒被截到。其餘交給 `_ai_rest_params` 標出來。"""
+    if not isinstance(inp, dict):
+        return set()
+    keys = set()
+    for k in _AI_SUMMARY_KEYS.get(name, ()):
+        v = inp.get(k)
+        if isinstance(v, str) and v == _ai_one_line(v) and (k not in _AI_SUMMARY_FIRST_LINE or first_line(v) == v):
+            keys.add(k)
+    return keys
+
+
+def _ai_rest_params(inp, shown, label="輸入"):
+    """這一行沒有畫出來的其餘輸入參數：短的照列，長的標出略了多少——不可以安靜地不見。
+    回傳的每一段都是單行（接在 `- 🔧` 那一行後面）；照列的值要經得起那一行的空白壓縮，否則也算「略」。
+    輸入不是 dict（字串、陣列…）就整份當成一個 `label` 交代。"""
+    if not isinstance(inp, dict):
+        inp = {} if inp in (None, "", [], {}) else {label: inp}
+    out = []
+    for k, v in inp.items():
+        if k in shown:
+            continue
+        try:
+            s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        except (TypeError, ValueError):
+            s = str(v)
+        k = _ai_one_line(k)                   # 欄位名也是原文：不可以帶換行進來
+        out.append(f"{k}={s}" if (len(s) <= 60 and s == _ai_one_line(s)) else f"{k} 略（{len(s):,} 字）")
+    return out
+
+
+def _ai_cap(text, limit=AI_MD_REPORT):
+    text = "" if text is None else str(text)
+    if len(text) <= limit:
+        return text, ""
+    return text[:limit], f"共 {len(text):,} 字，只留前 {limit:,} 字"
+
+
+def _ai_lines(text):
+    return len(str(text).splitlines()) if text else 0
+
+
+def _ai_command(name, inp):
+    """指令類工具「跑了什麼」的原文；認不出來回 None。"""
+    if isinstance(inp, str):
+        return inp
+    if isinstance(inp, dict):
+        c = inp.get("command", inp.get("cmd"))
+        if isinstance(c, list):
+            return " ".join(str(x) for x in c)
+        if isinstance(c, str):
+            return c
+    return None
+
+
+_AI_PLAN_LIST = {"TodoWrite": ("todos", "content"), "update_plan": ("plan", "step")}
+
+
+def _ai_plan_lines(name, inp):
+    """待辦／計畫類工具的清單，一項一筆：回傳 (筆, 畫出來的頂層欄位, 標記)；認不出來回 ([], set(), [])。
+    項目的文字、狀態都照原值（一字不改；呼叫端整份放進 fence，跨行的項目也開不出結構）。
+    項目裡沒畫的欄位（例 `activeForm`）照欄位名彙總標出來；不是物件的項目照原文列一筆。"""
+    if not isinstance(inp, dict):
+        return [], set(), []
+    mark = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}
+    if name in _AI_PLAN_LIST and isinstance(inp.get(_AI_PLAN_LIST[name][0]), list):
+        key, text_key = _AI_PLAN_LIST[name]
+        lines, extra = [], {}
+        for t in inp[key]:
+            if not isinstance(t, dict):
+                lines.append("- [?] " + (t if isinstance(t, str) else json.dumps(t, ensure_ascii=False)))
+                continue
+            st = t.get("status")
+            box = "[?]" if st in (None, "") else mark.get(str(st), f"[{st}]")
+            lines.append(f"- {box} {t.get(text_key, '')}")
+            for k in t:
+                if k not in (text_key, "status"):
+                    extra[k] = extra.get(k, 0) + 1
+        return lines, {key}, [f"{key}[*].{_ai_one_line(k)} 略（{c} 項）" for k, c in extra.items()]
+    if name in ("TaskCreate", "TaskUpdate"):
+        keys = [k for k in ("taskId", "subject", "status", "activeForm") if inp.get(k) not in (None, "")]
+        bits = [f"{k}={inp[k]}" for k in keys]
+        return (["- " + "，".join(bits)] if bits else []), set(keys), []
+    return [], set(), []
+
+
+def render_tool_ai_md(block, tmap):
+    """一次工具呼叫 ⇒ 恰好一行 `AI_MD_TOOL`，後面視工具種類接留下來的那一點。"""
+    name = str(block.get("name") or "tool")
+    inp = block.get("input", {})
+    g = inp.get if isinstance(inp, dict) else (lambda k, d=None: d)
+    tid = block.get("id")
+    has_res = tid in tmap
+    content, is_err = tmap[tid] if has_res else (None, False)
+    res = normalize_result(content) if has_res else ""
+    notes, body = [], []
+    # 每一支都要交代兩件事：輸入有沒有全部畫出來（沒畫的走 `_ai_rest_params`）、結果有沒有畫出來
+    # （沒畫的在最後標成「結果 N 行，略」或短的照列）——兩者都不可以安靜地不見。
+    shown, res_shown = None, False          # shown＝已經畫出來的輸入欄位；None＝整份輸入都畫了
+    if not has_res:
+        notes.append("沒有結果：中斷或未完成")
+    if name in _AI_READ:
+        shown = _ai_summary_keys(name, inp)
+        if has_res and not is_err:
+            notes.append(f"內容略（{_ai_lines(res):,} 行）")
+            res_shown = True
+    elif name in _AI_WRITE:
+        wkey = "new_source" if (not g("content") and g("new_source")) else "content"     # 只算用到的那一個
+        shown = _ai_summary_keys(name, inp) | {wkey}
+        notes.append(f"寫入 {_ai_lines(g(wkey) or ''):,} 行，內容略")
+    elif name in _AI_EDIT:
+        edits = g("edits")
+        if isinstance(edits, list) and edits:      # 有 edits 就畫它；頂層的新舊字串（若也有）交給 `_ai_rest_params`
+            shown = _ai_summary_keys(name, inp) | {"edits"}
+        else:
+            edits = [{"old_string": g("old_string", ""), "new_string": g("new_string", "")}]
+            shown = _ai_summary_keys(name, inp) | {"old_string", "new_string"}
+        diff = []
+        for i, ed in enumerate(edits):
+            if isinstance(ed, dict):
+                diff += ["- " + ln for ln in str(ed.get("old_string", "")).split("\n")]
+                diff += ["+ " + ln for ln in str(ed.get("new_string", "")).split("\n")]
+                # diff 只畫得出新舊字串
+                notes += [f"edits[{i}].{x}" for x in _ai_rest_params(ed, {"old_string", "new_string"})]
+            else:
+                notes += _ai_rest_params({f"edits[{i}]": ed}, set())
+        body.append(_ai_block("改動", "\n".join(diff), AI_MD_HEAD, False, "diff"))
+    elif name == "Patch" and isinstance(inp, str):
+        body.append(_ai_block("改動", inp, AI_MD_HEAD, False, "diff"))
+    elif name in _AI_LOOKUP:
+        shown = _ai_summary_keys(name, inp)
+        if has_res and not is_err:
+            notes.append(f"結果 {_ai_lines(res):,} 行，略")
+            res_shown = True
+    elif name in _AI_AGENT:
+        shown = _ai_summary_keys(name, inp)
+        if has_res:
+            rep, note = _ai_cap(res)
+            # ⚠ 報告是原文，可能有沒關的 fence、像回合標頭的行：一律包進 fence，不可以直接攤在版面上
+            body.append(f"交回的報告{'（' + note + '）' if note else ''}：\n{_md_fence(_ai_guard(rep))}")
+            res_shown = True
+    elif name in _AI_ASK:
+        try:
+            q = json.dumps(inp, ensure_ascii=False, indent=1)
+        except (TypeError, ValueError):
+            q = str(inp)
+        # 提問與使用者的回答全留（不截）：接手的人要知道使用者到底選了什麼
+        body.append(f"提問：\n{_md_fence(_ai_guard(q), 'json')}")
+        if has_res:
+            body.append(f"使用者的回答：\n{_md_fence(_ai_guard(res))}")
+            res_shown = True
+    elif name in _AI_PLAN:
+        items, shown, pnotes = _ai_plan_lines(name, inp)
+        notes += pnotes
+        if items:           # 原值、整份進 fence（項目可以跨行、可以帶 fence）
+            body.append(_md_fence(_ai_guard("\n".join(items))))
+    else:
+        cmd = _ai_command(name, inp)
+        if cmd is not None and isinstance(inp, dict):     # 只畫了用到的那一個（command 或 cmd）：其餘參數要交代
+            shown = _ai_summary_keys(name, inp) | {"command" if "command" in inp else "cmd"}
+        if cmd is None and inp not in (None, "", {}):
+            try:
+                cmd = json.dumps(inp, ensure_ascii=False)
+            except (TypeError, ValueError):
+                cmd = str(inp)
+        # 一行就講完、而且那一行**原樣**出現在 `- 🔧` 那一行裡（比的是空白壓縮之後的那一行）的，不再重複
+        one = cmd.strip() if cmd else ""
+        if cmd and not ("\n" not in one and one in _ai_one_line(tool_summary(name, inp))):
+            body.append(_ai_block("輸入", cmd, AI_MD_CMD, False))
+        if has_res:
+            if res.strip():
+                body.append(_ai_block("錯誤輸出" if is_err else "輸出", res,
+                                      AI_MD_TAIL_ERR if is_err else AI_MD_TAIL, True))
+            else:
+                notes.append("沒有輸出")
+            res_shown = True
+        is_err = False                       # 上面已經照錯誤留了，下面不再重複
+    if shown is not None:
+        notes += _ai_rest_params(inp, shown)
+    if is_err and has_res:
+        body.append(_ai_block("錯誤輸出", res, AI_MD_TAIL_ERR, True))
+    elif has_res and not res_shown and res.strip():
+        one = res.strip()
+        notes.append(f"結果：{one}" if (one == _ai_one_line(one) and len(one) <= 120)
+                     else f"結果 {_ai_lines(res):,} 行，略")
+    head = tool_summary(name, inp)
+    if notes:
+        head += " — " + "；".join(notes)
+    # 這一行裡的摘要與標記都可能帶原文：空白（含換行）一律壓成一個空格，它才一定只有一行
+    # （所以上面算「畫出來了」的值，都要先經得起這一道壓縮）
+    return "\n\n".join([AI_MD_TOOL + _ai_one_line(head)] + body)
+
+
+def _ai_turn_blocks(group, tmap):
+    role, parts = group["role"], []
+    for b in group["blocks"]:
+        t = b.get("type")
+        if t == "text":
+            raw = b.get("text") or ""
+            txt = clean_user_text(raw) if role == "user" else str(raw)
+            if txt.strip():
+                parts.append(_ai_demote_headings(txt))
+        elif t == "tool_use":
+            parts.append(render_tool_ai_md(b, tmap))
+        elif t == "image":
+            parts.append("[圖片]")
+        elif t == "_command":
+            nm = " ".join(str(x) for x in (b.get("name"), b.get("args")) if x)
+            if nm:          # 一行的照列；參數有好幾行就整段進 fence（原文開不出 fence、造不出別的行）
+                parts.append(_ai_guard(f"`{nm}`") if nm == _ai_one_line(nm)
+                             else "指令列：\n" + _md_fence(_ai_guard(nm)))
+            if b.get("out"):
+                parts.append(_ai_block("指令輸出", b["out"], AI_MD_TAIL, True))
+            parts += ["[圖片]"] * len(b.get("imgs") or [])
+        elif t == "_interject":
+            _what = "這一輪結束後才讀到" if b.get("after_turn") else "中途插話"
+            _lines = clean_user_text(b.get("text") or "").splitlines() + ["[圖片]"] * len(b.get("imgs") or [])
+            # 整則一起降級（fence 的開關要跨行看），再逐行加引用符號
+            _txt = _ai_demote_headings("\n".join(_lines)).split("\n") if _lines else []
+            parts.append(f"> **👤 你 · {_what}**\n>\n" + "\n".join("> " + ln for ln in _txt))
+        elif t == "_notify":
+            st = _NOTIFY_STATUS_LABEL.get(b.get("status") or "", b.get("status") or "")
+            lead = b.get("summary") or ""
+            parts.append(_ai_guard("⚙ 背景任務" + (f" · {_ai_exact_line(st)}" if st else "")
+                                   + (f" · {_ai_exact_line(lead)}" if lead else "")))
+            _detail = _strip_ansi(b.get("raw") or b.get("event") or "")
+            if _detail.strip():
+                parts.append(_ai_block("通知內容", _detail, AI_MD_TAIL, True))
+        # thinking／redacted_thinking／步驟分隔不放
+    return parts
+
+
+def _ai_preview(group, n=40):
+    for b in group["blocks"]:
+        t = b.get("type")
+        s = ""
+        if t == "text":
+            s = clean_user_text(b.get("text") or "")
+        elif t == "_interject":
+            s = clean_user_text(b.get("text") or "")
+        elif t == "_command":
+            s = " ".join(x for x in (b.get("name"), b.get("args")) if x)
+        elif t == "_notify":
+            s = "⚙ " + (b.get("summary") or "背景任務")
+        s = " ".join(s.split())
+        if s:
+            return s if len(s) <= n else s[:n] + "…"
+    return ""
+
+
+def _ai_last_plan(s):
+    """主對話裡最後一份完整的待辦清單（TodoWrite／update_plan）：(時刻, [行])；沒有回 None。"""
+    last = None
+    for g in s.main_groups:
+        for b in g["blocks"]:
+            if b.get("type") == "tool_use" and b.get("name") in _AI_PLAN_LIST:
+                items = _ai_plan_lines(b.get("name"), b.get("input"))[0]
+                if items:
+                    last = (g.get("dt"), b.get("name"), items)
+    return last
+
+
+def render_session_ai_md(s: Session, full_path=None) -> str:
+    """給 AI 讀的精簡版。只畫主對話（子代理內部的來回不放，它交回的報告在 Task 那一行底下）。
+
+    檔頭有目錄：每個使用者回合（含壓縮摘要）一列「日期時間 · 第幾行 · 前幾個字」——行號是**本檔**的行，
+    讓人或 AI 照時間找到那一段、不必整份讀。"""
+    if not hasattr(s, "main_groups"):
+        analyze(s)
+    ai = ai_name(s.source_kind)
+    dfmt = "%Y-%m-%d %H:%M:%S"
+    body, toc = [], []                  # toc：(在 body 裡的第幾段, 時刻, 種類, 預覽)
+    n_tools = 0
+    for g in s.main_groups:
+        when = local_str(g.get("dt"), dfmt)
+        if g.get("compact"):
+            summ = "\n\n".join(str(b.get("text") or "") for b in g["blocks"]
+                               if b.get("type") == "text" and (b.get("text") or "").strip())
+            if not summ:
+                continue
+            toc.append((len(body), when, "📋", "前情摘要（" + "，".join(_compact_bits(g)) + "）"))
+            body.append(f"### 📋 前情摘要 · {when}\n\n"
+                        "這是先前對話被壓縮成的摘要（Claude Code 自己寫的）；這之後的對話接在它後面。\n\n"
+                        + _ai_demote_headings(summ))
+            continue
+        parts = _ai_turn_blocks(g, s.tmap)
+        if not parts:
+            continue
+        n_tools += sum(1 for b in g["blocks"] if b.get("type") == "tool_use")
+        if g["role"] == "user":
+            toc.append((len(body), when, "👤", _ai_preview(g)))
+            who = "👤 You"
+        else:
+            who = f"🤖 {ai}"
+        body.append(f"### {who} · {when}\n\n" + "\n\n".join(parts))
+    # 行號以 `\n` 計：`\r`、U+2028 這類有些工具算換行、有些不算，一律換成 `\n`（`_ai_nl`），目錄的行號才對得上。
+    body = [_ai_nl(x) for x in body]
+    # 檔頭的行數跟行號的值無關（行號只出現在單行的列裡）⇒ 先用 0 排一次數行數，再填真的行號。
+    # 檔頭裡的原文（標題、路徑、工作目錄、分支…）放在 fence 外：一律 `_ai_exact_line`（一行、字一個不少）。
+    def header(nums):
+        h = [f"# {_ai_exact_line(s.title)}", "",
+             "> **給 AI 讀的精簡版。** 雙方講的話全留；每一次工具操作都列成一行 `- 🔧 …`"
+             f"（共 {n_tools:,} 次），讀檔內容、寫檔的整檔內容與大部分指令輸出已略去，**略去處都有標記**。"
+             "思考區塊、花費與快取等計量、子代理內部的來回不放（子代理交回的報告有留）。",
+             (f"> 完整版：`{_ai_exact_line(full_path)}`" if full_path else "> 這一次沒有產生完整版。"),
+             f"> 紀錄只到 {local_str(s.end, dfmt) or '（不明）'}；磁碟上的檔案可能已經和紀錄不同，動手前先看 `git status`。"]
+        compacts = [i for i, e in enumerate(toc) if e[2] == "📋"]
+        if compacts:
+            h.append(f"> 要接續工作：從第 {nums[compacts[-1]]} 行（最後一則前情摘要）讀起即可；"
+                     "那正是 Claude Code 自己接續時讀進去的範圍。")
+        h += ["",
+              f"- 專案：`{_ai_exact_line(s.proj_display)}`" + (f" · 工作目錄：`{_ai_exact_line(s.cwd)}`" if s.cwd else "")
+              + (f" · 分支：`{_ai_exact_line(s.branch)}`" if s.branch else ""),
+              f"- 時間：{local_str(s.start, dfmt)} – {local_str(s.end, dfmt)}",
+              f"- 來源：{source_label(s.source_kind)} · Session：`{_ai_exact_line(s.session_id)}`"]
+        plan = _ai_last_plan(s)
+        if plan:             # 原值、整份進 fence（同工具那一段）
+            h += ["", f"## 最後一份待辦清單（{local_str(plan[0], dfmt)} 的 {plan[1]}）", "",
+                  _md_fence(_ai_guard("\n".join(plan[2])))]
+        h += ["", "## 目錄（每個使用者回合一列；行號是本檔的行）", ""]
+        h += [f"- {when} · 第 {nums[i]} 行 · {icon} {prev}" for i, (_, when, icon, prev) in enumerate(toc)]
+        h += ["", "---", ""]
+        return h
+    def header_text(nums):
+        # 檔頭裡也有原文（工作目錄、待辦清單…）：`_ai_guard` 先把斷行統一成 `\n`，行數照**寫出來的文字**數，不照清單的元素數
+        return _ai_guard("\n".join(header(nums)))
+    n_head = header_text([0] * len(toc)).count("\n") + 1
+    starts, line = {}, n_head + 1       # 第一段從檔頭之後的那一行開始（1 起算）
+    for i, part in enumerate(body):
+        starts[i] = line
+        line += part.count("\n") + 2     # 段與段之間空一行
+    nums = [starts[idx] for idx, *_ in toc]
+    return header_text(nums) + "\n" + "\n\n".join(body) + "\n"
 
 
 # =========================================================================
@@ -7625,8 +8187,7 @@ function bkIndexMark(){
   var items=(o&&Array.isArray(o.items))?o.items:[];
   var now=Date.now();
   for(var i=0;i<items.length;i++){
-   /* ⚠ 每一筆都要驗型別：`{items:[null]}` 與 `{sid:{}}` 都是合法 JSON
-      （跨模型 Medium#7 在 core 那邊的同一件事）。 */
+   /* ⚠ 每一筆都要驗型別：`{items:[null]}` 與 `{sid:{}}` 都是合法 JSON。 */
    var x=items[i]; if(!x||typeof x!=='object'||typeof x.sid!=='string'||!x.sid)continue;
    var e=by[x.sid]||(by[x.sid]={n:0,due:0,cats:Object.create(null)});
    e.n++;
@@ -7660,8 +8221,8 @@ function bkIndexMark(){
     否則和其他篩選條件疊起來會互相打架。 */
  var fb=document.getElementById('fb');
  if(fb){
-  /* ⚠⚠ 要數的是**這份索引裡真的有書籤的列**，不是 store 裡的 sid 總數
-     （跨模型 Low#11）。書籤可能來自別台的匯入檔、或指向這次沒涵蓋的 session
+  /* ⚠⚠ 要數的是**這份索引裡真的有書籤的列**，不是 store 裡的 sid 總數。
+     書籤可能來自別台的匯入檔、或指向這次沒涵蓋的 session
      ⇒ 用總數決定的話，鈕會出現、勾下去卻得到一張空表，而畫面上沒有任何解釋。
      ⚠ 這一段一定要跑在上面那個 `ROWS.forEach` **之後**（`data-bm` 才填好了）。
      守它的是索引探針的 `filter_hidden_when_only_offindex`。 */
@@ -7671,7 +8232,7 @@ function bkIndexMark(){
   fb.parentElement.title=total+' 場有書籤';
   /* ⚠⚠ **藏起來的篩選不可以還在生效。** 上一行只是把控制項藏起來，`af()` 讀的仍是
      `fb.checked` ⇒ 勾著的狀態下，別的分頁移除最後一筆書籤時：勾選框消失、篩選照跑
-     ⇒ **整張表 0 列，而畫面上沒有任何東西解釋為什麼**（收斂確認輪 Medium）。
+     ⇒ **整張表 0 列，而畫面上沒有任何東西解釋為什麼**。
      ⚠ 這個狀態是新的 storage listener 造出來的：這個函式以前只在載入時跑一次，
      那時 `fb` 必定沒勾，所以到不了。**每加一條同步路徑，就要問它造出了哪些新狀態。**
      ⚠ 只在 `total===0`（＝控制項真的被藏起來）時取消勾選；鈕還看得見時勾著就該繼續生效
@@ -8127,7 +8688,7 @@ def build_cache_report(rows, stratify=True, acct_health=None):
     api_excluded = 0                                # 因「前綴變動」被排除的相鄰步對（全母體）
     band_excluded = 0                               # 其中「本來會落在應命中帶」的對數（假說頁引用此值）
     srv_excluded = 0                                # 因「伺服器側自報不可用」而整對移出的對數
-    # (v36-fam5 #1) 標成 `acct`（人因、記錢）但同場稍早出現過 limit/auth 的步數——那次切換
+    # 標成 `acct`（人因、記錢）但同場稍早出現過 limit/auth 的步數——那次切換
     # 可能是被迫的。**只揭露，不改成因也不改金額**；顯示端在 `_cold_cause_label` 並列標示。
     acct_limit_earlier = 0
     cf_comply_n = 0                                 # 反事實帶內 n：假裝「API 自報」這條規則不存在時的樣本數。
@@ -8151,9 +8712,9 @@ def build_cache_report(rows, stratify=True, acct_health=None):
         raw = r["cache_steps"]
         models = r.get("cache_models") or []
         events = r.get("cache_events") or []
-        # (v36-fam5 #1) 與 classify_cache_causes 同一份（兩處是刻意的雙胞胎）：整條時間軸上的
+        # 與 classify_cache_causes 同一份（兩處是刻意的雙胞胎）：整條時間軸上的
         # limit/auth 時刻，判「這次 acct 之前同場有沒有撞過 limit」。不走會前進的事件游標。
-        # ⚠⚠ **名字不可以叫 `limit_ts`**（v36-fam6 #1，Blocker）：迴圈外 `:4100` 有一個同名的
+        # ⚠⚠ **名字不可以叫 `limit_ts`**（Blocker）：迴圈外 `:4100` 有一個同名的
         #   **跨 session 累加器**（收折疊後的 429，餵報告 ④「什麼時候撞到 limit」）。在迴圈內
         #   重新繫結那個名字會把累加器整個蓋掉：`limits_n` 從 100 掉到 **0**，而 `if d["limits_n"]:`
         #   是整段 ④ 的開關 → **那一章連同時段表一起靜默消失**，沒有任何提示。
@@ -8287,7 +8848,7 @@ def build_cache_report(rows, stratify=True, acct_health=None):
                     # 與 classify_cache_causes 同規則（兩邊由 test_smoke 的一致性測試釘住）：
                     # 直接的帳號邊界證據勝過由間隔推論的 intra／evict，不分間隔長短。
                     cause = "acct"
-                    # (v36-fam5 #1) 這一步之前同場出現過 limit/auth ⇒ 這次切換可能是被迫的。
+                    # 這一步之前同場出現過 limit/auth ⇒ 這次切換可能是被迫的。
                     # ⚠ **只計數、只揭露，不動成因也不動金額**（Will 2026-08-21 裁決）；
                     #   顯示端的並列標示在 `classify_cache_causes` 那側，兩邊同一個判準。
                     if row_limit_ts and row_limit_ts[0] <= prev[0]:
@@ -8318,8 +8879,8 @@ def build_cache_report(rows, stratify=True, acct_health=None):
                     else:
                         avoid_partial = True
             # ── lineage 重置：四個入口一次算完，與 classify_cache_causes 共用 `_resets_lineage` ──
-            # ⚠ **不可以**再散回下面每個 continue 站點各寫一次：散寫正是 `v36-fam3` F1 那條分岔的
-            # 來源（`srv_cause` 當時只有這一側寫了，classify 那側沒有 → 同一步在報告端算 expiry
+            # ⚠ **不可以**再散回下面每個 continue 站點各寫一次：散寫就是分岔的
+            # 來源（例：`srv_cause` 只有這一側寫了，classify 那側沒有 → 同一步在報告端算 expiry
             # 記人因錢、在逐步徽章端算 evict 不記錢）。
             # 位置：`cohort` 在上面已經取過值，所以這裡改不會動到本對自己的分桶。
             if _resets_lineage(api_cause, srv_cause, boundary, bool(acct_ts)):
@@ -8350,7 +8911,7 @@ def build_cache_report(rows, stratify=True, acct_health=None):
                 # ⚠ **只影響統計，不影響標示**：成因與並列標籤在上面 `if cold:` 那段就算完了，
                 # 逐步徽章仍會標「閒置過期＋伺服器不可用」，讓人看得出「就算伺服器沒掛，
                 # 這一步的快取也還是會失效」。
-                # (v36-fam3 F6) 與 `api_excluded` 同一個判準：**只在「伺服器自報是唯一排除理由」
+                # 與 `api_excluded` 同一個判準：**只在「伺服器自報是唯一排除理由」
                 # 時計數**。`if srv_cause:` 排在 `if boundary or acct_kills_live:` 之前，所以同時有
                 # 邊界（切帳號/換模型/壓縮）的那一對會先落到這裡——那種對在這條規則出現以前就
                 # 已被 boundary 擋掉，算成「因自報而排除」是錯誤歸因。兩個計數器都對外揭露
@@ -8859,7 +9420,7 @@ def _band_api_note(d):
                     "──工具定義／系統提示／前文／換模型──整對移出樣本：命中與未命中都移，"
                     "只挑未命中移會把存活率灌高")
     if api.get("srv_excluded"):
-        # (v36-fam3 F4) `unavailable` 也永遠進不了 band_api——只講前綴變動類的話，讀者會以為
+        # `unavailable` 也永遠進不了 band_api——只講前綴變動類的話，讀者會以為
         # 它還留在帶內樣本裡。⚠ 這裡刻意**不給對數**：`srv_excluded` 是全母體計數，不是
         # 「本來會落在帶內」的數，拿它當帶內數字就是用全母體唬人（正是上一行要避免的事）。
         excl.append("API 自報「伺服器不可用」的相鄰步同樣整對移出，所以下面的成因分佈裡"
@@ -8939,9 +9500,9 @@ def _acct_scope_note(d, html=True) -> str:
     兩種報告共用同一份文字：分成兩份寫，遲早只有一邊會被改到，那時就有一種輸出在隱瞞。
     ⚠ 一律輸出、不看次數是不是 0——0 有三種意思（真的沒切過／這台只有一個帳號／
     history 讀不到或列格式變了），涵蓋率就是分辨它們的那份資料。
-    ⚠ (v36-fam3 F7) **兩個方向都要講。** 原本只揭露漏報（「顯示 0 不代表沒發生過」），
+    ⚠ **兩個方向都要講。** 原本只揭露漏報（「顯示 0 不代表沒發生過」），
     讀者會以為這個數字只會少不會多；而誤報那一格是**會記到錢**的（多算一次人因浪費）。
-    範圍限制本身見 planning/scope-limits.md 的 SCOPE-CFG-PATH-IDENTITY。"""
+    範圍限制 SCOPE-CFG-PATH-IDENTITY。"""
     b = "<b>{}</b>" if html else "**{}**"
     note = ("「自行切帳號」偵測自各帳號的 history.jsonl，"
             + b.format("只在多帳號的本機資料上成立")
@@ -8952,7 +9513,7 @@ def _acct_scope_note(d, html=True) -> str:
               "那種佈局在資料上與真的換帳號完全同形。兩份內容仍相同的情形已經擋掉"
               "（同一時刻同時出現在兩個 config 的 sessionId 整組不歸屬），"
               "擋不掉的是「兩份曾經相同、之後各自被用過」。")
-    # (v36-fam5 #1) 第三個誤報方向，同樣是**會記到錢**的那一種：「被迫/自願」只看同一對相鄰步
+    # 第三個誤報方向，同樣是**會記到錢**的那一種：「被迫/自願」只看同一對相鄰步
     # 之間的事件，429 與切換中間夾了任何一次 API 呼叫，那次被迫切換就落成「自行切帳號」。
     n_le = ((d.get("api") or {}).get("acct_limit_earlier") or 0)
     if n_le:
@@ -9015,7 +9576,7 @@ def render_cache_report_html(d) -> str:
     ct0 = d["causes_total"]
     tiles.append(("人因冷啟", f"{k['avoid_n']} 次",
                   f"閒置過期 {ct0['expiry']}＋自行切帳號 {ct0['acct']}；約 {k['avoid_week']:.1f} 次/週"))
-    # (v36-fam4 #1) 金額一律走 `cost_label`，與索引 td／tooltip／MD 同一個口徑——副標題就寫著
+    # 金額一律走 `cost_label`，與索引 td／tooltip／MD 同一個口徑——副標題就寫著
     # 「與索引同口徑」，而 `fmt_money(0)+"+?"` 給的 `$0+?` 會被讀成「沒多花錢」（索引那側給 `?`）。
     tiles.append(("人因浪費", cost_label(k["avoid_usd"], k["avoid_partial"]),
                   "重暖的估算額外成本（重寫 −0.1× 讀取）；與索引「浪費」欄同口徑"))
@@ -9091,7 +9652,7 @@ def render_cache_report_html(d) -> str:
                  "<code>diagnostics.cache_miss_reason</code> 直接寫明為什麼沒命中——實據）與"
                  "<b>本工具推論</b>（沒有自報時，依邊界事件與間隔判定）。有自報就以自報為準。</div>")
     total_cold = sum(d["causes_total"].values())
-    # (v36-fam5 #6) 三段揭露**在 `if total_cold:` 之外算好**：它們講的是「偵測範圍／被實據遮蔽
+    # 三段揭露**在 `if total_cold:` 之外算好**：它們講的是「偵測範圍／被實據遮蔽
     # 的人因／被移出樣本的對數」，三件事在零冷啟時照樣成立且照樣有話要說——實測本機有 289 個
     # 「有 cache_steps、零冷啟成因」的 session，只用它們建報告時 `_srv_excluded_note` 仍有
     # 75 對要揭露，而舊寫法一句都不出。三個函式各自守門（沒東西講就回空字串），所以無條件串接
@@ -9119,7 +9680,7 @@ def render_cache_report_html(d) -> str:
         # 只有一個帳號／history 讀不到或列格式變了）。只在 >0 時才附註，等於讓最需要保留懷疑
         # 的那個數字裸奔——讀者會把「沒偵測到」讀成「沒發生」。
         # ⚠ 這句話成立的前提是它**兩個分支都出**（見上面 `scope_notes_html`）：
-        #   (v36-fam5 #6) 之前它只長在這一支裡，於是「一律揭露」在零冷啟那一支是假的。
+        #   之前它只長在這一支裡，於是「一律揭露」在零冷啟那一支是假的。
         ins2 += scope_notes_html
         if api_n:
             ins2 += (f"「前綴變動」是 API 自報的（工具定義 {ct['tools']}／系統提示 {ct['system']}／"
@@ -9260,7 +9821,7 @@ def render_cache_report_md(d) -> str:
             "成因兩種來源：**API 自報**（Claude 在 `diagnostics.cache_miss_reason` 直接寫明——實據）與"
             "**本工具推論**（沒有自報時依邊界事件與間隔判定）；有自報就以自報為準。"]
     total_cold = sum(d["causes_total"].values())
-    # (v36-fam5 #6) 同 HTML：三段揭露在 `if` 之外算好，兩個分支都要出。
+    # 同 HTML：三段揭露在 `if` 之外算好，兩個分支都要出。
     scope_notes_md = (_acct_scope_note(d, html=False) + _masked_human_note(d, html=False)
                       + _srv_excluded_note(d, html=False))
     if total_cold:
@@ -10026,14 +10587,14 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
    ⚠⚠ **但一定要放在「底部」，不能放頂端。** 第一版放 `top:12px`，而
    `scrollIntoView({block:'start'})` 會把目標輪貼到視窗頂端（y=0）——實測橫幅佔 12–79px，
    **蓋住的正好是那一輪的標頭**：`.hl` 外框上緣、時間戳、`#` 直達連結全在底下。
-   「.hl 是跳成功的唯一訊號」而它被自己的提示遮掉，等於白做（`durable-anchor-r3` #2）。 */
+   「.hl 是跳成功的唯一訊號」而它被自己的提示遮掉，等於白做。 */
 .bm-miss{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:60;
          max-width:min(900px,calc(100vw - 24px));padding:10px 14px;
          border:1px solid var(--err);border-radius:8px;background:var(--panel);
          box-shadow:0 4px 16px rgba(0,0,0,.28);font-size:14px;line-height:1.6;
          max-height:34vh;overflow-y:auto}
 /* ⚠ 關閉鈕要有可按的大小：`padding:2px 4px` 量出來只有 20×19px，低於任何合理的觸控下限
-   （`durable-anchor-r4` #5，由 scripts/probe_anchor_layout.py 守著）。 */
+   （由 scripts/probe_anchor_layout.py 守著）。 */
 .bm-x{margin-left:10px;border:0;background:transparent;color:inherit;cursor:pointer;
       font-size:16px;line-height:1;opacity:.6;padding:0;
       min-width:28px;min-height:28px;vertical-align:middle}
@@ -10063,7 +10624,7 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
    ⚠⚠ **顯形範圍一定要縮到 `.blk`，不能沿用 `.turn:hover`。** 全語料實測一輪的可標記
    區塊數 p99＝101（Codex 129、max 412）——沿用整輪的規則，滑過任何一處就會同時亮起
    一百組按鈕。上面兩條 `.turn:hover` 規則因此加了 `:not(.blk-ctl)` 把區塊那組排除掉。
-   ⚠ 用 `>` 直接子選擇器。**但這裡原本寫的理由是假的**（`bookmarks-p4-fam` Low）：
+   ⚠ 用 `>` 直接子選擇器。**但這裡原本寫的理由是假的**：
    舊版說「工具區塊裡可能巢著子代理的回合，那裡面又有 `.blk`」——**不會**：
    `render_turn_html` 把子代理區塊放在 `extra`、當成工具區塊的**兄弟**，
    實測真頁上 `.blk .blk` 恒為 0，而且探針的 `subagent_not_wrapped_in_block`
@@ -10071,7 +10632,7 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
    → `>` 留著是因為它**比較窄、而且未來真的巢起來時不會壞**，
    不是因為現在有巢狀結構。**理由寫錯比沒寫更貴**：下一個人會拿它去推別的事。 */
 .blk{position:relative}
-/* ⚠⚠ **容器一定要 `pointer-events:none` ＋ 透明背景。**（`bookmarks-p4-fam` Medium）
+/* ⚠⚠ **容器一定要 `pointer-events:none` ＋ 透明背景。**
    第一版把 `background:var(--panel)` 放在容器上、`opacity:0` 只加在**子元素**上 ⇒
    每個區塊右上角固定有一塊 49×24px 的不透明方塊，**不管有沒有滑過**：
    蓋住第一行右端（code fence、寬表格、長工具摘要），而且那塊區域的文字**選不起來也點不到**。
@@ -10247,6 +10808,46 @@ def session_signature(main_path: Path, marks=()) -> str:
     return "|".join(parts)
 
 
+def out_id_part(s: "Session") -> str:
+    """輸出檔名裡代表這一場的那 8 個字元（`main()` 的 `base` 最後一段）。
+
+    要取 id 裡**隨機的那一段**：檔名前面已經有開始時間（到分鐘）與專案名，這一段負責把
+    同一分鐘、同一專案的幾場分開。
+    - Claude：sessionId 是 UUIDv4，前 8 碼就是隨機位元 ⇒ 取前 8 碼。
+    - Codex：id 是 UUIDv7，前 12 碼是毫秒時間戳 ⇒ 前 8 碼在約 65 秒內都一樣，同一分鐘開的幾場會
+      組出同一個檔名、後寫的蓋掉先寫的。取**最後 8 碼**（`rand_b` 的低位，隨機）。
+      沒有 `session_meta.id` 時 sid 是 rollout 檔名（`rollout-<時間>-<uuid>`），最後 8 碼一樣是 uuid 的尾巴。
+    ⚠ 只看 sid 本身：不可以因為別場存不存在而改變（例如撞到就加後綴），否則同一場的檔名
+      會隨語料增減而變，既有的連結與書籤快取跟著失效。
+    """
+    if s.source_kind == SOURCE_CODEX:
+        return safe_name(s.session_id[-8:], 8)
+    return s.session_id[:8]
+
+
+def report_output_clashes(rows) -> int:
+    """兩場以上的輸出檔是同一個檔：每個路徑印一行 `!` 到 stderr，回傳有幾個這樣的路徑。
+
+    後寫的蓋掉先寫的，索引上幾列連到同一頁，而且**沒有任何錯誤**、頁面看起來完整。檔名的 id 段取的是
+    隨機位元（`out_id_part`），撞到的機率極低；撞到就要出聲。看的是這一次要畫進索引的每一列（含沿用的）。
+    - 只比 `out_html`：`.md` 與它共用同一個 `base`。
+    - 不分大小寫比：Windows（與 macOS 預設）的檔案系統不分大小寫，只差大小寫的兩個路徑是同一個檔。
+    範圍限制 SCOPE-OUTNAME-CASEFOLD-OVERREPORT：比的是 Unicode `casefold`，不是檔案系統自己的比法——
+    `casefold` 相同、檔案系統卻當成兩個檔的路徑（例：`ß` 對 `ss`）也會被報成同一個檔。
+    """
+    by_out = {}
+    for r in rows:
+        if r.get("out_html"):
+            by_out.setdefault(str(r["out_html"]).casefold(), []).append(r)
+    n = 0
+    for rs in by_out.values():
+        if len(rs) > 1:
+            n += 1
+            print(f"  ! 輸出檔名相同 {rs[0]['out_html']}：{len(rs)} 場寫到同一個檔，頁面只會是其中一場"
+                  f"（sid {', '.join(str(x.get('session_id', ''))[-8:] for x in rs)}）", file=sys.stderr)
+    return n
+
+
 def session_to_row(s: "Session") -> dict:
     dur = fmt_dur((s.end - s.start).total_seconds()) if (s.start and s.end) else ""
     return {
@@ -10316,7 +10917,7 @@ def load_manifest_paths(out: Path) -> dict:
     不能拿來重用輸出）；但**檔名與標題不隨 renderer 改變**，
     而書籤管理頁需要的就只有那兩樣。
 
-    ⚠⚠ 不做這件事的後果（`bookmarks-p23` Medium）：升版後第一次跑縮範圍建置
+    ⚠⚠ 不做這件事的後果：升版後第一次跑縮範圍建置
     （`--project X`）時 `rows` 只剩本次掃到的那幾場，管理頁就會對著**磁碟上還好端端
     躺著**的 session 斬釘截鐵地說「⚠ 不在這次的輸出裡」並且不給連結。
     索引頁少幾列還看得出是「這次沒涵蓋」，管理頁那句話卻是**明確的假話**。
@@ -10336,12 +10937,12 @@ def save_manifest(out: Path, entries: dict):
 def _write_atomic(path: Path, text: str):
     """先寫 `<檔名>.tmp` 再 `os.replace` 換上：中斷（Ctrl+C）或寫到一半失敗時，正式檔永遠是
     完整的舊版或完整的新版——索引頁、manifest 這類每次都重寫的檔，舊版直接寫正式檔，
-    中斷就留下一個截斷的索引（`v62-fam` #7 實測 `idx_ok=False`）。
+    中斷就留下一個截斷的索引（實測 `idx_ok=False`）。
     暫存檔在任何失敗下都收掉；硬終止留下的由下一次建置開頭清掉（`_sweep_stray_tmp`）。
 
     範圍限制 SCOPE-ATOMIC-WRITE-SHARING-LOCK：換上一律用 `os.replace`。Windows 上正式檔被別的行程
     以不帶 `FILE_SHARE_DELETE` 的方式開著時換不上，例外照樣往外拋（建置中止，正式檔維持完整的舊版）；
-    本函式不涵蓋重試或退回直接覆寫。詳見 planning/scope-limits.md。"""
+    本函式不涵蓋重試或退回直接覆寫。"""
     tmp = path.with_name(path.name + ".tmp")
     try:
         tmp.write_text(text, encoding="utf-8")
@@ -10355,7 +10956,7 @@ def _write_atomic(path: Path, text: str):
 
 
 # 輸出目錄根層每次都重寫的檔（`_write_atomic` 的暫存檔就是 `<這些>.tmp`）
-_ROOT_REWRITTEN = ("index.html", "index.md", MANIFEST_NAME,
+_ROOT_REWRITTEN = ("index.html", "index.md", MANIFEST_NAME, CWD_CACHE_NAME,
                    "cache-report.html", "cache-report.md", "cache-hypotheses.html",
                    "cache-hypotheses.md", "cache-codex.html", "cache-codex.md")
 
@@ -10365,11 +10966,11 @@ def _sweep_stray_tmp(out: Path) -> int:
 
     Ctrl+C 那一類各寫入點自己會收；收不到的是行程被砍、斷電——那時 `*.html.tmp` 留在原地，
     而指定了 `--claude-source`／`--codex-source` 的建置會略過孤兒清理、那一場又被沿用，
-    於是半截的暫存檔**永遠**留著（`v62-fam` #7 實測）。
+    於是半截的暫存檔**永遠**留著。
     ⚠ 只認本工具自己的命名：`sessions/` 與 `memory/` 底下的 `*.html.tmp`／`*.md.tmp`（兩個目錄都是
       工具自己的），以及根層那幾個固定檔名的 `.tmp`。`--out` 可能指到別的東西也在的目錄，不掃其他檔。
     範圍限制 SCOPE-TMP-SWEEP-NAME-OWNERSHIP：所有權只靠「目錄＋檔名樣式」判斷；放在 `sessions/`／`memory/`
-    底下、名字剛好符合樣式的非本工具檔案，也在清理範圍內。詳見 planning/scope-limits.md。"""
+    底下、名字剛好符合樣式的非本工具檔案，也在清理範圍內。"""
     n = 0
     cands = [out / (name + ".tmp") for name in _ROOT_REWRITTEN]
     for sub in ("sessions", "memory"):
@@ -10396,8 +10997,7 @@ def _index_rows(entries: dict, include_empty: bool) -> list:
     ⚠⚠ **正常路徑與「零場對帳」那條路一定要用同一段。** 那兩處曾經各寫一份，
     結果零場那份**漏掉了 `empty` 的過濾**（曾用 `--include-empty` 建過的話，
     manifest 裡會留著 `empty:true` 的 row，之後一次不帶那個旗標的零場建置就會把它畫進索引）
-    ——同一份輸入在兩條路上長得不一樣。`bookmarks-fix2-fam-r2` 驗收找到的。
-    ⚠ 抽成函式**本身就是修法**：把條件複製一份、再叮嚀「兩邊要一致」，是這條線上
+    ——同一份輸入在兩條路上長得不一樣。    ⚠ 抽成函式**本身就是修法**：把條件複製一份、再叮嚀「兩邊要一致」，是這條線上
     重複失效的那個做法（`bkMerge` 與 `bkCommit` 的守門條件也是這樣分岔的）。
     ⚠ 誠實邊界：`empty` 那一格**沒有專屬的測試素材**（要造 `n_turns==0` 的語料）。
     現在它承重的理由是「兩條路共用同一段」這個結構，不是有一格斷言在守它——
@@ -10457,7 +11057,7 @@ def session_content_kind(s) -> str:
                 # `~/.claude/projects/`**——而那張圖在頁面上是畫得出來的
                 # （`render_image_block`）。
                 # 那正是本函式 docstring 說「另寫一份判準遲早和畫面分岔」要避開的事，
-                # 而它自己就分岔了（`utf-fam` High#2 實測）。
+                # 而它自己就分岔了。
                 # ⚠ `_command`／`_notify`／`_step`／`_interject` 都在前面的 elif 攔掉了，
                 #   這裡不會誤收；`tool_result` 與純空白本來就不是可呈現區塊，判 False 正確。
                 return "conversation"
@@ -10490,16 +11090,15 @@ def _drop_session_pages(out: Path, key: str) -> tuple:
     """刪掉某個來源檔產生的頁面（HTML／MD）。回傳 `(刪掉幾個, [失敗原因…])`。
 
     路徑取自 manifest 的 `out_html`／`out_md`，**不自己重組檔名**——檔名規則
-    （時間前綴、專案名截斷、sid 前 8 碼）在別處，重組一份遲早分岔。
+    （時間前綴、專案名截斷、id 段 `out_id_part()`）在別處，重組一份遲早分岔。
 
     ⚠⚠ **那兩個欄位是相對 `out/sessions/`，不是相對 `out/`。**
     少接一層 `sessions/` 的話 `unlink()` 會靜靜地什麼都刪不到——`is_file()` 為 False、
     不丟例外、回報「刪了 0 個」也不會有人看。索引頁那邊也是接 `"sessions/" + out_html`。
 
     ⚠⚠ **刪不掉一定要往上報，不可以 `except OSError: pass`。**
-    頁面被鎖／唯讀／權限不足時，舊版把錯誤整個吞掉、來源照搬 ⇒ 磁碟上留下一個
-    **索引連不到、但仍含私密對話**的孤兒頁，而輸出上完全沒有跡象
-    （`utf-fix-codex` Medium 實測）。回報之後由呼叫端決定怎麼辦。
+    頁面被鎖／唯讀／權限不足時，把錯誤整個吞掉、來源照搬的話，磁碟上會留下一個
+    **索引連不到、但仍含私密對話**的孤兒頁，而輸出上完全沒有跡象。回報之後由呼叫端決定怎麼辦。
     """
     n, fails = 0, []
     entries, _ = load_manifest(out)
@@ -10584,7 +11183,7 @@ def archive_command_only(sessions, dest: Path, scanned_roots, out: Path) -> tupl
     # ⚠⚠ **第 5 道閘：記帳寫得進去，才可以開始搬。**
     # 舊版是「搬完才開檔記帳」⇒ manifest 不可寫（權限／磁碟滿／它其實是個目錄）時，
     # 主檔已經離開 `~/.claude/projects/`、目的地有檔、**而還原依據一行都沒有**
-    # （`utf-fix-codex` High#3 實測 `archive_rc=1 source_exists=False manifest_is_dir=True`）。
+    # （實測 `archive_rc=1 source_exists=False manifest_is_dir=True`）。
     # 先開起來、整趟持有這個 handle：寫不進去就在**任何一次搬移之前**停下來。
     try:
         man_fh = man.open("a", encoding="utf-8")
@@ -10705,7 +11304,7 @@ def _archive_move(path, target, src_id, staging):
             raise
     # 範圍限制 SCOPE-ARCHIVE-NO-RESTART-RECONCILE：還原只涵蓋這一趟行程收得到的失敗與中斷。
     # 行程在凍結之後被硬終止（或中斷落在凍結改名回來、進入 `try` 之前）時，來源以 `staging` 的
-    # 名字留在原處旁，之後的執行不會把它改名回去。詳見 planning/scope-limits.md。
+    # 名字留在原處旁，之後的執行不會把它改名回去。
     _rename_noreplace(path, staging)
     try:
         st = os.stat(staging)
@@ -10713,7 +11312,7 @@ def _archive_move(path, target, src_id, staging):
         os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))     # 保留原本的時間（`--resume` 清單看它）
         # 範圍限制 SCOPE-ARCHIVE-OPEN-HANDLE-WINDOW：比對涵蓋到「凍結檔與目的地各量一次」為止；
         # 經**已經開著的 handle** 寫進凍結檔、而且落在量完凍結檔之後到刪除之間的位元組，
-        # 不在這道比對的涵蓋範圍內。詳見 planning/scope-limits.md。
+        # 不在這道比對的涵蓋範圍內。
         if _file_ident(staging) != src_id or _file_ident(target) != src_id:
             raise OSError("複製之後的內容與搬移前量的不同（來源在搬移期間被寫入），這一場不搬")
         try:
@@ -10757,21 +11356,20 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             continue
         # ⚠⚠ **還在寫的 session 不搬。** 判定只看得到「那一刻」：用 `!` 下這個封存指令的那一場，
         # 判定時只有一行 `<bash-input>`（指令還在跑、輸出還沒寫）⇒ 被判成只有指令。
-        # 搬走一場還開著的檔，Claude Code 下一次寫入會在原路徑重建新檔，對話被切成兩半
-        # （`v62-fam` #2 指出的觸發形狀）。
+        # 搬走一場還開著的檔，Claude Code 下一次寫入會在原路徑重建新檔，對話被切成兩半。
         try:
             _idle = _now - path.stat().st_mtime
         except OSError as e:
             _skip(f"讀不到來源：{type(e).__name__}: {e}")
             continue
         # 範圍限制 SCOPE-ARCHIVE-FUTURE-MTIME：閒置只看「現在減 mtime」；mtime 在未來的來源
-        # （時鐘偏差、從別台機器拷來）也落在這一支、用同一句訊息。詳見 planning/scope-limits.md。
+        # （時鐘偏差、從別台機器拷來）也落在這一支、用同一句訊息。
         if _idle < ARCHIVE_MIN_IDLE_SEC:
             _skip(f"最近 {ARCHIVE_MIN_IDLE_SEC // 60} 分鐘內還有寫入（可能還開著），這次不搬")
             continue
         # ⚠⚠ **判定用的是那一刻的位元組，搬之前要確認還是同一份。** 判定與搬移之間隔著整批的讀取，
         # 這段時間 Claude Code 往同一場寫了一則真的對話的話，照搬就是把有對話的 session 封存掉
-        # （`v62-fam` #2 實測：`kind: command_only` 之後補上問答，照樣被搬走）。
+        # （例：`kind: command_only` 之後補上問答，照樣被搬走）。
         cls_id = _cls[0] if _cls else _file_ident(path)
         if cls_id is None:
             _skip("判定期間來源有寫入或讀不到（可能還開著），這次不搬")
@@ -10783,8 +11381,8 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         # 寫進 pending 那一行：搬到一半被硬砍時，還原的人知道去哪裡找。
         staging = path.with_name(path.name + ".archiving")
         # ⚠⚠ **來源的絕對路徑要在搬走之前算好。** `--claude-source` 收得下相對路徑，
-        # 而舊版寫進紀錄的是未 resolve 的 `str(path)` ⇒ CLI 同時印著「含原始絕對路徑」，
-        # 兩者互相矛盾，而還原的人只有那份紀錄（`utf-fix-codex` High#3 實測
+        # 而紀錄若寫未 resolve 的 `str(path)` ⇒ CLI 同時印著「含原始絕對路徑」，
+        # 兩者互相矛盾，而還原的人只有那份紀錄（實測
         # `FROM_IS_ROOTED=False`）。⚠ 搬完再 resolve 是錯的——那時來源已經不在了。
         try:
             src_abs = str(path.resolve())
@@ -10794,7 +11392,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         # 頁面還在」的孤兒；反過來最壞只是頁面被刪、來源還在，下一次執行會重產。
         # 失敗方向要選可自癒的那一邊。
         # ⚠⚠ **順序是：原子佔名 → pending 落磁 → 刪頁 → 確認內容還是判定時那份 → 搬移**，
-        # 而且**任何一步失敗都要把佔位檔收回來**（`utf-fix-codex-r2` 驗收）。
+        # 而且**任何一步失敗都要把佔位檔收回來**。
         # 第一版把「刪頁」排在「佔名」之前、又只有搬移那一段有 cleanup ⇒
         # 注入一次 `fsync` 失敗就實測到：`source=True target=True target_size=0
         # html=False md=False`——**頁面已經刪了、目的地留下 0 位元組的佔位檔，
@@ -10809,12 +11407,12 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             判準是「來源**開頭**還是不是搬移前那份位元組」：只被追加過的來源仍然完整保有它
             （目的地多餘、可以刪）；被改寫或重建的就保留目的地，**當場印到 stderr**
             （Ctrl+C 會直接往外拋，排到 `_skip` 的訊息來不及被印），並附上復原方法。
-            ⚠ 訊息要照實講目的地**是不是完整的**（`v62-fam` #4：7 位元組的半截檔被說成
+            ⚠ 訊息要照實講目的地**是不是完整的**（例：7 位元組的半截檔被說成
               「唯一完整副本」）。
 
             ⚠⚠ **不可以只刪 0 位元組的。** 跨磁碟搬移是「複製＋刪來源」，
             複製寫到一半才失敗時目的地是**部分內容**，不是 0 位元組
-            （`utf-fix-codex-r3` 實測 `target_size=7`）⇒ 只認 0 的話那個半截檔留下來，
+            （實測 `target_size=7`）⇒ 只認 0 的話那個半截檔留下來，
             下一次執行永遠撞「目的地已有同名檔」，這一場再也搬不動。
             ⚠ 判準是**這個名字是我們這一趟建出來的**（`O_EXCL` 保證），
               而且**來源還保有那份內容**——兩者都成立時刪掉它是安全的。
@@ -10823,7 +11421,6 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             **這一趟行程內收得到的中斷**（例外與 `KeyboardInterrupt`）。
             硬終止／斷電之後留下的檔沒有跨次的恢復機制，會擋住那一場的後續封存
             （資料仍在；跨磁碟時來源可能以 `.archiving` 的名字留在原處旁）。
-            詳見 planning/scope-limits.md。
 
             ⚠⚠ **刪不掉要講出來，不可以吞掉。** 舊版 `except OSError: pass` ⇒
             輸出只講「fsync 失敗」，完全沒提「而且佔位檔清不掉」，
@@ -10863,7 +11460,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
 
             ⚠⚠ 舊版這裡只接 `Exception`：主檔搬完之後（或子代理目錄搬到一半）按 Ctrl+C ⇒
               `_archived.jsonl` 停在 `pending`、stderr 一個字都沒有，子代理目錄一半在來源、一半在封存目錄
-              （`v62-fam` #3 實測）——違反本迴圈自己的規矩「主檔一離開來源目錄，下一件事就必須是記帳」。"""
+              ——違反本迴圈自己的規矩「主檔一離開來源目錄，下一件事就必須是記帳」。"""
             _sn = side_note or ("子代理目錄未處理" if side.is_dir() else "")
             try:
                 _journal({"state": "moved", "moved_at": datetime.now(timezone.utc).isoformat(),
@@ -10881,7 +11478,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
                   f"紀錄在 {ARCHIVE_MANIFEST}（含原始絕對路徑，可依它還原）", file=sys.stderr)
 
         # ⚠ `os.open` 與 `os.close` 要包在同一個受保護區：`close` 也可能丟例外，
-        #   而那時檔名已經被我們搶走了（`utf-fix-codex-r3` 指出）。
+        #   而那時檔名已經被我們搶走了。
         try:
             fd = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
@@ -10927,7 +11524,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             # 「搶到名字」與「寫 pending」之間按下 Ctrl+C，就留下一個
             # **0 位元組、而且 manifest 一行紀錄都沒有**的檔——之後每一次執行
             # 都會撞「目的地已有同名檔」而略過這一場，永遠搬不動
-            # （`utf-fix-codex-r4` 實測 `INTERRUPT_GAP` ＋ `INTERRUPT_RETRY`）。
+            # （實測 `INTERRUPT_GAP` ＋ `INTERRUPT_RETRY`）。
             # ⚠ **收完一定要原樣拋出去**：吞掉 `KeyboardInterrupt` 會讓 Ctrl+C 失效。
             _unreserve()
             raise
@@ -10945,7 +11542,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             continue
         # ⚠⚠ 「絕不覆蓋」是上面那道 `O_CREAT|O_EXCL`——**原子的**，不是 `exists()` 之後再搬。
         # 兩者之間有窗：另一個 viewer（或任何程序）在中間建出同名檔時，
-        # 跨磁碟的複製會**覆蓋掉先前封存的紀錄**（`utf-fix-codex` Medium 實測）。
+        # 跨磁碟的複製會**覆蓋掉先前封存的紀錄**。
         # 搶到名字的只會有一個，搶輸的拿 `FileExistsError`。
         # 搬之前的來源內容身分：①要等於判定時那一份（否則這段時間又被寫過，不搬——頁面已經刪了，
         # 來源還在，這一次建置就會把它重產回來）；②中斷後的清理靠它判斷能不能刪目的地。
@@ -10961,7 +11558,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             _skip("判定之後來源又被寫過（可能還開著），這次不搬")
             continue
         # 範圍限制 SCOPE-ARCHIVE-RECHECK-TO-MOVE-WINDOW：這道比對涵蓋到「量完 `src_id` 的那一刻」為止；
-        # 量完到搬移之間寫進來的內容（含真的對話）不在涵蓋範圍內，會跟著整份搬走。詳見 planning/scope-limits.md。
+        # 量完到搬移之間寫進來的內容（含真的對話）不在涵蓋範圍內，會跟著整份搬走。
         try:
             _archive_move(path, target, src_id, staging)
         except BaseException as e:
@@ -10993,7 +11590,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         # **主檔已經不在 `~/.claude/projects/` 了，而 `_archived.jsonl` 一行都沒寫**，
         # 畫面還回報「搬走 0 場」——使用者被告知什麼都沒發生，實際上少了一場
         # `claude --resume` 入口，**而且沒有任何還原依據**
-        # （`utf-fam` High#1 實測：來源主檔不在、封存目錄有、manifest 0 行）。
+        # （實測：來源主檔不在、封存目錄有、manifest 0 行）。
         # ⇒ 記帳與 `moved` 都綁在**主檔搬移成功**這一件事上，
         #   子代理目錄的成敗只是這一筆的附註，不可以讓它推翻記帳。
         # ⚠⚠ 中斷（Ctrl+C）也一樣：整段包在 `BaseException` 裡，記一行 `moved`（附註中斷）再拋出去。
@@ -11001,7 +11598,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         try:
             if side.is_dir():
                 # ⚠ 子代理目錄也要有「絕不覆蓋」閘：直接 `shutil.move` 到已存在的目錄
-                # 會把它塞成**巢狀子目錄**（`utf-fam` Low#2）。
+                # 會把它塞成**巢狀子目錄**。
                 # ⚠⚠ 和主檔同一個理由改成原子的：`os.mkdir` 在目的地已存在時丟
                 # `FileExistsError`，中間沒有窗。搶到之後**逐一搬子項**進去
                 # ——`shutil.move` 到一個「已經存在的目錄」正是會巢狀的那個動作。
@@ -11046,7 +11643,7 @@ def prune_gone_sources(entries: dict, scanned_roots) -> tuple:
     回傳 `(留下來的 entries, 拿掉幾筆)`。
 
     ⚠⚠ **這是書籤管理頁反查表（`BX_SESS`）唯一的對帳點。** 不做的話，明確來源中
-    **已刪除的 session 會永久留在表裡**（跨模型 Medium#5）：任何縮範圍旗標都讓
+    **已刪除的 session 會永久留在表裡**：任何縮範圍旗標都讓
     `filtering=True` ⇒ 整份舊 manifest 原封不動被沿用，而縮範圍模式又不清孤兒檔
     ⇒ 舊 HTML 還躺在磁碟上 ⇒ fallback 每次都把它烤回去。實測：以明確來源建兩場、
     刪掉其中一份 JSONL、再用同一個來源重建，程式仍回報共 2 場。
@@ -11060,7 +11657,6 @@ def prune_gone_sources(entries: dict, scanned_roots) -> tuple:
 
     範圍限制 SCOPE-BOOKMARK-PRUNED-ORPHAN-FILES：本函式只對帳 manifest 紀錄，
     **不刪磁碟上已經產出來的檔**；縮範圍模式的孤兒清理範圍見 `main()` 尾端那段。
-    詳見 planning/scope-limits.md。
     """
     roots = []
     for r in scanned_roots:
@@ -11123,7 +11719,13 @@ def munge_path(cwd) -> str:
 
 
 def peek_cwd(path: Path, max_lines: int = 50) -> str:
-    """只讀檔案開頭幾行、cheaply 取出 Claude JSONL 記錄的 cwd（不整檔解析）。"""
+    """只讀檔案開頭幾行、cheaply 取出 Claude JSONL 記錄的 cwd（不整檔解析）；讀不到也回空字串。"""
+    return _peek_cwd_raw(path, max_lines) or ""
+
+
+def _peek_cwd_raw(path: Path, max_lines: int = 50):
+    """同 `peek_cwd`，但**讀不到檔回 `None`**（被別的程式鎖住、離線的雲端佔位檔、網路磁碟斷線），
+    開得了檔、開頭沒有 cwd 才回空字串。快取要分得出這兩種：前者不可以記成「這個檔沒有 cwd」。"""
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             for _ in range(max_lines):
@@ -11139,21 +11741,81 @@ def peek_cwd(path: Path, max_lines: int = 50) -> str:
                 if c:
                     return c
     except OSError:
-        pass
+        return None
     return ""
 
 
-def build_project_names(files) -> dict:
+# `peek_cwd` 的判讀方式（讀幾行、怎麼取值）改變時 +1：快取裡存的是舊判讀的結果，
+# 版本不符就整份不用。
+CWD_CACHE_VERSION = 1
+
+
+def load_cwd_cache(out: Path) -> dict:
+    """回傳 `{主檔路徑字串: [size, mtime_ns, cwd]}`；檔不在、壞掉、版本不符一律回空字典（全部重讀）。"""
+    try:
+        data = json.loads((out / CWD_CACHE_NAME).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict) or data.get("v") != CWD_CACHE_VERSION:
+        return {}
+    files = data.get("files")
+    return files if isinstance(files, dict) else {}
+
+
+def save_cwd_cache(out: Path, files: dict):
+    """寫不進去只印一行警告、建置照常：這份快取只影響下一次的速度，不影響輸出。
+    `ensure_ascii=True`：路徑與 cwd 可能帶著孤立的代理字元（JSONL 裡合法的 `\\udc80` 跳脫），
+    直接寫成 UTF-8 會丟 `UnicodeEncodeError`——那不是 `OSError`，會讓整次建置中止。"""
+    try:
+        _write_atomic(out / CWD_CACHE_NAME,
+                      json.dumps({"v": CWD_CACHE_VERSION, "files": files}, ensure_ascii=True))
+    except OSError as e:
+        print(f"  ! cwd 快取寫不進去（下一次建置會全部重讀）：{type(e).__name__}: {e}", file=sys.stderr)
+
+
+def peek_cwd_cached(path: Path, old: dict, new: dict) -> str:
+    """`peek_cwd` 加上跨建置的快取：主檔**自己的** `(size, mtime_ns)` 和上次一樣就用上次讀到的 cwd，
+    否則重讀。結果記進 `new`（下一次建置的快取）。
+
+    - 鍵含 size：`peek_cwd` 只看開頭幾行，檔案還短時可能讀不到 cwd（回空字串），
+      長出來之後 size 變了就會重讀。
+    - 先 stat 再讀：檔案在兩步之間長大時，記下的是**較小**的 size ⇒ 下一次對不上、重讀。
+      順序反過來，「短檔讀不到 cwd」的結果會被記在長大後的 size 底下，之後一直沿用空字串。
+    - 只看主檔，不看 memory／子代理（`session_signature` 那份指紋含它們，cwd 跟它們無關）。
+    - 範圍限制 SCOPE-CWD-CACHE-STAT-KEY：「內容變了、size 與 mtime_ns 都沒變」視為沒變
+      （與 `session_signature` 同一個前提），那種改寫之後專案名沿用快取裡的舊 cwd。
+    - 讀不到檔（`_peek_cwd_raw` 回 `None`）時這一次當成沒有 cwd，但**不記**：
+      記下去的話檔案沒變就一直沿用空字串，暫時的讀取失敗會變成永久的錯誤專案名。
+    """
+    k = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return peek_cwd(path)
+    hit = old.get(k)
+    if (isinstance(hit, list) and len(hit) == 3 and hit[0] == st.st_size
+            and hit[1] == st.st_mtime_ns and isinstance(hit[2], str)):
+        cwd = hit[2]
+    else:
+        cwd = _peek_cwd_raw(path)
+        if cwd is None:
+            return ""
+    new[k] = [st.st_size, st.st_mtime_ns, cwd]
+    return cwd
+
+
+def build_project_names(files, peek=peek_cwd) -> dict:
     """每個 Claude (帳號, munged 夾) 算一個友善的正規顯示名（一夾一專案名）。
     取「原生 cwd」（munge 回來等於夾名）的葉名當專案名；搬遷後被複製進來的『外來』
     session（cwd 屬於別的夾）改用所屬夾的正規名，不再各自顯示舊路徑的葉名。
     整夾都無原生 cwd（全是外來複本）時退而用任一 cwd 葉名、再退回夾名。
-    cwd 一律從主檔開頭 peek（不綁 manifest 指紋，免得只動到 memory/子代理就誤判 cwd）。"""
+    cwd 一律從主檔開頭取（`peek`；建置時用 `peek_cwd_cached`，只看主檔自己有沒有變，
+    不綁 manifest 指紋，免得只動到 memory/子代理就誤判 cwd）。"""
     cwds = {}   # (account, munged) -> [cwd, ...]
     for source_kind, acc, munged, sf in files:
         if source_kind != SOURCE_CLAUDE:
             continue
-        cwds.setdefault((acc, munged), []).append(peek_cwd(sf))
+        cwds.setdefault((acc, munged), []).append(peek(sf))
     names = {}
     for (acc, munged), lst in cwds.items():
         native = [c for c in lst if c and munge_path(c) == munged]
@@ -11308,7 +11970,7 @@ MAX_HIT_CARDS = 800        # 整頁命中上限（防極熱門詞把頁面撐爆
 # ⚠ 耐久錨點 `{#k…Z}` 接在 `{#tN}` **後面**，所以這條一定要吃得下它，否則整份 .md 切不出
 #   任何回合、搜尋結果頁一則都不會有（`test_search` 的「命中詞高亮」就是在守這一格）。
 #   它是 optional：既有的 .md 是舊 renderer 產的、沒有那一段，重建之前兩種都要認得。
-_TURN_HEAD_RE = re.compile(r"^### (?P<side>↳ )?(?P<who>👤 You|🤖 \S+) ·(?P<rest>.*)\{#(?P<a>[ts]\d+)\}"
+_TURN_HEAD_RE = re.compile(r"^### (?P<side>↳ )?(?P<who>👤 You|🤖 \S+|" + MD_COMPACT_WHO + r") ·(?P<rest>.*)\{#(?P<a>[ts]\d+)\}"
                            r"(?: \{#(?P<k>k[0-9A-Za-z-]+)\})?\s*$")
 _TIME_RE = re.compile(r"\d\d:\d\d:\d\d")
 
@@ -11353,16 +12015,41 @@ def _term_pattern(text, is_phrase, flags):
     return re.compile(src, flags)
 
 
-def iter_turn_chunks(md_text):
+def _turn_table(turns):
+    """manifest 的 `turns`（`[[錨點, 耐久錨點或 None, 序號], …]`）→ `{序號: (錨點, 耐久錨點或 None)}`；形狀不對就回 None。"""
+    if not isinstance(turns, list):
+        return None
+    try:
+        return {int(n): (a, k) for a, k, n in turns}
+    except (TypeError, ValueError):
+        return None
+
+
+def iter_turn_chunks(md_text, turns=None):
     """把 session 的 .md 切成 (錨點, 是否子代理, 角色字串, 時間, 內文)；第一個回合前的 session 標頭不納入
-    （標題/專案/cwd 等 metadata 搜尋 index.html 就有，這裡專搜對話內容）。"""
+    （標題/專案/cwd 等 metadata 搜尋 index.html 就有，這裡專搜對話內容）。
+
+    `turns`＝這一份 .md 寫出時真的寫了哪些回合標頭：`[[錨點, 耐久錨點或 None, 序號], …]`（`render_session_md`
+    記在 `s.md_turns`，建置時存進 manifest 那一筆的 `turns`；序號＝全檔第幾個長得像回合標頭的行）。
+    給了的話，只有「序號在表上、而且錨點與耐久錨點跟表上那一格**完全相同**」的那一行算回合標頭，其餘當內文。
+    ⚠ 內文會原樣進 .md（指令輸出、貼上的文字），裡面可以有一行長得跟回合標頭一模一樣——例如
+    `cat` 另一份本工具產的 .md。只看正則的話，那一行會切出一個不存在的回合，命中連到失效的錨點。
+    ⚠ 不用「fence 裡面的不算」來擋：使用者自己的文字也原樣進 .md，裡面沒關掉的 ``` 會把後面
+    真的標頭整段吞掉。⚠ 只比「錨點＋耐久錨點」也不夠：照抄的那一行可以跟後面某一則真的完全相同
+    （沒有耐久錨點的回合只要抄對 `tN`／`sN`），比真的那一行先出現就搶走它；所以要比**位置**（序號）。
+    `turns` 是 None 或形狀不對（manifest 是這一欄出現之前寫的）就只看正則。"""
     # ⚠ 內文**尾端一律 rstrip**。回合之間插進來的東西（目前是切帳號分隔線）除了自己那一行，
     # 前後還會帶空行，那些會落進**前**一則的內文。與其讓這裡去認得每一種插入物的形狀
     # （認漏一種就是一個缺陷，而形狀會隨渲染端改動），不如直接不讓尾端空白有意義——
     # 命中位置不可能落在尾端空白裡，片段本來也會把空白壓平，所以砍掉不損失任何東西。
-    cur, buf = None, []
+    table = _turn_table(turns)
+    cur, buf, n = None, [], 0
     for line in md_text.splitlines():
         m = _TURN_HEAD_RE.match(line)
+        if m:
+            n += 1
+            if table is not None and table.get(n - 1) != (m.group("a"), m.group("k")):
+                m = None
         if m:
             if cur:
                 yield (*cur, "\n".join(buf).rstrip())
@@ -11429,7 +12116,7 @@ def render_search_html(q, args, groups, n_hits, n_scope, n_missing, truncated):
             chips += ' <span class="chip">僅 .md</span>'
         items = []
         for h in g["hits"]:
-            icon = "👤" if "👤" in h["who"] else "🤖"
+            icon = "👤" if "👤" in h["who"] else ("📋" if "📋" in h["who"] else "🤖")
             side = ' <span class="badge">↳ 子代理</span>' if h["side"] else ""
             target = f'{href}#{h["anchor"]}' if has_html else href   # .md 無錨點可跳，開純文字後可搜 {#tN}
             items.append(
@@ -11502,6 +12189,10 @@ def run_search(args):
         raise SystemExit(2)
 
     rows = [e["row"] for e in entries.values() if e.get("row") and not e["row"].get("empty")]
+    md_turns = {}                 # 輸出路徑 → 寫到這個路徑的每一筆的 `turns`（兩筆來源可以寫到同一個路徑）
+    for e in entries.values():
+        if e.get("row"):
+            md_turns.setdefault(e["row"].get("out_md"), []).append(e.get("turns"))
     if args.project:
         rows = [r for r in rows if row_matches_project(r, args.project)]
     if args.account:
@@ -11538,8 +12229,21 @@ def run_search(args):
             continue
         if not matches(text):                 # 整檔快篩：任一組整檔都沒中就不必切回合
             continue
+        # 這份 .md 寫了哪些回合標頭（理由見 iter_turn_chunks）。⚠ 表要跟磁碟上這份 .md 對得上：核對後切出來的
+        #   回合必須剛好是表上那幾則、依序。兩筆來源寫到同一個輸出路徑時 manifest 各記一張，只有最後寫的那一筆
+        #   對得上 ⇒ 每一張都試，挑對得上的；都對不上（或沒有表）才照正則切——硬套的話，真的標頭會整批變成內文。
+        chunks = None
+        for _t in md_turns.get(r["out_md"]) or ():
+            if _turn_table(_t) is None:
+                continue
+            _c = list(iter_turn_chunks(text, _t))
+            if [c[0] for c in _c] == [t[0] for t in _t]:
+                chunks = _c
+                break
+        if chunks is None:
+            chunks = list(iter_turn_chunks(text))
         hits, more = [], 0
-        for anchor, is_side, who, when, chunk in iter_turn_chunks(text):
+        for anchor, is_side, who, when, chunk in chunks:
             if not matches(chunk):
                 continue
             if len(hits) >= HITS_PER_SESSION or n_hits >= MAX_HIT_CARDS:
@@ -11592,6 +12296,210 @@ def run_search(args):
             pass
 
 
+def collect_session_files(args):
+    """這一次要處理的來源檔：`(accounts, codex_accounts, files, 去重前的筆數)`，
+    `files` 每一筆是 `(來源類型, 帳號, 專案munged名, session檔)`。建置與 `--ai-md` 共用同一條路。"""
+    accounts = [] if args.no_claude else collect_sources(args.claude_source, args.account)
+    codex_accounts = [] if args.no_codex else collect_codex_sources(args.codex_source)
+    files = []
+    for acc_name, proj_root in accounts:
+        if not proj_root.is_dir():
+            print(f"  (略過) 帳號 {acc_name} 找不到目錄：{proj_root}", file=sys.stderr)
+            continue
+        for proj_name, sf in iter_session_files(proj_root, args.project):
+            files.append((SOURCE_CLAUDE, acc_name, proj_name, sf))
+    for acc_name, sessions_root in codex_accounts:
+        if not sessions_root.exists():
+            print(f"  (略過) Codex {acc_name} 找不到目錄：{sessions_root}", file=sys.stderr)
+            continue
+        for sf in iter_codex_session_files(sessions_root):
+            files.append((SOURCE_CODEX, acc_name, "codex", sf))
+    n_raw = len(files)
+    return accounts, codex_accounts, _dedupe_claude_sessions(files), n_raw   # 跨來源同 sessionId 的複本只留一份
+
+
+def out_base(s):
+    """一場的輸出位置：`(來源夾, 帳號夾, 檔名主幹)`。`sessions/` 與 `ai/` 共用，兩邊各組一份遲早分岔。"""
+    date = s.start.astimezone().strftime("%Y%m%d-%H%M") if s.start else "nodate"
+    return (safe_name(s.source_kind, 24), safe_name(s.account or "default", 24),
+            f"{date}__{safe_name(s.proj_display,24)}__{out_id_part(s)}")
+
+
+_UUID_TAIL_RE = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
+
+
+def _ai_md_sid(kind, path):
+    """這一場的 session id，與載入器同一個來源：Claude＝檔名；Codex＝開頭那一筆 `session_meta` 的 `id`
+    （`load_codex_session` 用它當 session id，輸出檔名的那 8 碼也從它來）——檔名可以被改，不可以拿檔名認人。
+    沒有 `session_meta` 才退回 rollout 檔名結尾的 uuid，再退回整個檔名。"""
+    stem = path.stem
+    if kind == SOURCE_CODEX:
+        mid = _codex_meta(path).get("id")
+        if isinstance(mid, str) and mid.strip():
+            return mid.strip()
+        m = _UUID_TAIL_RE.search(stem)
+        if m:
+            return m.group(1)
+    return stem
+
+
+def _ai_md_id_matches(kind, sid, key):
+    """`key`（已轉小寫）指的是不是這個 session id：完整、開頭，或 Codex 的結尾（輸出檔名那 8 碼，見 `out_id_part`）。"""
+    sid = str(sid).lower()
+    return sid == key or sid.startswith(key) or (kind == SOURCE_CODEX and sid.endswith(key))
+
+
+def _ai_md_stem_matches(path, ids, key):
+    """`key` 是整個檔名（不含副檔名）：只有在檔名本身就帶著這一場的 id 時才算——檔名和內容的 id 不一致，
+    就不可以拿檔名繞過 id 的判斷。"""
+    stem = path.stem.lower()
+    return stem == key and any(x and str(x).lower() in stem for x in ids)
+
+
+def _codex_meta(path):
+    """rollout 開頭那一筆 `session_meta` 的 payload（不讀整份檔）；讀不到回 {}。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 20:
+                    break
+                if '"session_meta"' in line:
+                    e = json.loads(line)
+                    if e.get("type") == "session_meta":
+                        return e.get("payload") or {}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _codex_is_subagent(path):
+    """Codex 的子代理執行緒（`session_meta.source` 是 dict）。"""
+    return isinstance(_codex_meta(path).get("source"), dict)
+
+
+def codex_file_matches_project(path, project_filter, account="default"):
+    """`--project` 對 Codex 的判準：與建置同一個（載入整場，`project_matches_filter`）——cwd 會被後面的
+    `turn_context` 改掉，只看開頭那一筆會和建置挑出不同的場。讀不起來就丟例外（由呼叫端講出來）。"""
+    if not project_filter:
+        return True
+    return project_matches_filter(load_codex_session(path, account, {}), project_filter)
+
+
+def pick_ai_md_target(files, ident, now=None, eligible=None):
+    """`--ai-md` 要處理的那一場：回傳 (files 裡的那一筆, [給人看的說明…])；找不到或不唯一就 `SystemExit`。
+
+    - `last`：最近有寫入的那一場。`AI_MD_FRESH_SEC` 秒內還在寫的視為**呼叫者自己那一場**（接手的 AI 呼叫
+      這個指令的當下，它自己的紀錄一定剛寫過），跳過並列進說明；Codex 的子代理執行緒不算一場。
+    - 其餘：完整的 session id、id 的開頭，或輸出檔名裡的那 8 碼（Codex 是 id 的**結尾**，見 `out_id_part`）。
+    - `eligible(item)`：範圍篩選（`--project`）。對 `last` 是從新到舊一場一場問、問到第一場符合的就停；
+      對 id 是先對 id、再篩——貴的判斷只做在候選上。
+    """
+    ident = ident.strip()
+    if ident.lower() == "last":
+        now = datetime.now().timestamp() if now is None else now
+        cands = []
+        for item in files:
+            try:
+                cands.append((item[3].stat().st_mtime, item))
+            except OSError:
+                continue
+        cands.sort(key=lambda c: c[0], reverse=True)
+        notes = []
+        for mt, item in cands:
+            if now - mt < AI_MD_FRESH_SEC:
+                notes.append(f"  略過 {_ai_md_sid(item[0], item[3])}：{int(now - mt)} 秒前還在寫，視為呼叫者自己那一場")
+                continue
+            if item[0] == SOURCE_CODEX and _codex_is_subagent(item[3]):
+                continue
+            if eligible is not None:
+                try:
+                    ok = eligible(item)
+                except Exception as e:     # 判斷不了不等於不符合：講出來，不可以安靜地跳到更舊的那一場
+                    notes.append(f"  略過 {_ai_md_sid(item[0], item[3])}：讀不起來，判斷不了在不在範圍內"
+                                 f"（{type(e).__name__}: {e}）")
+                    continue
+                if not ok:
+                    continue
+            ts = datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M:%S")
+            notes.append(f"  last＝{_ai_md_sid(item[0], item[3])}（最後寫入 {ts}，{item[3]}）")
+            return item, notes
+        raise SystemExit("--ai-md last：找不到可用的 session" + ("\n" + "\n".join(notes) if notes else ""))
+    key = ident.lower()
+    if len(key) < 4:
+        raise SystemExit(f"--ai-md {ident!r}：太短，至少給 4 個字元（session id 的開頭，或輸出檔名裡那 8 碼）")
+    hits = []
+    for item in files:
+        sid = _ai_md_sid(item[0], item[3])
+        if _ai_md_id_matches(item[0], sid, key) or _ai_md_stem_matches(item[3], [sid], key):
+            hits.append(item)
+    if not hits:
+        raise SystemExit(f"--ai-md {ident!r}：找不到這一場（看的是 session id 的開頭；Codex 也認結尾那 8 碼）")
+    if eligible is not None:
+        kept = []
+        for h in hits:
+            try:
+                if eligible(h):
+                    kept.append(h)
+            except Exception as e:
+                raise SystemExit(f"--ai-md {ident!r}：{h[3].name} 讀不起來，判斷不了在不在 --project 的範圍內"
+                                 f"（{type(e).__name__}: {e}）")
+        hits = kept
+        if not hits:
+            raise SystemExit(f"--ai-md {ident!r}：對到的那一場不在 --project 的範圍內")
+    if len(hits) > 1:
+        lines = [f"  {_ai_md_sid(k, p)} · {p}" for k, _, _, p in hits[:10]]
+        more = f"\n  …共 {len(hits)} 場" if len(hits) > 10 else ""
+        raise SystemExit(f"--ai-md {ident!r}：對到 {len(hits)} 場，給長一點的 id：\n" + "\n".join(lines) + more)
+    return hits[0], []
+
+
+def run_ai_md(args):
+    """`--ai-md`：只處理一場，產給 AI 讀的精簡版（與完整版）到 `out/ai/`，stdout 只印一行絕對路徑。
+    不碰 `out/sessions/`、manifest、索引——那些是增量建置的紀錄。"""
+    accounts, codex_accounts, files, _ = collect_session_files(args)
+    # `--project`：Claude 在收集來源時就照專案夾篩了；Codex 的建置是載入後才篩，這裡要在挑那一場時篩
+    eligible = ((lambda it: it[0] != SOURCE_CODEX or codex_file_matches_project(it[3], args.project, it[1]))
+                if args.project else None)
+    item, notes = pick_ai_md_target(files, args.ai_md, eligible=eligible)
+    for n in notes:
+        print(n, file=sys.stderr)
+    kind, acc, proj, sf = item
+    switches = ({} if args.no_claude else load_account_switches(
+        claude_config_dirs(p for _, p in claude_source_items(args.claude_source, args.account))))
+    if kind == SOURCE_CODEX:
+        titles = {}
+        for _, root in codex_accounts:
+            titles.update(load_codex_thread_names(root))
+        s = load_codex_session(sf, acc, titles)
+    else:
+        s = load_session(sf, proj, acc, kind)
+    analyze(s, switches)
+    key = args.ai_md.strip().lower()
+    if key != "last":
+        # 挑的時候只讀了開頭；載入器讀完整份才定 session id。兩者對不上（例：檔裡不只一筆 `session_meta`）
+        # 就不是指定的那一場——停下來，不可以寫出別場。
+        m = _UUID_TAIL_RE.search(s.session_id)        # 沒有 `session_meta` 時 session id 是 rollout 檔名
+        ids = [s.session_id, m.group(1) if m else ""]
+        if not (any(_ai_md_id_matches(kind, x, key) for x in ids) or _ai_md_stem_matches(sf, ids, key)):
+            raise SystemExit(f"--ai-md {args.ai_md!r}：{sf.name} 載入後的 session id 是 {s.session_id}，"
+                             "對不上指定的 id")
+    if kind == SOURCE_CLAUDE:                  # 一夾一專案名，同 `main()`（只看同一夾的檔就夠）
+        names = build_project_names([f for f in files if f[0] == SOURCE_CLAUDE and f[1] == acc and f[2] == proj])
+        s.proj_display = names.get((acc, proj), s.proj_display)
+    if not any(e.get("type") in ("user", "assistant") for e in s.events):
+        raise SystemExit(f"--ai-md：{sf.name} 裡沒有對話")
+    safe_source, safe_acc, base = out_base(s)
+    d = Path(args.out) / "ai" / safe_source / safe_acc
+    d.mkdir(parents=True, exist_ok=True)
+    full, comp = (d / f"{base}.md").resolve(), (d / f"{base}.ai.md").resolve()
+    want = args.ai_md_kind
+    if want in ("full", "both"):
+        _write_atomic(full, render_session_md(s))
+    if want in ("compact", "both"):
+        _write_atomic(comp, render_session_ai_md(s, full if want == "both" else None))
+    print(str(full if want == "full" else comp))
+
+
 def main():
     ap = argparse.ArgumentParser(description="把 Claude Code / Codex 的 JSONL session 轉成 HTML/Markdown")
     ap.add_argument("--claude-source", action="append", default=None,
@@ -11623,7 +12531,17 @@ def main():
                          "（檔名＝cwd＋原檔名），並刪掉它產生的頁面。"
                          "⚠ 那些 session 會從 `claude --resume` 的清單消失；"
                          "每一筆都記在該目錄的 _archived.jsonl，可依它還原")
+    ap.add_argument("--ai-md", default=None, metavar="SESSION",
+                    help="只處理一場：產生給 AI 讀的精簡版 md（與完整版）到 out/ai/，只印一行精簡版的絕對路徑。"
+                         "SESSION＝session id、它的開頭，或輸出檔名裡那 8 碼；寫 last＝最近有寫入的那一場"
+                         "（跳過 30 秒內還在寫的，也就是正在呼叫它的那一場）。不重建索引、不碰其他輸出")
+    ap.add_argument("--ai-md-kind", choices=["compact", "full", "both"], default="both",
+                    help="--ai-md 產哪一份：精簡版、完整版或兩者（預設兩者；印出的是精簡版的路徑）")
     args = ap.parse_args()
+
+    if args.ai_md is not None:       # 有給 --ai-md 就只處理那一場
+        run_ai_md(args)
+        return
 
     if args.search is not None:      # 有給 --search 就走搜尋；空字串/純空白由 run_search 報錯
         run_search(args)
@@ -11639,23 +12557,7 @@ def main():
     want_html = args.format in ("html", "both")
     want_md = args.format in ("md", "both")
 
-    accounts = [] if args.no_claude else collect_sources(args.claude_source, args.account)
-    codex_accounts = [] if args.no_codex else collect_codex_sources(args.codex_source)
-    files = []   # (來源類型, 帳號, 專案munged名, session檔)
-    for acc_name, proj_root in accounts:
-        if not proj_root.is_dir():
-            print(f"  (略過) 帳號 {acc_name} 找不到目錄：{proj_root}", file=sys.stderr)
-            continue
-        for proj_name, sf in iter_session_files(proj_root, args.project):
-            files.append((SOURCE_CLAUDE, acc_name, proj_name, sf))
-    for acc_name, sessions_root in codex_accounts:
-        if not sessions_root.exists():
-            print(f"  (略過) Codex {acc_name} 找不到目錄：{sessions_root}", file=sys.stderr)
-            continue
-        for sf in iter_codex_session_files(sessions_root):
-            files.append((SOURCE_CODEX, acc_name, "codex", sf))
-    n_raw = len(files)
-    files = _dedupe_claude_sessions(files)          # 跨來源同 sessionId 的複本只留一份，避免雙倍計
+    accounts, codex_accounts, files, n_raw = collect_session_files(args)
 
     # 封存「只有指令、沒有對話」的 session。⚠ **只有明確給了參數才會發生**——
     # 沒給就連判定都不做，一個來源檔都不會被讀第二次。
@@ -11751,6 +12653,10 @@ def main():
         if n_gone:
             print(f"  （來源已刪除，對掉 {n_gone} 筆舊紀錄）")
         save_manifest(out, new_entries)
+        # 沿用的列照樣可能撞名，這條路也要講（同正常路徑的收尾）
+        _n_clash = report_output_clashes(_index_rows(new_entries, args.include_empty))
+        if _n_clash:
+            print(f"⚠ 輸出檔名相同 {_n_clash} 個（見上面的 ! 訊息）")
         if want_html:
             # ⚠⚠ **索引頁要用對帳後的 `new_entries` 重畫，不可以寫死。**
             #     `new_entries` 在縮範圍時保留了範圍外的紀錄（正常路徑本來就會把它們
@@ -11796,7 +12702,7 @@ def main():
     new_entries = dict(old_manifest) if filtering else {}
     # ⚠⚠ 沿用舊 manifest 不等於「舊的都還在」。本次真的掃過的來源根底下、檔案已經不在的，
     #     一律對掉——不做的話已刪除的 session 會**永久**留在書籤管理頁的反查表裡
-    #     （跨模型 Medium#5）。判準與保守方向見 `prune_gone_sources` 的 docstring。
+    #     。判準與保守方向見 `prune_gone_sources` 的 docstring。
     scanned_roots = [root for _, root in accounts] + [root for _, root in codex_accounts]
     if filtering:
         new_entries, n_gone = prune_gone_sources(new_entries, scanned_roots)
@@ -11819,7 +12725,17 @@ def main():
             mem_cache[k] = load_memory_dir(root / munged / "memory") if root else None
         return mem_cache[k]
 
-    proj_names = build_project_names(files)
+    # cwd 快取：完整建置只留本次掃到的主檔。縮範圍建置只碰到一部分，範圍外的舊紀錄**檔還在才留**
+    # （下一次完整建置就不必重讀）——帶 `--claude-source` 的建置每次都算縮範圍，不看存不存在的話，
+    # 被刪掉的 session 會一直留在快取裡。`--force`（忽略快取）也不用它。
+    cwd_old = {} if args.force else load_cwd_cache(out)
+    cwd_new = {}
+    proj_names = build_project_names(files, peek=lambda sf: peek_cwd_cached(sf, cwd_old, cwd_new))
+    if filtering:
+        for k, v in cwd_old.items():
+            if k not in cwd_new and os.path.exists(k):        # 任何 OSError 都當成不在（只少一筆快取）
+                cwd_new[k] = v
+    save_cwd_cache(out, cwd_new)
     n_build = n_reuse = n_empty = n_broken = 0      # n_broken：壞掉被跳過的來源檔
     n_broken_kept = 0                              # 其中「沿用上一次輸出」的（見下方 except）
     for source_kind, acc_name, proj_name, sf in files:
@@ -11833,7 +12749,7 @@ def main():
         new_entries.pop(key, None)
         reusable = (
             cached.get("sig") == sig and row
-            # ⚠⚠ 帳號標籤變了就**一定要重建**（跨模型 Medium#5 的 [推論] 那半）。
+            # ⚠⚠ 帳號標籤變了就**一定要重建**。
             #    輸出路徑是 `<來源>/<帳號>/<檔名>`，而 sig 只看檔案內容 ⇒ 同一份 JSONL
             #    換一個 `--claude-source 標籤=路徑` 重跑時，舊 row 會被沿用、頁面留在
             #    **舊的帳號目錄**下，索引與 BX_SESS 也跟著指到那裡。標籤是會改輸出位置
@@ -11849,13 +12765,13 @@ def main():
             and (not want_md or (row.get("has_md", True) and (sess_dir / row["out_md"]).exists()))
         )
         if reusable:
-            new_entries[key] = {"sig": sig, "row": row}
+            new_entries[key] = {"sig": sig, "row": row, "turns": cached.get("turns")}
             n_reuse += 1
             continue
 
         # ⚠⚠ **壞掉的那一場只有一個處理器。** 先前解析失敗與分析失敗各寫一份，於是
         # 「把上一次的 row 放回去」只做在分析那一半 ⇒ **解析失敗照樣會刪掉舊頁面**
-        # （`qimg-fix-codex` Medium#1）。兩條路共用這一支，之後再長第三條也是。
+        # 。兩條路共用這一支，之後再長第三條也是。
         def _broken(kind, exc):
             nonlocal n_broken, n_broken_kept
             print(f"  ! {kind} {sf.name}: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -11914,18 +12830,15 @@ def main():
             continue
         if source_kind == SOURCE_CLAUDE:                       # 一夾一專案名：外來複本改用所屬夾的正規名
             s.proj_display = proj_names.get((s.account, s.proj_munged), s.proj_display)
-        date = s.start.astimezone().strftime("%Y%m%d-%H%M") if s.start else "nodate"
-        safe_source = safe_name(s.source_kind, 24)
-        safe_acc = safe_name(s.account or "default", 24)
+        safe_source, safe_acc, base = out_base(s)
         (sess_dir / safe_source / safe_acc).mkdir(parents=True, exist_ok=True)
-        base = f"{date}__{safe_name(s.proj_display,24)}__{s.session_id[:8]}"
         s.out_html = f"{safe_source}/{safe_acc}/{base}.html"
         s.out_md = f"{safe_source}/{safe_acc}/{base}.md"
         s.mem_href = ""
         if source_kind == SOURCE_CLAUDE and get_mem(s.account, s.proj_munged):
             s.mem_href = memory_rel_path(s.account, s.proj_munged)
         # ⚠⚠ **護欄要真的包到渲染。** 先前只包了 `analyze()`，而註解卻寫著「包到渲染完為止」
-        # ——那是**只修一半、而且註解在說謊**（`qimg-fix-codex` Medium#8 讀碼抓到）。
+        # ——那是**只修一半、而且註解在說謊**。
         # 渲染層拿到的是同一份髒資料，而這條線新增的碼有一半在渲染層。
         # ⚠⚠ **先寫到暫存檔、全部成功才換上正式檔。** 直接寫正式檔的話，寫到一半失敗（或 HTML
         #   寫好了、MD／`session_to_row` 才失敗）時，磁碟上留下的是**寫壞的新頁面**或「新 HTML ＋舊 MD」，
@@ -11945,7 +12858,7 @@ def main():
             row = session_to_row(s)
         except BaseException as e:
             # ⚠ Ctrl+C 落在寫暫存檔途中也要收：只接 `Exception` 的話半截的 `*.html.tmp` 留在原地，
-            #   而之後的建置會沿用這一場、不會再寫到它（`v62-fam` #7 實測 `('old', 67233, False)`）。
+            #   而之後的建置會沿用這一場、不會再寫到它（實測 `('old', 67233, False)`）。
             for _t, _ in staged:
                 try:
                     _t.unlink(missing_ok=True)
@@ -11988,11 +12901,15 @@ def main():
             prev and prev.get("has_html") and (sess_dir / row["out_html"]).exists()))
         row["has_md"] = md_new or (not want_md and bool(
             prev and prev.get("has_md") and (sess_dir / row["out_md"]).exists()))
-        new_entries[key] = {"sig": sig, "row": row}
+        # `turns` 跟著 .md 走：這一次寫了 .md 就用這一次的；沒寫、沿用同一 sig 的舊 .md 就沿用舊的
+        turns = (getattr(s, "md_turns", None) if md_new
+                 else (cached.get("turns") if row["has_md"] else None))
+        new_entries[key] = {"sig": sig, "row": row, "turns": turns}
         n_build += 1
 
     rows = _index_rows(new_entries, args.include_empty)
     show_account = len({r.get("account", "") for r in rows}) > 1
+    n_clash = report_output_clashes(rows)
 
     # 產生「有 memory/ 的 Claude 專案」的 memory 頁。
     # 只處理「本次實際掃描到的」(帳號, munged) 專案——精準涵蓋 --project / --account / --no-claude 等所有縮範圍旗標；
@@ -12071,7 +12988,7 @@ def main():
         #   守它的是 `test_bookmark_manage_pages` 的「重建兩次仍在」那一格。
         # ⚠⚠ fallback 讀的是**磁碟上那份舊 manifest**（`save_manifest` 這時還沒跑），
         #    所以它必須走**同一條對帳規則**——否則上面 `new_entries` 對掉的那幾筆會從
-        #    這裡再被烤回反查表，同一個缺陷換一條路徑進來（跨模型 Medium#5）。
+        #    這裡再被烤回反查表，同一個缺陷換一條路徑進來。
         #    守它的是 `test_bookmark_deleted_source_pruned`。
         bx_fallback, _ = prune_gone_sources(load_manifest_paths(out), scanned_roots)
         _write_atomic(sess_dir / "bookmarks.html", render_bookmarks_html(rows, bx_fallback, sess_dir))
@@ -12093,9 +13010,14 @@ def main():
     removed = 0
     if not filtering:
         allowed = {r["out_html"] for r in rows} | {r["out_md"] for r in rows}
+        # ⚠ 只產一種格式的建置（`--format md`／`html`）**不刪另一種格式的檔**：另一種格式的索引
+        #   （`index.html`／`index.md`）這一次沒有重畫，還連著它們。檔名換了的時候（升版改名、專案改名）
+        #   舊名的那一份就留到下一次兩種都產的建置再清。
+        skip_ext = ({".html"} if not want_html else set()) | ({".md"} if not want_md else set())
         for f in sess_dir.rglob("*"):
             rel = f.relative_to(sess_dir)
             if (f.is_file() and rel.parts and rel.parts[0] in scanned_source_dirs
+                    and f.suffix.lower() not in skip_ext
                     and rel.as_posix() not in allowed):
                 try:
                     f.unlink(); removed += 1
@@ -12113,6 +13035,8 @@ def main():
         # ⚠ 「沿用上一次的輸出」要講出來——那一頁的內容是舊的，而索引與書籤照樣指得到它。
         _kept = f"，其中 {n_broken_kept} 沿用上一次的輸出" if n_broken_kept else ""
         bits.append(f"壞掉跳過 {n_broken}{_kept}（見上面的 ! 訊息）")
+    if n_clash:
+        bits.append(f"⚠ 輸出檔名相同 {n_clash} 個（見上面的 ! 訊息）")
     if n_mem:
         bits.append(f"memory 頁 {n_mem}")
     if removed:

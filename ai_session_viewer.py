@@ -243,7 +243,12 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 # 70 → 71（2026-10-21）：提問卡片的判讀——複選只認開頭那一段選項、其餘整段是自己打的；分不出是哪一個選項（重疊的選項、
 #    同名的選項、同名的題目）照原文畫、不標；完整版 MD 的卡片照 `splitlines()` 逐行加引用符號（回答裡的 `\r` 這類斷行）。
 #    v70 的頁面在這幾種情形畫錯，升版讓它們重建。
-RENDERER_VERSION = 71
+# 71 → 72（2026-10-22）：跨機同步工具另存的副本（`<sid>.synced-<主機>-<時間>.jsonl`）自己一列、自己一頁——輸出檔名的
+#    id 段另帶一段（`claude_out_id`），索引與頁首標「同步副本 <主機> <時間>」；原本和原檔寫到同一個輸出檔、後寫的
+#    蓋掉先寫的。沒有副本的場次頁面不變。
+# 72 → 73（2026-10-22）：副本輸出檔名另帶的那一段改成整個 id 的 32 碼雜湊（v72 是 6 碼）。只有副本的檔名變；
+#    沿用的 row 帶著舊檔名，升版讓它們照新檔名重建。
+RENDERER_VERSION = 73
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -1015,6 +1020,7 @@ class Session:
         self.n_user = self.n_assistant = self.n_tools = 0
         self.out_html = ""
         self.out_md = ""
+        self.sync_note = ""         # 同步副本的說明「同步副本 <主機> <時間>」（見 sync_copy_label）
 
 
 def load_events(path: Path, sidechain_force=False):
@@ -1077,6 +1083,7 @@ def _unify_call_usage(events):
 
 def load_session(path: Path, proj_munged: str, account: str = "", source_kind: str = SOURCE_CLAUDE) -> Session:
     s = Session(path, proj_munged, source_kind)
+    s.sync_note = sync_copy_label(s.session_id) if source_kind == SOURCE_CLAUDE else ""
     s.account = account
     s.events = load_events(path)
 
@@ -7040,10 +7047,23 @@ def render_bookmarks_html(rows, fallback=None, sess_dir=None) -> str:
     # ⚠⚠ 再用 manifest 補上「本次沒涵蓋、但檔案還在磁碟上」的那些。
     #    升版後第一次跑 `--project X` 時 `rows` 只剩那幾場（manifest 被視為空），
     #    沒有這一段的話，管理頁會對著還在的檔案說「不在這次的輸出裡」——那是假話。
-    for e in (fallback or {}).values():
-        row = (e or {}).get("row")
-        if row:
-            _add(row, False)
+    # ⚠⚠ **補的那一列，它的路徑還有別場的列指著（這一次的列，或上一次 manifest 裡的別列）就不補。**
+    #    檔名規則跟著版本換過時（例：同步副本以前和原檔寫同一個檔，現在各有各的檔名），上一次的列還指著那個
+    #    共用的檔：這一次有別場在那裡重建 ⇒ 檔是那一場的；沒有 ⇒ 裡面是上一次後寫的那一場，分不出是誰。
+    #    兩種都讓它走「對不到檔案」。比法同 `report_output_clashes`（不分大小寫；範圍限制
+    #    SCOPE-OUTNAME-CASEFOLD-OVERREPORT：分大小寫的檔案系統上會少補一條連結）。
+    def _key(p):
+        return str(p or "").casefold()
+
+    old = [r for r in ((e or {}).get("row") for e in (fallback or {}).values()) if r]
+    claims = {}
+    for r in list(rows) + old:
+        if r.get("session_id") and r.get("out_html"):
+            claims.setdefault(_key(r["out_html"]), set()).add(r["session_id"])
+    for row in old:
+        if claims.get(_key(row.get("out_html")), set()) - {row.get("session_id")}:
+            continue
+        _add(row, False)
     body = f"""
 <div class="wrap">
   <div class="topbar">
@@ -7280,6 +7300,8 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
                       + "bookmarks.html")
     sub = (f'<div class="smeta">自動標題：{esc(s.ai_title)}</div>'
            if (s.rename and s.ai_title and s.ai_title != s.title) else "")
+    sync_chip = (f' · <span class="chip" title="{esc_attr(SYNC_COPY_TITLE)}">{esc(s.sync_note)}</span>'
+                 if getattr(s, "sync_note", "") else "")
 
     body = f"""
 <div class="wrap">
@@ -7309,7 +7331,7 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
   <h1>{h1}</h1>
   {sub}
   <div class="smeta">{meta}</div>
-  <div class="smeta">{esc(when)} · {stats} · <span class="mono">{esc(s.session_id)}</span></div>
+  <div class="smeta">{esc(when)} · {stats} · <span class="mono">{esc(s.session_id)}</span>{sync_chip}</div>
   {_cost_mix_html(s)}
   {sub_toc}
   <div class="thread">{''.join(turns)}</div>
@@ -7784,7 +7806,8 @@ def render_session_md(s: Session) -> str:
         (f"- {_ttl_head(s)[0]}（只計主對話）" if _ttl_head(s)[0] else None),
         (f"- {_miss_head(s)[0]}（API 自報）" if _miss_head(s)[0] else None),
         (f"- 型態：{KIND_LABELS.get(s.kind, s.kind)}" if s.kind != "chat" else None),
-        f"- Session：`{s.session_id}` · v{s.version}",
+        f"- Session：`{s.session_id}` · v{s.version}"
+        + (f" · {s.sync_note}" if getattr(s, "sync_note", "") else ""),
         "", "---",
     ]
     ai = ai_name(s.source_kind)          # 回合標頭 AI 那方的名（Claude/Codex）
@@ -8681,9 +8704,10 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
                       if src == SOURCE_CLAUDE else r.get("cwd", ""))   # Codex 的 proj_munged 不是真夾，不標「夾」
         ai = r.get("ai_title", "")
         kind = r.get("kind") or "chat"
+        sync = r.get("sync_copy") or ""
         blob = (source_label(src) + " " + acc + " " + r["proj"] + " "
                 + r.get("cwd", "") + " " + r.get("proj_munged", "") + " "
-                + r["title"] + " " + ai + " " + r.get("branch", "") + " " + kind).lower()
+                + r["title"] + " " + ai + " " + r.get("branch", "") + " " + kind + " " + sync).lower()
         acc_td = f'<td><span class="chip acc">{esc(acc)}</span></td>' if show_account else ""
         src_td = f'<td><span class="chip src">{esc(source_label(src))}</span></td>' if show_source else ""
         ns = r.get("n_subagents") or 0
@@ -8692,6 +8716,8 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
                       if kind != "chat" else "")
         sub_badge = (f' <span class="chip sub" title="包含 {ns} 個子代理對話（其他 JSONL 內容）">🧩 ×{ns}</span>'
                      if ns else "")
+        if sync:
+            sub_badge += f' <span class="chip" title="{esc_attr(SYNC_COPY_TITLE)}">{esc(sync)}</span>'
         sub_badge += (f' <span class="chip compact" title="此 session 發生 {nc} 次壓縮（手動 /compact 或自動）">✂ ×{nc}</span>'
                       if nc else "")
         wn = r.get("waste_n") or 0
@@ -8889,7 +8915,8 @@ def render_index_md(rows, show_account=False, cache_report=False, codex_report=F
             _link = (f"{mark}{r['title']}（沒有可用的輸出）"
                      if not r.get("has_md", True) and not r.get("has_html", True)
                      else f"[{mark}{r['title']}](sessions/{md_href}){only}")
-            out.append(f"- {acc}{_link} — {r.get('date_str','?')} · "
+            sync = f"〔{r['sync_copy']}〕" if r.get("sync_copy") else ""
+            out.append(f"- {acc}{_link}{sync} — {r.get('date_str','?')} · "
                        f"~{cost} · {r['n_user']}問/{r['n_assistant']}答 · 🔧{r['n_tools']}"
                        + (f" · 型態:{KIND_LABELS.get(kind, kind)}" if kind != "chat" else "")
                        + waste
@@ -11209,11 +11236,11 @@ def session_signature(main_path: Path, marks=()) -> str:
 
 
 def out_id_part(s: "Session") -> str:
-    """輸出檔名裡代表這一場的那 8 個字元（`main()` 的 `base` 最後一段）。
+    """輸出檔名裡代表這一場的那一段（`main()` 的 `base` 最後一段；通常是 8 個字元）。
 
     要取 id 裡**隨機的那一段**：檔名前面已經有開始時間（到分鐘）與專案名，這一段負責把
     同一分鐘、同一專案的幾場分開。
-    - Claude：sessionId 是 UUIDv4，前 8 碼就是隨機位元 ⇒ 取前 8 碼。
+    - Claude：sessionId 是 UUIDv4，前 8 碼就是隨機位元 ⇒ 取前 8 碼（`claude_out_id`）。
     - Codex：id 是 UUIDv7，前 12 碼是毫秒時間戳 ⇒ 前 8 碼在約 65 秒內都一樣，同一分鐘開的幾場會
       組出同一個檔名、後寫的蓋掉先寫的。取**最後 8 碼**（`rand_b` 的低位，隨機）。
       沒有 `session_meta.id` 時 sid 是 rollout 檔名（`rollout-<時間>-<uuid>`），最後 8 碼一樣是 uuid 的尾巴。
@@ -11222,7 +11249,19 @@ def out_id_part(s: "Session") -> str:
     """
     if s.source_kind == SOURCE_CODEX:
         return safe_name(s.session_id[-8:], 8)
-    return s.session_id[:8]
+    return claude_out_id(s.session_id)
+
+
+def claude_out_id(sid: str) -> str:
+    """Claude 那一場在輸出檔名裡的 id 段：前 8 碼。session id 是同步副本的檔名（`sync_copy_base`）時前 8 碼和原檔
+    相同 ⇒ 另帶整個 id 的 SHA-256 前 32 碼（只看它自己的 id）。`--ai-md` 認輸出檔名那一段時也用這一支，兩邊不會
+    各算各的。
+    - 32 碼（128 位元）：同一場的副本檔名只差在主機、時間、`.<n>`，短的雜湊湊得出兩個合法檔名撞成同一段。
+    - 用雜湊、不直接接副本檔名的後段：主機名可以有大寫，只差大小寫的兩份副本在不分大小寫的檔案系統
+      （Windows、macOS 預設）上會是同一個檔；雜湊一律小寫。"""
+    if sync_copy_base(sid) == sid:
+        return sid[:8]
+    return sid[:8] + "-" + hashlib.sha256(sid.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
 def report_output_clashes(rows) -> int:
@@ -11234,6 +11273,8 @@ def report_output_clashes(rows) -> int:
     - 不分大小寫比：Windows（與 macOS 預設）的檔案系統不分大小寫，只差大小寫的兩個路徑是同一個檔。
     範圍限制 SCOPE-OUTNAME-CASEFOLD-OVERREPORT：比的是 Unicode `casefold`，不是檔案系統自己的比法——
     `casefold` 相同、檔案系統卻當成兩個檔的路徑（例：`ß` 對 `ss`）也會被報成同一個檔。
+    範圍限制 SCOPE-OUTNAME-CLASH-AFTER-WRITE：這裡在頁面都寫完之後才跑，只負責講出來——撞到的兩場，
+    後寫的那一頁已經蓋掉先寫的。
     """
     by_out = {}
     for r in rows:
@@ -11262,6 +11303,7 @@ def session_to_row(s: "Session") -> dict:
         "title": s.title,
         "rename": s.rename,
         "ai_title": s.ai_title,
+        "sync_copy": getattr(s, "sync_note", ""),
         "kind": s.kind,
         "models": [short_model(m) for m in s.models],
         "cost": s.cost,
@@ -12089,7 +12131,9 @@ def prune_gone_sources(entries: dict, scanned_roots) -> tuple:
 def _dedupe_claude_sessions(files):
     """同一個 Claude session（相同 sessionId＝檔名）若被跨機同步複製到不同來源路徑，
     會在 index 與 cache report 雙倍計。依 sessionId 去重、保留檔案較大者（較完整）。
-    （junction/symlink 指到同一真實檔的情形另由來源層 _dedupe_by_realpath 處理。）非 Claude 不動。"""
+    （junction/symlink 指到同一真實檔的情形另由來源層 _dedupe_by_realpath 處理。）非 Claude 不動。
+    範圍限制 SCOPE-DEDUP-SAME-NAME-NO-CONTAINMENT：只比檔案大小、不比內容；兩份各自接著聊過的話，小的那一份
+    獨有的回合不會出現在任何一頁。"""
     out, pos = [], {}     # sessionId -> (out 內索引, 檔案大小)
     for item in files:
         source_kind, _, _, sf = item
@@ -12110,6 +12154,44 @@ def _dedupe_claude_sessions(files):
             pos[sid] = (len(out), size)
             out.append(item)
     return out
+
+
+# 跨機同步工具（claude-session-sync）不覆蓋本機既有檔時另存的副本：
+#   `<原檔名>.synced-<主機名>-<UTC 時間 YYYYMMDDTHHMMSSZ>[.<n>].jsonl`
+# 主機名只含 `[A-Za-z0-9_-]`、最多 24 字；同名已存在時再加 `.1`、`.2`…。內文的 `sessionId` 不改。
+# 副本本身也會被當成一場同步到別台，在那裡再撞到時檔名會接上好幾段 ⇒ 原檔名是第一段之前的部分。
+# 副本是另一個檔名，就是另一場（`claude --resume` 也這樣認）：自己一列、自己一頁，只多標「同步副本」。
+# 範圍限制 SCOPE-SYNC-COPY-NAME-SHAPE：只認上面這個形狀（整段後綴都要是它）；手動複製、別的同步工具
+# 留下的副本（例「<sid> (1).jsonl」）不在範圍內，照舊當成另一場。
+# 範圍限制 SCOPE-SYNC-COPY-FORK-STATS：副本和原檔各自一列，共同的那一段在花費、快取報告、搜尋裡算兩次；
+# 副本那一頁只讀它自己旁邊的子代理目錄，切帳號資料也只對它自己的 id。
+_SYNC_SEG = r"\.synced-([A-Za-z0-9_-]{1,24}?)-(\d{8}T\d{6}Z)(?:\.\d+)?"
+_SYNC_COPY_RE = re.compile(rf"^(.+?)((?:{_SYNC_SEG})+)$")
+_SYNC_SEG_RE = re.compile(_SYNC_SEG)
+SYNC_COPY_TITLE = ("跨機同步工具另存的副本（主機、存的時間）：和原檔各自一列、各自一頁。"
+                   "內容可能和原檔一樣，也可能各自接著聊過")
+
+
+def sync_copy_base(stem: str) -> str:
+    """同步副本（`_SYNC_COPY_RE`）的原檔名，也就是原本那一場的 session id；不是同步副本就回原樣。"""
+    m = _SYNC_COPY_RE.match(stem)
+    return m.group(1) if m else stem
+
+
+def sync_copy_label(sid: str) -> str:
+    """session id 是同步副本的檔名時，給人看的說明：「同步副本 <主機> <本地時間>」（好幾段就逐段接）；
+    不是副本回空字串。"""
+    m = _SYNC_COPY_RE.match(sid)
+    if not m:
+        return ""
+    parts = []
+    for host, stamp in _SYNC_SEG_RE.findall(m.group(2)):
+        try:
+            when = local_str(datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc))
+        except ValueError:
+            when = stamp
+        parts.append(f"{host} {when}")
+    return "同步副本 " + " · ".join(parts)
 
 
 def munge_path(cwd) -> str:
@@ -12744,9 +12826,12 @@ def _ai_md_sid(kind, path):
 
 
 def _ai_md_id_matches(kind, sid, key):
-    """`key`（已轉小寫）指的是不是這個 session id：完整、開頭，或 Codex 的結尾（輸出檔名那 8 碼，見 `out_id_part`）。"""
-    sid = str(sid).lower()
-    return sid == key or sid.startswith(key) or (kind == SOURCE_CODEX and sid.endswith(key))
+    """`key`（已轉小寫）指的是不是這個 session id：完整、開頭，或輸出檔名裡的那一段（Codex 是結尾 8 碼，
+    Claude 的同步副本是 `claude_out_id`，見 `out_id_part`）。"""
+    sid = str(sid)
+    low = sid.lower()
+    return (low == key or low.startswith(key) or (kind == SOURCE_CODEX and low.endswith(key))
+            or (kind != SOURCE_CODEX and claude_out_id(sid).lower() == key))
 
 
 def _ai_md_stem_matches(path, ids, key):
@@ -12793,6 +12878,8 @@ def pick_ai_md_target(files, ident, now=None, eligible=None):
     - 其餘：完整的 session id、id 的開頭，或輸出檔名裡的那 8 碼（Codex 是 id 的**結尾**，見 `out_id_part`）。
     - `eligible(item)`：範圍篩選（`--project`）。對 `last` 是從新到舊一場一場問、問到第一場符合的就停；
       對 id 是先對 id、再篩——貴的判斷只做在候選上。
+    - 對到不只一場、其中剛好一場的 id 和給的**完全相同**，就是那一場：同步副本的 id 以原檔的 id 開頭，
+      不這樣做的話原檔那一場永遠指定不到。
     """
     ident = ident.strip()
     if ident.lower() == "last":
@@ -12847,6 +12934,9 @@ def pick_ai_md_target(files, ident, now=None, eligible=None):
         if not hits:
             raise SystemExit(f"--ai-md {ident!r}：對到的那一場不在 --project 的範圍內")
     if len(hits) > 1:
+        exact = [h for h in hits if _ai_md_sid(h[0], h[3]).lower() == key]
+        if len(exact) == 1:
+            return exact[0], []
         lines = [f"  {_ai_md_sid(k, p)} · {p}" for k, _, _, p in hits[:10]]
         more = f"\n  …共 {len(hits)} 場" if len(hits) > 10 else ""
         raise SystemExit(f"--ai-md {ident!r}：對到 {len(hits)} 場，給長一點的 id：\n" + "\n".join(lines) + more)

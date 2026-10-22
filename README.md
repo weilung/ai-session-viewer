@@ -97,6 +97,13 @@ python3 ai_session_viewer.py --no-claude --out ~/codex-logs --open
 > `--account work` 只是「`~/.claude-work/projects`」的捷徑，**前提是你的設定夾照 `~/.claude-<名稱>` 命名**；
 > 若 `CLAUDE_CONFIG_DIR` 指到其他位置（例如 `D:\foo`），請改用 `--claude-source work=D:\foo\projects`。
 
+**同一場出現在好幾個地方時**：
+- 同一個 session 檔（檔名相同）出現在好幾個來源裡，只列比較大的那一份。
+- 跨機同步工具 [claude-session-sync](https://github.com/weilung/claude-session-sync) 不覆蓋你本機的檔，會在旁邊另存一份
+  `<原檔名>.synced-<電腦名>-<時間>.jsonl`。副本是另一個檔名，就是另一場（`claude --resume` 也這樣認）：自己一列、自己一頁，
+  那一列與那一頁標「同步副本 <電腦名> <時間>」。內容可能和原檔一樣，也可能各自接著聊過；兩份共同的那一段在花費與
+  快取報告裡會算兩次。
+
 ## 增量建置（只重產有變動的）
 
 每次產生會在 `out\.build-manifest.json` 記錄每個 session 來源檔的指紋（mtime + 大小，含外部子代理檔）。

@@ -9967,12 +9967,229 @@ def test_codex_tool_output_items(tmp_path=None):
     print("OK: codex tool output items test passed")
 
 
+def test_sync_conflict_copies(tmp_path=None):
+    """跨機同步工具另存的副本（`<sid>.synced-<主機>-<UTC 時間>.jsonl`）自己一列、自己一頁，標「同步副本」。
+
+    副本與原檔的開始時間、專案、前 8 碼都相同 ⇒ 輸出檔名的 id 段不另帶一段的話，兩份寫到同一個輸出檔、後寫的蓋掉
+    先寫的。逐段走：①內容一樣的兩份 ②分岔的兩份 ③`--ai-md` 選場 ④檔名的形狀 ⑤旁邊沒有原檔的副本
+    ⑥同一場的幾份副本各自一頁 ⑦上一次建置兩份寫在同一個檔、升版後只建一部分時的書籤反查表。
+    """
+    import importlib
+    from datetime import datetime, timezone
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+    tmp = new_tmp(tmp_path)
+    sid = "5c5c0000-0000-4000-8000-00000000c0de"
+    cname = f"{sid}.synced-HOSTX-20260801T010203Z"
+    # 副本的說明：主機與存的時間（UTC 換成本地時間，同索引的日期欄）
+    label = "同步副本 HOSTX " + datetime(2026, 8, 1, 1, 2, 3, tzinfo=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+
+    def ev(i, role, content, sec):
+        e = {"type": role, "uuid": f"{role[0]}{i}", "timestamp": f"2026-07-30T02:00:{sec:02d}.000Z",
+             "cwd": "/x/Sync", "sessionId": sid, "isSidechain": False}
+        if role == "user":
+            e["message"] = {"role": "user", "content": content}
+        else:
+            e["message"] = {"role": "assistant", "model": "claude-opus-4-8", "id": f"msg_s{i}",
+                            "usage": {"input_tokens": 10, "output_tokens": 5},
+                            "content": [{"type": "text", "text": content}]}
+        return e
+
+    title = {"type": "ai-title", "aiTitle": "原檔的AI標題SYNCTITLE", "sessionId": sid}
+    head = [ev(1, "user", "第一個問題SYNCFIRST。", 0), ev(1, "assistant", "第一個回答。", 5)]
+
+    def write(path, evs, sort=False):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(e, ensure_ascii=False, sort_keys=sort) for e in evs) + "\n",
+                        encoding="utf-8")
+
+    def build(out, src, *extra):
+        r = subprocess.run([sys.executable, str(SCRIPT), "--claude-source", f"demo={src}", "--no-codex",
+                            "--out", str(out), *extra], capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        assert "輸出檔名相同" not in r.stdout + r.stderr, f"不應撞名\n{r.stdout[-400:]}\n{r.stderr[-400:]}"
+        return r
+
+    def index_rows(out):
+        idx = (out / "index.html").read_text(encoding="utf-8")
+        rows = re.findall(r'<tr data-sid="([^"]*)"(.*?)</tr>', idx, re.S)
+        return [s for s, _ in rows], dict(rows)
+
+    def bx(out):
+        mgr = (out / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+        return json.loads(re.search(r"var BX_SESS=(\{.*?\});\s*$", mgr, re.M).group(1)
+                          .replace("\\u003c", "<").replace("\\u003e", ">"))
+
+    def own_pages(out, tags):
+        pages = [p.read_text(encoding="utf-8") for p in _session_pages(out)]
+        assert len(pages) == len(tags), f"每份各一頁，實得 {[p.name for p in _session_pages(out)]}"
+        for tag in tags:
+            assert sum(tag in h for h in pages) == 1, f"{tag} 要剛好在一頁裡（沒被別份蓋掉）"
+
+    # --- 1. 內容一樣的兩份（副本重新序列化、少了標題列）：兩列、各自一頁，副本那一列與那一頁標「同步副本」---
+    p1 = tmp / "s1" / "sync-proj"
+    write(p1 / f"{sid}.jsonl", head + [title])
+    write(p1 / f"{cname}.jsonl", head, sort=True)
+    out1 = tmp / "out1"
+    build(out1, p1.parent)
+    cid = v.claude_out_id(cname)
+    assert cid != sid[:8] and cid.startswith(sid[:8]), cid
+    pages = _session_pages(out1)
+    po = [p for p in pages if p.name.endswith(f"__{sid[:8]}.html")]
+    pc = [p for p in pages if p.name.endswith(f"__{cid}.html")]
+    assert len(pages) == 2 and len(po) == 1 and len(pc) == 1, f"兩份各有一頁、檔名不同，實得 {[p.name for p in pages]}"
+    sids, rows = index_rows(out1)
+    assert sorted(sids) == sorted([sid, cname]), f"兩份各一列、各用自己的檔名當 id，實得 {sids}"
+    assert label in rows[cname] and "同步副本" not in rows[sid], "索引上只有副本那一列標同步副本"
+    assert "SYNCTITLE" in rows[sid], "原檔那一列是原檔的標題"
+    ho, hc = po[0].read_text(encoding="utf-8"), pc[0].read_text(encoding="utf-8")
+    assert label in _page_body(hc) and "同步副本" not in _page_body(ho), "副本那一頁的頁首要標同步副本"
+    md_idx = (out1 / "index.md").read_text(encoding="utf-8")
+    assert md_idx.count(f"〔{label}〕") == 1, f"MD 索引的副本那一列要標同步副本\n{md_idx}"
+    mdo, mdc = po[0].with_suffix(".md").read_text(encoding="utf-8"), pc[0].with_suffix(".md").read_text(encoding="utf-8")
+    assert label in mdc and "同步副本" not in mdo, "MD 頁首也要標"
+    m1 = bx(out1)
+    assert m1[sid]["u"].endswith(po[0].name) and m1[cname]["u"].endswith(pc[0].name), f"書籤反查表各指各的頁，實得 {m1}"
+    r1 = build(out1, p1.parent)
+    assert "沿用 2" in r1.stdout, f"沒有變的兩份都沿用（不互相蓋掉、不重建）\n{r1.stdout[-300:]}"
+
+    # --- 2. 分岔（兩台各自接著聊）：一樣兩列，各畫各的內容 ---
+    p2 = tmp / "s2" / "sync-proj"
+    write(p2 / f"{sid}.jsonl", head + [title, ev(5, "user", "原檔這邊OMARK。", 40)])
+    write(p2 / f"{cname}.jsonl", head + [ev(6, "user", "副本那邊CMARK。", 40)])
+    out2 = tmp / "out2"
+    build(out2, p2.parent)
+    cid = v.claude_out_id(cname)
+    pages = _session_pages(out2)
+    ho = [p for p in pages if p.name.endswith(f"__{sid[:8]}.html")][0].read_text(encoding="utf-8")
+    hc = [p for p in pages if p.name.endswith(f"__{cid}.html")][0].read_text(encoding="utf-8")
+    assert "OMARK" in ho and "CMARK" not in ho and "CMARK" in hc and "OMARK" not in hc, "各畫各的內容"
+
+    # --- 3. `--ai-md` 選場：前 8 碼兩份都對得到；完整 id 剛好是另一份的開頭時以完全相同的為準；認副本的 id 與輸出檔名那一段 ---
+    def aimd(key):
+        return subprocess.run([sys.executable, str(SCRIPT), "--claude-source", f"demo={p2.parent}", "--no-codex",
+                               "--ai-md", key, "--out", str(tmp / "ai")], capture_output=True, text=True,
+                              encoding="utf-8")
+    ra = aimd(sid[:8])
+    assert ra.returncode != 0 and "對到 2 場" in ra.stderr, f"前 8 碼兩份都對得到，要請人給長一點的 id\n{ra.stderr[-300:]}"
+    rb = aimd(sid)
+    assert rb.returncode == 0 and "OMARK" in Path(rb.stdout.strip()).read_text(encoding="utf-8"), (
+        f"原檔的完整 id 要指得到原檔（不可以被副本的 id 開頭擋住）\n{rb.stderr[-300:]}")
+    for key in (cname, cid):
+        rc = aimd(key)
+        assert rc.returncode == 0, f"要認得副本的 id 與輸出檔名裡那一段（{key}）\n{rc.stderr[-300:]}"
+        got = Path(rc.stdout.strip())
+        assert "CMARK" in got.read_text(encoding="utf-8") and got.name.endswith(f"__{cid}.ai.md"), (key, got.name)
+
+    # --- 4. 檔名的形狀：只認同步工具產生的那一種 ---
+    for stem, base in [(cname, sid), (cname + ".1", sid), (cname + ".synced-OTHER-20260802T000000Z", sid),
+                       (cname + ".2.synced-B-C-20260802T000000Z.1", sid),
+                       (f"{sid}.synced-{'H' * 25}-20260801T010203Z", None),     # 主機名超過 24 字
+                       (f"{sid}.synced-HOSTX", None), (f"{sid}.synced-HOSTX-20260801T0102Z", None),
+                       (f"{sid}.synced-HOSTX-20260801T010203Z.x", None),
+                       (f"{sid} (1)", None), (".synced-HOSTX-20260801T010203Z", None)]:
+        assert v.sync_copy_base(stem) == (stem if base is None else base), (
+            f"檔名的形狀只認同步工具產生的那一種：{stem} → {v.sync_copy_base(stem)}")
+        assert bool(v.sync_copy_label(stem)) == (base is not None), f"說明與判讀要一致：{stem}"
+        assert (v.claude_out_id(stem) == stem[:8]) == (base is None), f"只有副本的輸出檔名另帶一段：{stem}"
+    assert v.sync_copy_label(cname) == label, f"副本的說明是主機與本地時間，實得 {v.sync_copy_label(cname)!r}"
+
+    # --- 5. 旁邊沒有原檔的副本：照樣自己一列、標同步副本 ---
+    p5 = tmp / "s5" / "sync-proj"
+    write(p5 / f"{cname}.jsonl", head)
+    out5 = tmp / "out5"
+    build(out5, p5.parent)
+    sids, rows = index_rows(out5)
+    assert sids == [cname] and label in rows[cname], f"只有副本也照樣標，實得 {sids}"
+
+    # --- 6. 同一場的兩份副本只差在 `.<n>`：雜湊取得太短就湊得出撞成同一段的一對 ⇒ 各自一頁、不撞名 ---
+    pair = [f"{cname}.4243", f"{cname}.4502"]
+    for i, stem in enumerate(pair):
+        write(tmp / "s6" / "pair" / f"{stem}.jsonl", head + [ev(7 + i, "user", f"第{i}份PAIR{i}MARK。", 40)])
+    build(tmp / "out6", tmp / "s6")
+    own_pages(tmp / "out6", ("PAIR0MARK", "PAIR1MARK"))
+    assert v.claude_out_id(pair[0]) != v.claude_out_id(pair[1]), f"輸出檔名的 id 段要分得開：{pair}"
+
+    # --- 6b. 主機名只差大小寫的兩份副本：不分大小寫的檔案系統（Windows、macOS 預設）上，直接接副本檔名的後段
+    #         會是同一個檔 ⇒ id 段不分大小寫也要分得開 ---
+    case = [f"{sid}.synced-HOSTX-20260801T010203Z", f"{sid}.synced-hostx-20260801T010203Z"]
+    for i, stem in enumerate(case):          # 只差大小寫的兩個檔名在 Windows 放不進同一個資料夾 ⇒ 各放一個（同一個 cwd）
+        write(tmp / "s6b" / f"case{i}" / f"{stem}.jsonl", head + [ev(9 + i, "user", f"第{i}份CASE{i}MARK。", 40)])
+    build(tmp / "out6b", tmp / "s6b")
+    own_pages(tmp / "out6b", ("CASE0MARK", "CASE1MARK"))
+    assert v.claude_out_id(case[0]).casefold() != v.claude_out_id(case[1]).casefold(), f"輸出檔名的 id 段要分得開：{case}"
+
+    # --- 7. 上一次建置時原檔和副本寫在同一個檔（輸出檔名的規則跟著版本換過），升版後只建一部分：書籤管理頁
+    #        不可以把那個共用的檔給錯的那一場。那個檔這一次有別場重建過 ⇒ 是那一場的；沒有 ⇒ 裡面是上一次後寫的那一場、
+    #        分不出是誰。兩種都照實講對不到（不在反查表裡）---
+    other = "7e7e0000-0000-4000-8000-0000000000aa"
+    s7 = tmp / "s7"
+    write(s7 / "A-orig" / f"{sid}.jsonl", head + [title, ev(5, "user", "原檔這邊OMARK。", 40)])
+    write(s7 / "B-copy" / f"{cname}.jsonl", head + [ev(6, "user", "副本那邊CMARK。", 40)])
+    write(s7 / "C-other" / f"{other}.jsonl", [dict(e, sessionId=other, cwd="/x/Other") for e in head])
+    full = tmp / "out7"
+    build(full, s7)
+    m7 = bx(full)
+    assert {sid, cname, other} <= set(m7), f"完整建置三場都在反查表裡，實得 {list(m7)}"
+    copy_page = (full / m7[cname]["u"]).read_text(encoding="utf-8")
+
+    def old_build(name, copy_wrote_last=False, orig_row=True, copy_case=False):
+        """複製一份完整建置，改成「上一次建置」的樣子：manifest 版本不符；副本那一列指著原檔那一頁的路徑
+        （`copy_case`：只差大小寫的寫法），副本自己那一頁不在；`copy_wrote_last` 時共用的那個檔裝的是副本的頁；
+        `orig_row=False` 時上一次的 manifest 裡沒有原檔那一列。"""
+        dst = tmp / name
+        shutil.copytree(full, dst)
+        mf = dst / v.MANIFEST_NAME
+        d = json.loads(mf.read_text(encoding="utf-8"))
+        d["renderer_version"] = -1
+        ents = d["entries"]
+        okey = next(k for k, e in ents.items() if e["row"]["session_id"] == sid)
+        crow = next(e["row"] for e in ents.values() if e["row"]["session_id"] == cname)
+        shared, shared_md = ents[okey]["row"]["out_html"], ents[okey]["row"]["out_md"]
+        (dst / "sessions" / crow["out_html"]).unlink()
+        (dst / "sessions" / crow["out_md"]).unlink()
+        crow["out_html"], crow["out_md"] = (shared.upper(), shared_md.upper()) if copy_case else (shared, shared_md)
+        if not orig_row:
+            del ents[okey]
+        mf.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        if copy_wrote_last:
+            (dst / "sessions" / shared).write_text(copy_page, encoding="utf-8")
+        return dst, "sessions/" + shared
+
+    def page_of(out, m, key):
+        return (out / m[key]["u"]).read_text(encoding="utf-8")
+
+    # --- 7a. 只建原檔那個夾：原檔在共用的那個檔重建，副本不可以指過去 ---
+    o7, x = old_build("out7a")
+    build(o7, s7, "--project", "A-orig")
+    m = bx(o7)
+    assert m[sid]["u"] == x and "OMARK" in page_of(o7, m, sid), f"原檔指著它重建的那一頁，實得 {m.get(sid)}"
+    assert cname not in m, f"那個檔現在是原檔的，副本不可以指過去，實得 {m.get(cname)}"
+    # --- 7b. 只建副本那個夾（共用的那個檔裝的是副本、副本那一列寫成只差大小寫）：副本指它自己的新頁，原檔不可以指過去 ---
+    o7, x = old_build("out7b", copy_wrote_last=True, copy_case=True)
+    build(o7, s7, "--project", "B-copy")
+    m = bx(o7)
+    assert m[cname]["u"] != x and "CMARK" in page_of(o7, m, cname), f"副本指著它自己的新頁，實得 {m.get(cname)}"
+    assert sid not in m, f"共用的那個檔裝的是副本，原檔不可以指過去，實得 {m.get(sid)}"
+    # --- 7c. 兩邊都不建：兩場都不指過去，別場照舊 ---
+    o7, x = old_build("out7c", copy_wrote_last=True)
+    build(o7, s7, "--project", "C-other")
+    m = bx(o7)
+    assert sid not in m and cname not in m and other in m, f"分不出是誰的那個檔兩場都不給，實得 {list(m)}"
+    # --- 7d. 上一次的 manifest 裡只有副本那一列：原檔這一次在那裡重建，副本照樣不可以指過去 ---
+    o7, x = old_build("out7d", orig_row=False)
+    build(o7, s7, "--project", "A-orig")
+    m = bx(o7)
+    assert m[sid]["u"] == x and cname not in m, f"那個檔這一次是原檔重建的，實得 {list(m)}"
+    print("OK: sync conflict copies test passed")
+
+
 # ⚠⚠ 改到頁面輸出（HTML 或 MD 的任何一個位元組）就要升 `RENDERER_VERSION`，再把這兩個值一起更新。
 #    **只改雜湊、不升版本，這支測試就會放行——那是作弊，不是修法**：既有的 `out/` 會靜默沿用舊頁面。
 #    ⚠ 反過來：**擴大 fixture 時雜湊一定會變，那時產品輸出沒變，版本不升、只更新雜湊**。
 # 範圍限制 SCOPE-RENDER-PIN-FIXTURE：釘的是這支測試的 fixture 走得到的輸出；Codex 只有「工具結果是
 #    content item 陣列」那一條，子代理、Claude 的圖片、壓縮、排隊句、未知模型這些路徑不在 fixture 裡。
-_RENDER_PIN =(71, "a629170eb1bef58effebfa0b3d645b82afa7070574692a934e06d27275cd354b")
+_RENDER_PIN =(73, "806c51eacf689a5c19c63266315df44ec5cf7fc45b4f222f19f325426bf2cbf4")
 
 
 def test_ask_user_question(tmp_path=None):
@@ -10323,6 +10540,15 @@ def test_renderer_version_pinned(tmp_path=None):
             "v.analyze(s)\n"
             "s.out_html, s.out_md, s.mem_href = 'claude-code/demo/pin.html', 'claude-code/demo/pin.md', ''\n"
             "blob = v.render_session_html(s, '../../../index.html', '') + '\\n@@MD@@\\n' + v.render_session_md(s)\n"
+            # 同一場的同步副本（另一個檔名，頁首標「同步副本」）
+            "import shutil\n"
+            f"cp = v.Path({str(proj.parent / 'pin-copy' / (sid + '.synced-PINHOST-20260930T020000Z.jsonl'))!r})\n"
+            "cp.parent.mkdir(parents=True, exist_ok=True)\n"
+            f"shutil.copyfile({str(proj / (sid + '.jsonl'))!r}, cp)\n"
+            "y = v.load_session(cp, 'pin-proj', 'demo', v.SOURCE_CLAUDE)\n"
+            "v.analyze(y)\n"
+            "y.out_html, y.out_md, y.mem_href = 'claude-code/demo/pin2.html', 'claude-code/demo/pin2.md', ''\n"
+            "blob += '\\n@@COPY@@\\n' + v.render_session_html(y, '../../../index.html', '') + '\\n@@MD@@\\n' + v.render_session_md(y)\n"
             f"c = v.load_codex_session(v.Path({str(cfile)!r}))\n"
             "v.analyze(c)\n"
             "c.out_html, c.out_md, c.mem_href = 'codex/demo/pin.html', 'codex/demo/pin.md', ''\n"
@@ -10408,4 +10634,5 @@ if __name__ == "__main__":
     test_cwd_cache()
     test_codex_tool_output_items()
     test_ask_user_question()
+    test_sync_conflict_copies()
     test_renderer_version_pinned()

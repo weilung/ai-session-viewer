@@ -213,6 +213,10 @@ def test_smoke(tmp_path=None):
     assert "✎" in index, "renamed 應有 ✎ 標記"
     assert "idx_filter_v1" in index and "restoreF" in index, "索引應有篩選狀態記憶（localStorage 還原）"
     assert 'onclick="clearF()"' in index, "索引應有清除篩選按鈕"
+    # 回索引時停在剛剛點的那一列：行為由 `python scripts/probe_bookmarks.py --back`（真 Chrome）驗；
+    # 這裡只守「那一段有被寫進頁面、而且接在篩選上」。
+    assert "idx_back_v1" in index and 'id="backmsg"' in index, "索引應有「回索引時停在那一列」"
+    assert "saveF();backAf();}" in index, "每次篩完都要讓「被藏起來的那一列」有機會捲過去"
 
     htmls = list(_session_pages(out))
     assert htmls, "應產生 session HTML"

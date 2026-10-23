@@ -39,6 +39,8 @@ python3 ai_session_viewer.py --open
 
 打開 `out\index.html`：session 索引，可用**關鍵字搜尋**與**專案／月份／型態下拉**交叉篩選，
 點欄位標題可排序，右側顯示符合筆數；點標題進入單一對話。
+從那一場按「← 回索引」回來時，索引會停在剛剛點的那一列、短暫亮一下（那一列被目前的篩選藏起來時，
+篩選不動，篩選列下方會說一聲）。
 「型態」是自動分類：`review`（首句是 review prompt，`# Review` 開頭——跑 cross-model review 的人適用）、
 `exec`（Codex 無頭執行 `codex exec`，取自 session_meta）、其餘為一般互動；review/exec 會在標題旁
 與對話頁標記。看快取／成本統計時建議分開看——這兩類與互動 session 的快取行為是不同母體。

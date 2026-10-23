@@ -8658,6 +8658,58 @@ addEventListener('storage',function(ev){
  try{bkIndexMark();af();}catch(e){}});
 """
 
+# 回索引時停在剛剛點的那一列。和上面一樣是**普通 raw 字串**（單大括號），接在
+# `_INDEX_BOOKMARK_JS` 後面、同一個 `<script>`：它要等篩選還原與書籤圖示都跑完
+# （那時每一列藏不藏才是定案），而 `af()` 呼叫的 `backAf()` 靠同一個 script 裡的提升。
+# ⚠ 不需要升 RENDERER_VERSION：只動 `index.html`，session 頁一個位元組都沒變。
+_INDEX_BACK_JS = r"""
+/* ── 回索引時停在剛剛點的那一列 ─────────────────────────────────────
+   點某一列裡的連結時，把那一列記在 sessionStorage（只屬於這個分頁）；這一頁下一次
+   載入時捲到那一列、短暫亮一下，然後把記錄刪掉（只用一次）。
+   ⚠ 記的是「哪一列」不是捲動位置：捲動位置會因為篩選、排序、視窗寬度而失效。
+   ⚠ 那一列的身分是標題連結的 `href`（列裡另一個連結只有 🧠 `.memlink`），不是 `data-sid`：
+     同步副本和原檔是同一個 sid、各自一列。
+   ⚠ 那一列被目前的篩選藏起來時**不動篩選**（那是使用者設的），只在篩選列下面講一句；
+     之後哪一次 `af()` 讓它看得見了（例如按了「清除」），就捲過去、收掉那句話。
+   ⚠ 這份索引裡找不到那一列（那一場不在這次輸出裡）、或不只一列連到那一頁，就什麼都不做。 */
+var BACK_KEY='idx_back_v1', BACK_ROW=null, BACKMSG=document.getElementById('backmsg');
+function ssGet(k){try{return sessionStorage.getItem(k);}catch(e){return null;}}
+function ssSet(k,v){try{sessionStorage.setItem(k,v);}catch(e){}}
+function ssDel(k){try{sessionStorage.removeItem(k);}catch(e){}}
+function backHref(r){var a=r.querySelector('a:not(.memlink)');return a?a.getAttribute('href'):'';}
+function backShow(r){
+ r.scrollIntoView({block:'center'});
+ var cs=r.cells,i;
+ for(i=0;i<cs.length;i++)cs[i].style.backgroundColor='rgba(210,153,34,.28)';
+ setTimeout(function(){for(var j=0;j<cs.length;j++)cs[j].style.backgroundColor='';},1600);}
+/* `af()` 每次篩完都會叫這一支。⚠ 函式宣告會提升，但 `BACK_ROW` 在這一段跑到之前是
+   `undefined`——載入初期那幾次 `af()` 走到這裡時一律什麼都不做。 */
+function backAf(){
+ if(!BACK_ROW||BACK_ROW.style.display==='none')return;
+ var r=BACK_ROW; BACK_ROW=null;
+ if(BACKMSG)BACKMSG.style.display='none';
+ backShow(r);}
+(function(){
+ var tb=document.querySelector('#tbl tbody'), h=ssGet(BACK_KEY), i;
+ if(tb)tb.addEventListener('click',function(ev){
+  var a=(ev.target&&ev.target.closest)?ev.target.closest('a'):null;
+  var tr=a?a.closest('tr'):null, hr=tr?backHref(tr):'';
+  if(hr)ssSet(BACK_KEY,hr);});
+ if(!h)return;
+ ssDel(BACK_KEY);
+ /* ⚠ 兩列以上連到同一頁（輸出檔名撞名；建置時另有警告）就分不出點的是哪一列 ⇒
+    什麼都不做：停在別列、或說「被藏起來了」都是錯的。 */
+ var hit=[];
+ for(i=0;i<ROWS.length;i++)if(backHref(ROWS[i])===h)hit.push(ROWS[i]);
+ if(hit.length!==1)return;
+ BACK_ROW=hit[0];
+ if(BACK_ROW.style.display==='none'){
+  if(BACKMSG){BACKMSG.textContent='剛剛那一場被目前的篩選藏起來了，按「清除」就看得到。';
+   BACKMSG.style.display='';}
+  return;}
+ backAf();})();
+"""
+
 
 def render_index_html(rows, show_account=False, cache_report=False, codex_report=False) -> str:
     rows = sorted(rows, key=lambda r: r.get("start_ts") or 0, reverse=True)
@@ -8804,6 +8856,7 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
     <button id="clr" class="clr" type="button" onclick="clearF()">清除</button>
     <span id="cnt" class="cnt"></span>
   </div>
+  <div id="backmsg" class="smeta" style="display:none"></div>
   <div id="memstrip" class="memstrip" style="display:none"></div>
   <table id="tbl">
     <thead><tr>
@@ -8858,7 +8911,7 @@ function clearF(){{Q.value='';if(FS)FS.value='';FP.value='';FM.value='';if(FA)FA
 function af(){{var q=Q.value.toLowerCase(),s=FS?FS.value:'',p=FP.value,m=FM.value,a=FA?FA.value:'',k=FK?FK.value:'',w=(FW&&FW.checked),bm=(FB&&FB.checked),n=0;
  ROWS.forEach(function(r){{var ok=(!q||r.dataset.text.indexOf(q)>=0)&&(!s||r.dataset.source===s)&&(!p||r.dataset.proj===p)&&(!m||r.dataset.month===m)&&(!a||r.dataset.acc===a)&&(!k||r.dataset.kind===k)&&(!w||r.dataset.waste==='1')&&(!bm||r.dataset.bm==='1');
   r.style.display=ok?'':'none';if(ok)n++;}});
- CNT.textContent=n+' / '+ROWS.length;updMem(p,s,a);saveF();}}
+ CNT.textContent=n+' / '+ROWS.length;updMem(p,s,a);saveF();backAf();}}
 restoreF();af();
 document.querySelectorAll('#tbl th').forEach(function(th,i){{th.onclick=function(){{
  var tb=document.querySelector('#tbl tbody'),rs=[].slice.call(tb.rows);
@@ -8867,6 +8920,7 @@ document.querySelectorAll('#tbl th').forEach(function(th,i){{th.onclick=function
   var nx=parseFloat(x),ny=parseFloat(y);if(!isNaN(nx)&&!isNaN(ny)){{return th._d?nx-ny:ny-nx;}}
   return th._d?String(x).localeCompare(y):String(y).localeCompare(x);}});rs.forEach(function(r){{tb.appendChild(r);}});}};}});
 {_INDEX_BOOKMARK_JS}
+{_INDEX_BACK_JS}
 </script>
 """
     return html_page("Claude Code 對話紀錄", body)

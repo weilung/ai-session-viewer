@@ -15,8 +15,8 @@ sys.path.insert(0, str(ROOT))
 
 import ai_session_viewer as viewer  # noqa: E402
 sys.path.insert(0, str(ROOT / "tests"))
-# ⚠ 共用 `test_smoke.new_tmp`，**不拄第二份**——拄一份的代價已經付過一次了
-# （探針拄了 `block_is_renderable` 而且拄漏兩件事）。那支的 docstring 寫著為什麼不能直接用 mkdtemp。
+# ⚠ 共用 `test_smoke.new_tmp`，**不抄第二份**——抄出來的副本會漏掉原版處理的情形。
+# 那支的 docstring 寫著為什麼不能直接用 mkdtemp。
 from test_smoke import new_tmp  # noqa: E402
 
 SCRIPT = ROOT / "ai_session_viewer.py"
@@ -184,7 +184,7 @@ def test_force_project_keeps_unfiltered_manifest_rows():
     _write_session(projects, "proj-b", "bbbbbbbb", "Beta request")
 
     # ⚠ HOME 一律隔離：本工具會無條件列舉 ~/.claude* 與 ~/.codex，不隔離的話這裡會去掃
-    # 這台機器上真實、且正在被寫入的資料——結果隨環境浮動（實測曾因此偶發失敗）。
+    # 這台機器上真實、且正在被寫入的資料——結果隨環境浮動。
     env = _isolated_home_env(tmp)
     subprocess.run(
         [sys.executable, str(SCRIPT), "--claude-source", f"demo={projects}", "--out", str(out)],
@@ -287,10 +287,10 @@ def test_collect_sources_dedupes_same_realpath():
 
 
 def test_command_and_notify_are_escaped():
-    """指令輸出／通知原文／指令名／插話——這批新開的四個注入面都要逸出。
+    """指令輸出／通知原文／指令名／插話——這四個注入面都要逸出。
 
-    ⚠⚠ 這一格守的是：逸出**現在是對的**，
-    但**沒有任何斷言在守**。「現在是對的」和「壞了會被抓到」是兩件事。
+    ⚠⚠ 這一格守的是：逸出**壞了會被抓到**。「現在是對的」和「壞了會被抓到」是兩件事，
+    後者要**有斷言在守**才成立。
 
     ⚠ 這四個來源都不是使用者打的字，很容易被當成「自己人」而漏掉逸出：
       · 指令輸出 ＝ 終端文字（`/status`、`/context` 的 stdout）
@@ -336,7 +336,7 @@ def test_command_and_notify_are_escaped():
              timestamp="2026-07-26T01:00:06.000Z", sessionId=sid, content=XSS + "FACEFOUR"),
         dict(type="queue-operation", operation="remove",
              timestamp="2026-07-26T01:00:07.000Z", sessionId=sid, content=XSS + "FACEFOUR"),
-        # ⑤ 排隊句裡**貼的圖片**：`media_type` 是新開的注入面——不支援的型別會被
+        # ⑤ 排隊句裡**貼的圖片**：`media_type` 是注入面——不支援的型別會被
         #    原樣寫進「格式不支援內嵌」那句佔位文字裡。
         dict(type="attachment", uuid="u6", timestamp="2026-07-26T01:00:30.000Z",
              attachment={"type": "queued_command",
@@ -364,13 +364,13 @@ def test_command_and_notify_are_escaped():
             if p.parent.name != "sessions"][0]
     html = page.read_text(encoding="utf-8")
     # 這五個注入面都要在頁面上出現（不然這一格什麼都沒驗到），但一律是逸出後的形式
-    # ⚠⚠ **涵蓋率先驗要對每個面各驗一次，不可以用一個總數。** 舊寫法是
-    # `html.count("alert(1)") >= 5`，而真實計數是 8 ⇒ 把第五個面（圖片的 `media_type`）
+    # ⚠⚠ **涵蓋率先驗要對每個面各驗一次，不可以用一個總數。** 只用
+    # `html.count("alert(1)") >= 5` 的話，真實計數是 8 ⇒ 把第五個面（圖片的 `media_type`）
     # 整個中和掉、甚至把那一則帶圖排隊句從素材裡刪掉，那一格**照樣通過**
     # （實測：`ALERTCOUNT 8 → 7`，兩種破壞都仍然綠）。
     # ⇒ 每個面用它自己的指紋，這樣素材沒走到那條路時才會紅在對的地方。
     # ⚠⚠ **每個面要有自己的 marker，不可以共用 DOM class 當指紋。**
-    # 第一版用 `class="cmdline"`／`class="cmdout"` 之類，而「只有輸出、沒有指令名」的
+    # 用 `class="cmdline"`／`class="cmdout"` 之類當指紋的話，「只有輸出、沒有指令名」的
     # fallback 也會產出同樣的 class ⇒ 把指令名整個清空、那一格照樣綠
     # （實測）。marker 只會來自那一面自己的素材。
     for _needle, _face in (
@@ -379,7 +379,7 @@ def test_command_and_notify_are_escaped():
             ("FACETHREE", "③ 通知原文"),
             ("FACEFOUR", "④ 排隊插話"),
             # ⚠ 這個 marker 是小寫的：`render_image_block()` 會把 media_type 轉小寫，
-            #   用大寫的話這一格永遠找不到（第一版就是這樣紅的）。
+            #   用大寫的話這一格永遠找不到。
             ("facefive", "⑤ 圖片的 media_type")):
         assert _needle in html, (
             f"{_face} 這個注入面沒有走到頁面上（找不到 marker {_needle}）——那一格什麼都沒驗到")
@@ -388,7 +388,7 @@ def test_command_and_notify_are_escaped():
         "——這一格什麼都沒驗到")
     # ⚠⚠ **要驗「危險的形狀」，不是「危險的字面」。**
     # 逸出之後 `onerror=alert(2)` 這幾個字**照樣會出現**（`&lt;img src=x onerror=alert(2)&gt;`），
-    # 那是無害的文字。第一版斷言寫成「字面不可以出現」，於是**逸出正確也會紅**。
+    # 那是無害的文字。斷言寫成「字面不可以出現」的話，**逸出正確也會紅**。
     assert "<script>alert(1)</script>" not in html, "裸的 <script> 進到頁面了"
     assert "<img src=x onerror=" not in html, "裸的 <img onerror= 進到頁面了"
     assert "</script><script>" not in html, "可以截斷內嵌 <script> 區段"

@@ -45,18 +45,17 @@ def new_tmp(tmp_path=None):
     （codex `workspace-write`），`mkdtemp()` 建出來的目錄**連根目錄都寫不進去**，
     更別說在裡面再建一層——而這個測試套件每一支都要建 `projects/<專案>/`。
     ⇒ 整套測試**一行斷言都跑不到**就 `PermissionError` 死掉，於是 reviewer
-    **靜默降級成純讀碼、卻照樣寫出漂亮的 verdict**。這個 repo 為此賠過兩輪額度。
+    **靜默降級成純讀碼、卻照樣寫出漂亮的 verdict**。
 
-    ⭐ **2026-08-23 實測把成因釘死了**：
+    ⭐ **成因（2026-08-23 實測）**：
     | 位置 | 建目錄 | 寫檔 |
     |---|---|---|
     | `mkdtemp()` 的根 | — | **✗ 存取被拒** |
     | `mkdtemp()` 底下再一層 | **✗** | ✗ |
     | runner 預建的 `%TMP%\\work\\` 底下（`Path.mkdir`）| **✓** | **✓**（連巢狀都可以）|
 
-    ⚠⚠ **2026-08-23 晚間訂正：上面那張表是對的，
-    但從它推出來的結論錯了。** 當時的結論是「事前就存在的目錄可以用」，於是本函式改成
-    `mkdtemp(dir=<那個目錄>)`——**換了地點，沒換機制**。跨模型輪照樣整套死在
+    ⚠⚠ **上面那張表是對的，但「事前就存在的目錄可以用」這個推論不成立**：
+    `mkdtemp(dir=<那個目錄>)` **換了地點，沒換機制**，沙箱裡照樣整套死在
     `WinError 5`，只是改死在 `work\\tmpXXXX\\projects`。
 
     真正的規則是：**不可以是 `mkdtemp()` 建的目錄，不管它建在哪。**
@@ -72,7 +71,7 @@ def new_tmp(tmp_path=None):
 
     ⚠⚠ **這件事在本機無法被否證**（沒有沙箱，兩條路都寫得進去），所以
     `test_tmp_base_env` 是用「**把 `mkdtemp` 換成會爆的東西，看它還活不活得下去**」
-    在守，而不是用「建得出來嗎」在守。後者當時是綠的，而結論是錯的。
+    在守，而不是用「建得出來嗎」在守。後者在本機不管結論對不對都是綠的。
     """
     if tmp_path:
         return Path(tmp_path)
@@ -83,7 +82,7 @@ def new_tmp(tmp_path=None):
         # 這時候自己 mkdir 出來的目錄在沙箱下照樣寫不進去（那正是要避開的情況），
         # 而且會把「路徑打錯」變成一個更難查的權限錯誤。
         if b.is_dir():
-            # ⚠ **不可以用 `mkdtemp(dir=b)`**——理由見上方訂正。
+            # ⚠ **不可以用 `mkdtemp(dir=b)`**——理由見上方 docstring。
             # `exist_ok=False` 是刻意的：撞號要當場看得見，不要靜靜共用同一個目錄
             # （兩支測試共用暫存目錄的症狀會表現成「另一支的產物污染我的斷言」）。
             for _ in range(8):
@@ -102,7 +101,7 @@ def _session_pages(out):
 
     ⚠ 書籤第 3 期起，`out/sessions/` 的**第一層**多了兩個不是對話頁的檔：
     `bookmarks.html`（書籤管理頁）與 `settings.html`（設定頁）。
-    舊寫法 `rglob("*.html")[0]` 會隨機挑到它們——形狀斷言就對著一個空殼在跑，
+    直接用 `rglob("*.html")[0]` 會隨機挑到它們——形狀斷言就對著一個空殼在跑，
     而且**錯得很安靜**（那兩頁沒有 `.turn`，所有 `in html` 斷言一起變假）。
     對話頁一律落在 `<source>/<account>/` 底下 ⇒ 相對路徑至少三段。
     排序是為了讓 `[0]` 在多頁時是決定性的。
@@ -141,7 +140,7 @@ def _page_dup_ids(html):
 
     兩類都各有素材在守：純文字那類是 `test_durable_anchor` 的 `id="IDSCANFAKE"`，
     raw-text 那類是 `test_bookmark_ui`（那一頁的 JS 真的組了兩次 `id="bkTitle"`）。
-    **換回任何一個舊版，對應那一支就會紅。**
+    **少了任何一類的處理，對應那一支就會紅。**
     """
     ids = re.findall(r'<[a-zA-Z][^<>]*?\sid="([^"]*)"', _page_body(html))
     return sorted({i for i in ids if ids.count(i) > 1})
@@ -443,8 +442,8 @@ def test_subagent_inline(tmp_path=None):
 
     index = (out / "index.html").read_text(encoding="utf-8")
     # ⚠ 用 `data-sid=` 當計數依據，不要綁「`<tr` 後面第一個屬性是什麼」——
-    #   書籤第 2 期在 `<tr>` 最前面插了 `data-sid`，原本寫 `'<tr data-source'` 的計數
-    #   當場變成 0（實測）。每一列都有 `data-sid`，而它只出現在資料列上。
+    #   `<tr>` 最前面是 `data-sid`，寫 `'<tr data-source'` 的計數會是 0（實測）。
+    #   每一列都有 `data-sid`，而它只出現在資料列上。
     rows = index.count("<tr data-sid=")
     assert rows == 1, f"子代理不應另列索引，應只有 1 列，實得 {rows}"
     assert "🧩 ×1" in index, "索引標題後應有子代理數量標示 🧩 ×1"
@@ -1623,8 +1622,8 @@ def test_cold_cause_badges(tmp_path=None):
         f"真冷啟那步應拿到自己的成因，實得 {by_mid}"
     assert not by_mid.get("m_x"), \
         f"沒有 usage、不在 cache_steps 裡的步不得被掛上別人的成因，實得 {by_mid}"
-    # **單步回合**：不畫逐步分隔列，也不符合 ❄ 的 `n_steps >= 2` → 成因與並列標籤
-    #   原本在頁面上一個字都看不到，而 `_masked_human_note`／`_srv_excluded_note` 對讀者寫的正是
+    # **單步回合**：不畫逐步分隔列，也不符合 ❄ 的 `n_steps >= 2` → 不另外處理的話，成因與並列標籤
+    #   在頁面上一個字都看不到，而 `_masked_human_note`／`_srv_excluded_note` 對讀者寫的正是
     #   「逐步徽章會兩個都標」。規則要與多步回合一致：成因進 title、並列條件攤到版面上；
     #   MD 沒有 title 可掛，所以成因一律攤在版面上。
     def _one(cause, masked, n_steps=1):
@@ -1644,7 +1643,7 @@ def test_cold_cause_badges(tmp_path=None):
     assert both in h1, f"單步回合的整段徽章要把並列成因攤到版面上，實得 {h1}"
     assert both in m1, f"MD 的單步回合同樣要看得到並列成因，實得 {m1}"
     assert "只算一次" in h1, "並列的是顯示不是記帳：title 要講明金額記在哪一邊"
-    # 並列時 tooltip **不得自相矛盾**：前半句原本由 turn_cold_class 決定
+    # 並列時 tooltip **不得自相矛盾**：前半句若由 turn_cold_class 決定
     #   （只看勝出成因 → unavail 判成「非快取失效」），後半句卻在說「閒置過期（可避免）」。
     for bad in ("非快取失效", "含真正的快取失效"):
         assert bad not in h1, (
@@ -1844,13 +1843,13 @@ def test_api_miss_reason(tmp_path=None):
         + (m_def.group(1) if m_def else "(找不到 DEF)"))
     assert "工具定義變動" in mdtxt and "⚠" in mdtxt, "MD 也要看得到自報成因"
     # 24.6% 那步：⚡ 要著色成冷啟，緊接的 ⚠ 必須是整段失效樣式（非 m-miss part）；
-    # 且**顯示也要寫 24.6%**——寫成 25% 會與報告的「門檻＝命中率 < 25%」打架（G10 F2）。
+    # 且**顯示也要寫 24.6%**——寫成 25% 會與報告的「門檻＝命中率 < 25%」打架。
     m = re.search(r'>⚡24\.6%</span><span class="meter (m-miss[^"]*)"[^>]*>⚠(系統提示變動)', html)
     assert m and m.group(1) == "m-miss", \
         f"命中率 24.6% 應判冷啟（整段失效）且顯示 24.6%，不得四捨五入成 25%：{m and m.group(1)}"
     assert 'class="meter m-cache coldx" title="此步驟未命中快取' in html, "該步的 ⚡ 也要著上冷啟色"
     assert 'class="meter m-cache coldx"' in html, "自報前綴變動的冷啟＝結構性，應為中性灰而非紅"
-    # (G13) 首事件無可呈現內容的呼叫：成因 join 與 gap 都要用「呼叫起點」而非「第一筆有內容的事件」。
+    # 首事件無可呈現內容的呼叫：成因 join 與 gap 都要用「呼叫起點」而非「第一筆有內容的事件」。
     # m_m5 是 1h cohort、間隔 180s 的冷啟 → 應判 evict（真失效＝紅標 cold），不得因 join 失敗變成灰的未歸因。
     assert 'class="meter m-cache cold"' in html, \
         "首事件無內容的呼叫，其真失效（evict）成因必須 join 得上並標紅，不得顯示成未歸因的灰"
@@ -1860,7 +1859,7 @@ def test_api_miss_reason(tmp_path=None):
     report = (out / "cache-report.html").read_text(encoding="utf-8")
     assert "②-b" in report and "工具定義變動" in report, "報告頁應含 API 自報小節"
 
-    # G4 gate 修正的回歸釘子。
+    # 子代理步驟（cause=None）的冷啟著色，與 ②-b 金額混到未知模型時的標記。
     # (#1) 子代理步驟（cause=None）若 API 自報前綴變動，⚡ 要中性灰（coldx）、不得塗紅與旁邊 ⚠ 自打；
     #      但 previous_message_not_found 這種「真失效候選」cause=None 仍應紅標。
     su_pref = {"total_in": 10000, "cache_read": 0, "input": 2, "cache_create": 9998, "output": 5,
@@ -1886,8 +1885,8 @@ def test_api_miss_reason(tmp_path=None):
                                      "cache_models": ["claude-opus-4-8"], "cache_events": []}])
     assert d_known["api"]["usd_partial"] is False, "全已知模型不該標記 usd_partial"
 
-    # (G5) 修 G4 的回歸：`cause or …` 會把主對話「已分析、非失效」的 cause=""（無自報）洗成 None → 誤塗紅，
-    #      動到無 diagnostics 的舊資料（違反不變量①）。cause="" 且無自報必須維持中性灰。
+    # `cause or …` 會把主對話「已分析、非失效」的 cause=""（無自報）洗成 None → 誤塗紅，
+    # 動到無 diagnostics 的舊資料（違反不變量①）。cause="" 且無自報必須維持中性灰。
     su_ana = {"total_in": 10000, "cache_read": 0, "input": 2, "cache_create": 9998, "output": 5, "miss": ""}
     assert 'class="meter m-cache coldx"' in v.render_step_meters(1, su_ana, cause=""), \
         'cause=""（已分析非失效）無自報時應維持 coldx，不得塗紅'
@@ -1896,20 +1895,20 @@ def test_api_miss_reason(tmp_path=None):
                          "u": {"total_in": 10000, "cache_read": 0, "miss": ""}}]}
     assert v.turn_cold_class(g_ana) == "coldx", 'cause="" 的已分析冷啟回合應中性灰（不變量①）'
 
-    # (G6 #1) rewrite_waste_usd 混合 TTL 要逐段拆（同 avoid_usd），不得整段按 1h 高估。
+    # rewrite_waste_usd 混合 TTL 要逐段拆（同 avoid_usd），不得整段按 1h 高估。
     mix = v.rewrite_waste_usd("claude-opus-4-8", 50000, 9000, 1000, wrote=10000)   # 9k@5m + 1k@1h
     assert abs(mix - 10000 * (1.325 - 0.10) * 5 / 1e6) < 1e-9, f"混合 TTL 應逐段拆（blended 1.325），得 {mix}"
     assert abs(mix - (9000 * 1.25 + 1000 * 2.0 - 10000 * 0.10) * 5 / 1e6) < 1e-9, "missed==wrote 應化簡成 avoid_usd"
     assert abs(v.rewrite_waste_usd("claude-opus-4-8", 5000, 0, 8000, wrote=8000)
                - 5000 * 1.9 * 5 / 1e6) < 1e-9, "純 1h 寫入仍為 2.0（不回歸）"
-    # (G6 #2) fmt_money 的 "<$0.01" 在 ②-b HTML 要逃逸成 &lt;$0.01，不得吐裸 <（無效標記）。
+    # fmt_money 的 "<$0.01" 在 ②-b HTML 要逃逸成 &lt;$0.01，不得吐裸 <（無效標記）。
     d_tiny = v.build_cache_report([{"source_kind": v.SOURCE_CLAUDE, "account": "", "kind": "chat",
                                     "cache_steps": [step(0, 0), step(600, 0, tools_code, 1)],
                                     "cache_models": ["claude-opus-4-8"], "cache_events": []}])
     h_tiny = v.render_cache_report_html(d_tiny)
     assert "&lt;$0.01" in h_tiny and "~<$0.01" not in h_tiny, "②-b 的 <$0.01 金額應逃逸，不得吐裸 <"
 
-    # (G8 #2) 全部都是未知模型時 usd＝0，但仍要顯示「?」提示算不出來——整句消失會讓人以為沒多付。
+    # 全部都是未知模型時 usd＝0，但仍要顯示「?」提示算不出來——整句消失會讓人以為沒多付。
     d_unk = v.build_cache_report([{"source_kind": v.SOURCE_CLAUDE, "account": "", "kind": "chat",
                                    "cache_steps": [step(0, 0), step(600, 0, tools_code, 5000)],
                                    "cache_models": ["claude-zzznew-9"], "cache_events": []}])
@@ -1917,14 +1916,14 @@ def test_api_miss_reason(tmp_path=None):
     assert "多付 <b>~?</b>" in v.render_cache_report_html(d_unk), "全未知模型時金額應顯示 ?，不得整句消失"
     assert "多付 ~?" in "\n".join(v._api_miss_md(d_unk)), "MD 版同樣要顯示 ?"
 
-    # (G8 #3) 帶內失效樣本全被排除時（band 空），排除揭露更要講——否則遵約率看起來完美卻沒說原因。
+    # 帶內失效樣本全被排除時（band 空），排除揭露更要講——否則遵約率看起來完美卻沒說原因。
     d_allx = rep([st2(0, 0), st2(1000, 0, tools_code)])
     assert d_allx["api"]["band_excluded"] == 1 and not d_allx["api"]["band"]
     note_x = v._band_api_note(d_allx)
     assert "整對移出樣本" in note_x and "1 對" in note_x, f"band 空時仍須揭露排除：{note_x!r}"
 
-    # (G12 #1) 帶內樣本被排除到 0 時，假說頁不得謊稱「尚無應命中帶樣本…累積資料後才有東西可檢定」
-    #          （樣本存在、是被排除掉的），且排除揭露必須照樣出現——先前被 if comply_n 的 guard 擋掉。
+    # 帶內樣本被排除到 0 時，假說頁不得謊稱「尚無應命中帶樣本…累積資料後才有東西可檢定」
+    # （樣本存在、是被排除掉的），且排除揭露必須照樣出現（不可被 if comply_n 的 guard 擋掉）。
     d_zero = rep([st2(0, 0), st2(1000, 0, tools_code), st2(2000, 0, tools_code)])
     assert d_zero["kpi"]["comply_n"] == 0 and d_zero["api"]["band_excluded"] >= 1, "前提：帶內樣本全被排除"
     for txt, what in ((v.render_cache_hypotheses_html(d_zero), "HTML"),
@@ -1937,7 +1936,7 @@ def test_api_miss_reason(tmp_path=None):
         assert "整對移出樣本" in txt, f"{what}：排除揭露必須出現（最需要它的時候）"
     assert "帶內樣本全數被移出" in v._band_api_note(d_zero), "連樣本都不剩時不可說成「沒有失效樣本」"
 
-    # (G12 #2) 回合徽章的整段／只掉一段要照實拆，不得因「有一步整段冷啟」就把整個 ×N 講成整段失效
+    # 回合徽章的整段／只掉一段要照實拆，不得因「有一步整段冷啟」就把整個 ×N 講成整段失效
     g_mix = {"role": "assistant", "n_steps": 3, "blocks": [],
              "u": {"input": 2, "cache_create": 9000, "cache_read": 30000, "ctx_max": 39002,
                    "output": 9, "cost": 0.1, "unpriced": False, "miss_tok": 1000, "miss_usd": 0.2,
@@ -1951,7 +1950,7 @@ def test_api_miss_reason(tmp_path=None):
     assert "整段3·" not in h_all and "部分失效·" not in h_all, f"全整段時不該有拆分標籤：{h_all[:200]}"
     assert "部分失效·" in v.render_turn_meters(dict(g_mix, u=dict(g_mix["u"], miss_cold=0)))
 
-    # (G10 F3) 回合／表頭金額也要有 +?：未知模型不得靜默貢獻 0，讓畫面顯示偏低的「多付」。
+    # 回合／表頭金額也要有 +?：未知模型不得靜默貢獻 0，讓畫面顯示偏低的「多付」。
     acc = v._new_turn_usage()
     v._acc_turn_usage(acc, {"id": "mu1", "model": "claude-zzznew-9",
                             "diagnostics": {"cache_miss_reason":
@@ -1969,8 +1968,8 @@ def test_api_miss_reason(tmp_path=None):
         miss_tok, miss_usd, miss_usd_partial, miss_cold = 9000, 0.0, True, 1
     assert "多付 ~?" in v._miss_head(_S())[0], "session 表頭金額也要標 ?"
 
-    # (X1 F2) 逐步徽章同理——回合／表頭／②-b 三層都標 ? 了，只有步驟層靜默省略金額＝同一事實兩處
-    #         說法不一，且「失效前綴 9.0k」不附金額會被讀成「沒多付」。三種情形都要釘：
+    # 逐步徽章同理——回合／表頭／②-b 三層都標 ? 了，只有步驟層靜默省略金額＝同一事實兩處
+    # 說法不一，且「失效前綴 9.0k」不附金額會被讀成「沒多付」。三種情形都要釘：
     def _mk(model, c1, c2):
         return {"id": "su", "model": model,
                 "diagnostics": {"cache_miss_reason": {"type": "tools_changed",
@@ -1996,13 +1995,13 @@ def test_api_miss_reason(tmp_path=None):
     assert su_old["miss"] == "" and su_old["miss_usd_partial"] is False, "舊資料不得被本修正動到"
     assert "失效前綴" not in v.render_step_meters(1, su_old), "舊資料不該出現失效徽章"
 
-    # (G8 #1) ③ 的 MD 版不得還寫「不可避免＝第一句/切帳號/換模型/壓縮」（HTML 已改，MD 漏改＝兩處說法不一）
+    # ③ 的 MD 版不得還寫「不可避免＝第一句/切帳號/換模型/壓縮」（HTML 與 MD 要同一種說法）
     md_rep = v.render_cache_report_md(d1)
     assert "不可避免＝第一句" not in md_rep, "③ MD 仍用舊標籤（前綴變動也落在該桶，說法會與 ② 打架）"
     assert "非閒置造成" in md_rep, "③ MD 應改用「非閒置造成」並列出前綴變動"
 
-    # (G9 #1) 壓縮邊界後的冷啟會自報 messages_changed：不得被通稱 msgs 蓋掉更準的 compact 實據，
-    #         否則「壓縮後」那欄歸零，還被挪進「習慣可避免」（自動壓縮不是改習慣能省的）。
+    # 壓縮邊界後的冷啟會自報 messages_changed：不得被通稱 msgs 蓋掉更準的 compact 實據，
+    # 否則「壓縮後」那欄歸零，還被挪進「習慣可避免」（自動壓縮不是改習慣能省的）。
     msgs_code = v.API_MISS_CODES.index("messages_changed")
     raw_c = [st2(0, 0), st2(600, 0, msgs_code)]
     ev_c = [[300, "compact"]]
@@ -2022,9 +2021,9 @@ def test_api_miss_reason(tmp_path=None):
     got_n = v.classify_cache_causes(raw_c, ["claude-opus-4-8"], [])
     assert got_n[600] == "msgs", f"無壓縮邊界時仍應為 msgs：{got_n}"
 
-    # (X2 F1) 首步也要「有自報就以自報為準」。快取跨 session 共用 → 新 session 第一句仍可能命中上一場
-    #         的前綴，此時 tools/system/msgs 才是真成因；標 first 會把「習慣可避免」記進「不可避免」桶，
-    #         也讓 ② 與 ②-b／逐步徽章對同一步說法不一。
+    # 首步也要「有自報就以自報為準」。快取跨 session 共用 → 新 session 第一句仍可能命中上一場
+    # 的前綴，此時 tools/system/msgs 才是真成因；標 first 會把「習慣可避免」記進「不可避免」桶，
+    # 也讓 ② 與 ②-b／逐步徽章對同一步說法不一。
     raw_f1 = [st2(0, 0, tools_code)]
     assert v.classify_cache_causes(raw_f1, ["claude-opus-4-8"], []) == {0: "tools"}, \
         "首步自報 tools_changed 不得被 first 蓋掉"
@@ -2034,8 +2033,8 @@ def test_api_miss_reason(tmp_path=None):
     assert v.classify_cache_causes([st2(0, 0)], ["claude-opus-4-8"], []) == {0: "first"}, \
         "沒有自報時仍須是 first（不得反向誤判）"
 
-    # (X2 F2) 前綴變動步若沒有新寫入，舊 TTL lineage 必須失效——否則下一個冷啟沿用舊 1h cohort、
-    #         被判成假的「1h 內卻冷啟」(evict)，正是本工具要消滅的東西。
+    # 前綴變動步若沒有新寫入，舊 TTL lineage 必須失效——否則下一個冷啟沿用舊 1h cohort、
+    # 被判成假的「1h 內卻冷啟」(evict)，正是本工具要消滅的東西。
     def stw(t, cr, wrote, w1h, code=0):
         return [t, cr, 2000, wrote, 0, w1h, 0, code, 0]
     raw_f2 = [stw(0, 0, 2000, 2000), stw(60, 2000, 0, 0),
@@ -2049,9 +2048,9 @@ def test_api_miss_reason(tmp_path=None):
     assert v.classify_cache_causes(raw_f2b, ["claude-opus-4-8"], []).get(600) == "evict", \
         "前綴變動步有寫入時，lineage 應重建成 1h"
 
-    # (X2 F2b) band_excluded ＝「帶內樣本的**完整**減少量」（反事實差額），不是只數被直接排除的那一對：
-    #          lineage 失效會讓下游的對也從 1h 掉進 unknown、一併離開帶內。此 fixture 減少 2 對、
-    #          只數直接排除會report 1，故有鑑別力。
+    # band_excluded ＝「帶內樣本的**完整**減少量」（反事實差額），不是只數被直接排除的那一對：
+    # lineage 失效會讓下游的對也從 1h 掉進 unknown、一併離開帶內。此 fixture 減少 2 對、
+    # 只數直接排除會 report 1，故有鑑別力。
     raw_f2c = [[600, 1900, 2000, 2000, 0, 2000, 0, 0, 0],
                [1200, 0, 2000, 2000, 0, 0, 0, tools_code, 0],
                [2700, 0, 2000, 0, 0, 2000, 0, 0, 0]]
@@ -2061,15 +2060,15 @@ def test_api_miss_reason(tmp_path=None):
     assert on_c["api"]["band_excluded"] == drop_c, \
         f"band_excluded 須恆等於帶內樣本減少量：報 {on_c['api']['band_excluded']}、實減 {drop_c}"
 
-    # (X2 F3) ②-b 母體＝所有有自報成因的呼叫。ctx < REPORT_MIN_CTX 的過濾只服務「由命中率推論成因」，
-    #         對 API 明講的事實不適用；過濾掉會少算次數／長度／金額，還可能吞掉未知的新型別。
+    # ②-b 母體＝所有有自報成因的呼叫。ctx < REPORT_MIN_CTX 的過濾只服務「由命中率推論成因」，
+    # 對 API 明講的事實不適用；過濾掉會少算次數／長度／金額，還可能吞掉未知的新型別。
     d_f3 = rep([[0, 0, 400, 400, 0, 400, 0, tools_code, 321]])
     assert d_f3["api"]["cold"].get("tools_changed") == 1 and d_f3["api"]["cold_tok"] == 321, \
         f"ctx < {v.REPORT_MIN_CTX} 的自報呼叫不得被靜默吞掉：{d_f3['api']}"
 
-    # (X4 H2) 被 REPORT_MIN_CTX 濾掉的前綴變動步，照樣污染它所夾的那一對相鄰步。
-    #         不看的話結構性實據被分析門檻吃掉，下游冷啟被誤判成假 evict——實測 ctx 差 1 個
-    #         token（400 vs 500）結論就整個翻轉，那是分析門檻不該有的權力。
+    # 被 REPORT_MIN_CTX 濾掉的前綴變動步，照樣污染它所夾的那一對相鄰步。
+    # 不看的話結構性實據被分析門檻吃掉，下游冷啟被誤判成假 evict——實測 ctx 差 1 個
+    # token（400 vs 500）結論就整個翻轉，那是分析門檻不該有的權力。
     def stc(t, cr, ctx, wrote, w1h, code=0, missed=0):
         return [t, cr, ctx, wrote, 0, w1h, 0, code, missed]
     for ctx_lo in (400, v.REPORT_MIN_CTX):        # 門檻上下都要得到同一個結論
@@ -2085,9 +2084,9 @@ def test_api_miss_reason(tmp_path=None):
         assert v.classify_cache_causes(raw_h2, ["claude-opus-4-8"], []).get(1200) != "evict", \
             f"ctx={ctx_lo}：徽章端同樣不得有假 evict"
 
-    # (X4 H1) 同一秒的兩次呼叫不得共用 join 鍵。撞號時後者會蓋掉前者，而自從首步也採用 API
-    #         自報成因之後，後果從「推論成因貼錯」升級成「沒有 diagnostics 的那一步被標成
-    #         API 自報」＝把推論講成實據，違反最高不變量①。
+    # 同一秒的兩次呼叫不得共用 join 鍵。撞號時後者會蓋掉前者；首步也採用 API 自報成因，
+    # 所以後果不只是「推論成因貼錯」，還會是「沒有 diagnostics 的那一步被標成
+    # API 自報」＝把推論講成實據，違反最高不變量①。
     def stk(t, code=0):
         return [t, 0, 2000, 2000, 0, 2000, 0, code, 900 if code else 0]
     raw_h1 = [stk(1000), stk(1000, tools_code)]      # 同秒：第 0 步無自報、第 1 步自報 tools
@@ -2192,7 +2191,7 @@ def test_write_ttl_badges(tmp_path=None):
     assert "寫入 TTL 1h</span>" in html, "1h 寫入的步應標 1h"
     assert 'class="meter m-ttl sw t5"' in html and "寫入 TTL 1h→5m" in html, \
         "1h→5m 的切換步應標出來，而且落點是 5m ⇒ 要帶 .t5"
-    # ⚠⚠ 5m 一律紅底白字、且**不受勾選開關控制**（Will 2026-09-22 裁決）：
+    # ⚠⚠ 5m 一律紅底白字、且**不受勾選開關控制**：
     # 子代理可用 CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h 改掉 ⇒ 5m 不是中性事實。
     # 只驗 class 不夠——隱藏規則把它藏起來，紅色一樣沒人看得到，所以三格一起守。
     assert 'class="meter m-ttl t5"' in html, "純 5m 的步要帶 .t5（紅底白字）"
@@ -2425,7 +2424,7 @@ def test_write_ttl_badges(tmp_path=None):
         "渲染出來的徽章 title 也要乾淨（不是只驗常數）")
 
     # --- MD 的回合列要帶寫入 TTL：切換那一則標切換、5m 的標 5m、純 1h 不標----------
-    # MD 不畫逐步列；舊版 MD 只有表頭說「有切換」，每一則都找不到是哪一則。
+    # MD 不畫逐步列；只有表頭說「有切換」的話，每一則都找不到是哪一則。
     _md_turns = [l for l in mdtxt.splitlines() if "⚡" in l and "寫入 TTL：" not in l]
     assert sum("寫入 TTL 1h→5m" in l for l in _md_turns) == 1, (
         f"MD 裡切換那一則要標「寫入 TTL 1h→5m」，而且只有那一則：{[l[-60:] for l in _md_turns]}")
@@ -2559,7 +2558,7 @@ def test_cost_mix_table(tmp_path=None):
 
     # --- ⚠⚠ **場次總額**要逐位元等於「每次呼叫的 `call_cost` 依序相加」（m01）--------
     # 上面只釘了 `call_cost` 這個函式本身；`_collect_usage` 若改成累加組成表的各項，整場的總額會在
-    # 很多輸入上差最後一位（reviewer 的合成語料 151 場裡 89 場），而整套測試照樣綠。
+    # 很多輸入上差最後一位（合成語料 151 場裡 89 場），而整套測試照樣綠。
     # （這三筆是用隨機搜尋找到的「逐次 call_cost 相加」與「各項加總」會分岔的形狀：0.75826874999… vs 0.75826875）
     _calls = [("claude-opus-4-8", 1335, 22358, 582423, 1976, 16985, 4347),
               ("claude-haiku-4-5", 434, 28941, 260565, 783, 18359, 930),
@@ -2706,7 +2705,7 @@ def test_split_call_usage_last_event(tmp_path=None):
 
 
 def test_ctx_window_and_coldest(tmp_path=None):
-    # G3 gate 修正的回歸釘子：兩個「門檻／前綴一致性」bug。
+    # 先守兩件事：context 視窗的前綴判定，與冷熱門檻的判定（下面 (1)(2)）。
     import importlib
     sys.path.insert(0, str(ROOT))
     v = importlib.import_module("ai_session_viewer")
@@ -2716,8 +2715,8 @@ def test_ctx_window_and_coldest(tmp_path=None):
     assert v.context_window("claude-sonnet-5-20260101") == 1_000_000
     assert v.context_window("claude-3-5-sonnet-20241022") == 200_000, "3.x 世代仍落 200k fallback"
     assert v.context_window("gpt-5.5") is None, "非 Claude 查不到就回 None（只顯示絕對值）"
-    # (X4 M6) 1M 是**分版本**的，不能用裸前綴一律當 1M：opus/sonnet 要 4.6 以上才是 1M。
-    #         先前 sonnet-4-5 的 100k 脈絡會被算成 10%（實際 50%），差 5 倍。
+    # 1M 是**分版本**的，不能用裸前綴一律當 1M：opus/sonnet 要 4.6 以上才是 1M。
+    # 一律當 1M 的話，sonnet-4-5 的 100k 脈絡會被算成 10%（實際 50%），差 5 倍。
     for m in ("claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
               "claude-sonnet-4-6", "claude-sonnet-5", "claude-fable-5", "claude-opus-6"):
         assert v.context_window(m) == 1_000_000, f"{m} 應為 1M，實得 {v.context_window(m)}"
@@ -2738,9 +2737,9 @@ def test_ctx_window_and_coldest(tmp_path=None):
         {"type": "_step", "idx": 2, "u": {"cache_read": 2600, "total_in": 10000, "output": 0}}]}
     assert v.coldest_step(g2)[3] is False, "26% 不應判冷（確保沒有反向誤判）"
 
-    # (X2 F4) 同一顯示回合可能併了不同模型的呼叫（opus 1M 視窗 → haiku 200k 視窗）。回合的
-    #         「佔視窗 %」必須用 **ctx_max 那一步** 的視窗，不是第一步的——否則回合徽章與逐步徽章
-    #         對同一事實給出兩個百分比（實測 19% vs 95%）。HTML 與 MD 都要對。
+    # 同一顯示回合可能併了不同模型的呼叫（opus 1M 視窗 → haiku 200k 視窗）。回合的
+    # 「佔視窗 %」必須用 **ctx_max 那一步** 的視窗，不是第一步的——否則回合徽章與逐步徽章
+    # 對同一事實給出兩個百分比（實測 19% vs 95%）。HTML 與 MD 都要對。
     def _m(mid, model, cr):
         return {"id": mid, "model": model,
                 "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
@@ -2760,8 +2759,8 @@ def test_ctx_window_and_coldest(tmp_path=None):
     assert acc2["ctx_win"] == 1_000_000 and "(40%)" in v.render_turn_meters(
         {"role": "assistant", "n_steps": 2, "blocks": [], "u": acc2}), "反向情境不得誤用小視窗"
 
-    # (X3 M1) 「距上一步／effort」原本只掛在逐步分隔列上，而單步回合刻意不畫那一列
-    #         → 單次呼叫的回合（多數）這兩欄完全看不到；MD 更是完全不畫逐步列、單步多步都沒有。
+    # 「距上一步／effort」若只掛在逐步分隔列上，而單步回合刻意不畫那一列
+    # → 單次呼叫的回合（多數）這兩欄完全看不到；MD 更是完全不畫逐步列、單步多步都沒有。
     su_x3 = {"win": 1_000_000, "cache_read": 900, "total_in": 1000, "input": 0, "cache_create": 100,
              "output": 5, "miss": "", "miss_tok": 0, "miss_usd": None, "miss_usd_partial": False,
              "model": "claude-opus-4-8", "effort": "max"}
@@ -2779,8 +2778,8 @@ def test_ctx_window_and_coldest(tmp_path=None):
     h_multi = v.render_turn_html(dict(g_solo, n_steps=2), {}, set())
     assert h_multi.count("距上一步") == 1, f"多步回合不得重複顯示：出現 {h_multi.count('距上一步')} 次"
 
-    # (X3 M2) turn_duration 若在「還沒有開著的 assistant 回合」時抵達（緊接可見 user、同一次呼叫的
-    #         內容後到），原本直接丟掉 → 那則的 ⏱ 永遠消失。改成按 message.id 暫存再掛回。
+    # turn_duration 若在「還沒有開著的 assistant 回合」時抵達（緊接可見 user、同一次呼叫的
+    # 內容後到），不可以直接丟掉（那則的 ⏱ 會永遠消失）：要按 message.id 暫存再掛回。
     from datetime import datetime, timezone
 
     def _ev(role, mid, blocks, ms=None):
@@ -2797,7 +2796,7 @@ def test_ctx_window_and_coldest(tmp_path=None):
     a_x3 = [t for t in turns_x3 if t["role"] == "assistant"]
     assert a_x3 and a_x3[0].get("dur_ms") == 223000, \
         f"同一次呼叫的耗時必須掛回來，不得靜默丟失：{[t.get('dur_ms') for t in a_x3]}"
-    # (G7) 選「最冷步」也要用精確比值：25.0% 與 24.6% 同 round 成 25 時，要選真正最冷（步2）並標冷。
+    # 選「最冷步」也要用精確比值：25.0% 與 24.6% 同 round 成 25 時，要選真正最冷（步2）並標冷。
     g3 = {"n_steps": 2, "blocks": [
         {"type": "_step", "idx": 1, "u": {"cache_read": 2500, "total_in": 10000, "output": 0}},
         {"type": "_step", "idx": 2, "u": {"cache_read": 2460, "total_in": 10000, "output": 0}}]}
@@ -2810,7 +2809,7 @@ def test_ctx_window_and_coldest(tmp_path=None):
     assert v.context_window("claude-sonnet-4-5-20250929") == 200_000, \
         "對照組：沒有後綴的舊版本仍是 200k"
 
-    # (G10) 門檻邊界的「顯示」也要與判定一致：24.6% 不得寫成 25%（報告說門檻是「< 25%」）。
+    # 門檻邊界的「顯示」也要與判定一致：24.6% 不得寫成 25%（報告說門檻是「< 25%」）。
     assert v._pct_display(2460, 10000) == "24.6", "剛好進位到門檻時要多給一位小數"
     assert v._pct_display(2500, 10000) == "25", "正好 25% 照常取整（它不是冷啟）"
     # 一位小數也會進位：24.95〜24.99% 不得印成 25.0（否則同一個矛盾只是換個位數重現）
@@ -2820,7 +2819,7 @@ def test_ctx_window_and_coldest(tmp_path=None):
         assert cr * 100 < v.CACHE_COLD_PCT * tot, "前提：這些都該是冷啟"
     assert v._pct_display(9970, 10000) == "100" and v._pct_display(0, 10000) == "0", "其餘照常取整"
     assert r3[0] == "24.6", f"❄最低 也要顯示 24.6 而非 25：{r3[0]!r}"
-    # (G10 F1) turn_cold_class 的冷熱判定同樣不得先四捨五入（否則整段不著色、❄ 與逐步卻著色）
+    # turn_cold_class 的冷熱判定同樣不得先四捨五入（否則整段不著色、❄ 與逐步卻著色）
     g4 = {"n_steps": 2, "u": {"input": 40, "cache_create": 7500, "cache_read": 2460},
           "blocks": [{"type": "_step", "idx": 1, "cause": "expiry",
                       "u": {"total_in": 10000, "cache_read": 2460, "miss": ""}}]}
@@ -3108,8 +3107,8 @@ def test_codex_item_completed_user(tmp_path=None):
                                     "content": [{"type": "output_text", "text": "答OUTERA。"}]}),
     ]), encoding="utf-8")
 
-    # N：`item` **容器本身**漂了——不是 dict 而是包著 dict 的 list。舊寫法直接換成 {}，
-    #    於是 item 層每一個哨兵都看不到東西；payload 這一層又不帶 role（實測 485 個 rollout 皆然），
+    # N：`item` **容器本身**漂了——不是 dict 而是包著 dict 的 list。若直接換成 {}，
+    #    item 層每一個哨兵都看不到東西；payload 這一層又不帶 role（實測 485 個 rollout 皆然），
     #    event 層哨兵也接不到 → 整則 prompt 靜默消失、沒有任何一個計數會動。
     sid_n = "019f0011-0000-7000-8000-000000000011"
     (sess_dir / f"rollout-2026-06-08T05-10-00-{sid_n}.jsonl").write_text("\n".join([
@@ -3278,7 +3277,7 @@ def test_codex_item_completed_user(tmp_path=None):
     ]), encoding="utf-8")
 
     # Z：**舊格式** user_message 的 `message` 從字串漂成 content block 陣列。
-    #    原本是 `str(payload.get("message") or "")` → Python 的 repr 整包被當成 prompt 收下，
+    #    若只做 `str(payload.get("message") or "")` → Python 的 repr 整包會被當成 prompt 收下，
     #    而三層哨兵全靜：repr 非空（不觸發「取不出文字」）、型別名還在（不觸發型別哨兵）、
     #    不走 item 分支（不數 dropped block）。圖片 block 無聲消失、頁面看起來完整。
     #    新格式那條路徑早就有 `_codex_content_text` ＋ unconsumed 兩層，舊格式這側要對稱。
@@ -3406,7 +3405,7 @@ def test_codex_item_completed_user(tmp_path=None):
     assert "最外層型別不認得" in r.stderr, \
         f"最外層事件型別漂移應對 stderr 出聲，實得 stderr：{r.stderr}"
 
-    # N：item 容器不是 dict → 收不到回合，但**必須**出聲（舊寫法換成 {} 之後三層哨兵全都接不到）
+    # N：item 容器不是 dict → 收不到回合，但**必須**出聲（若直接換成 {}，三層哨兵全都接不到）
     n_md = md_of(sid_n)
     assert n_md.count("### 👤 You") == 0, "認不得的容器形狀不應硬收成回合"
     assert "CONTAINERQ" not in n_md, "沒收下的內容不應憑空出現"
@@ -3432,7 +3431,7 @@ def test_codex_item_completed_user(tmp_path=None):
         f"Python 的 repr 不得被當成 prompt 收下（三層哨兵都認不出來，只能靠這裡擋）：{z_md[:400]}"
 
     # ZR：助理內容整批消失時必須出聲——這是「看起來完整、少了東西」的另一半，
-    #    而它原本完全無聲（頁面：一則提問、零則回答）。
+    #    而它沒有哨兵就完全無聲（頁面：一則提問、零則回答）。
     zr_md = md_of(sid_zr)
     assert "回答會消失RESPDRIFTQ" in zr_md, f"同一場的 prompt 仍要收得到：{zr_md[:300]}"
     assert "答RESPDRIFTA" not in zr_md, "對照：容器漂掉的助理內容本來就解析不出來"
@@ -3755,8 +3754,8 @@ def test_account_switch_cause(tmp_path=None):
     assert "$0+?" not in part_md and "人因浪費 ?" in part_md, (
         f"MD 也要同口徑，實得：{[l for l in part_md.splitlines() if '人因浪費' in l]}")
 
-    # **報告那兩處也要同口徑**。上一批只修了索引三處、只釘了索引側的斷言，
-    #   而 KPI 磚的副標題就寫著「與索引『浪費』欄同口徑」——報告寫 $0+?、索引寫 ? 時那句是假的。
+    # **報告那兩處也要同口徑**。KPI 磚的副標題就寫著「與索引『浪費』欄同口徑」
+    #   ——報告寫 $0+?、索引寫 ? 時那句是假的。
     base = 1780000000
     st = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],
           [base + 4000, 0, 100000, 100000, 0, 100000, 0, 0, 0]]   # gap > TTL → expiry（人因）
@@ -3957,10 +3956,10 @@ def test_acct_precision_and_server_cause():
         f"{ {k: n for k, n in d_srv_bd['causes_total'].items() if n} }")
 
     # ④ **三步以上**才量得到 lineage。上面 ③ 的 srv fixture 全是兩步，量不到
-    #    「下一個冷啟用哪個 cohort」——而報告端與徽章端當時正是在這一格分岔：報告端遇到 srv 會重置
-    #    lineage、classify 端不會（重置條件漏了 srv_cause）。同一步於是一邊算 expiry（人因、記錢）、
+    #    「下一個冷啟用哪個 cohort」——而報告端與徽章端必須在這一格一致：報告端遇到 srv 會重置
+    #    lineage、classify 端若不會（重置條件漏了 srv_cause），同一步就一邊算 expiry（人因、記錢）、
     #    一邊算 evict（非人因、不記錢），同一頁上兩個地方對同一步講相反的話。
-    #    兩邊現已共用 `_resets_lineage`，這條測試就是釘住它的那根釘子。
+    #    兩邊共用 `_resets_lineage`，這條測試就是釘住它的那根釘子。
     #    ⚠ srv 那一步**必須沒有新寫入**：有寫入的話迴圈頂端會立刻把 lineage 立回來，分岔看不出來
     #    （本機語料 153 個 srv 步全都有寫入，所以實跑觸發 0 次——這是可達性低、不是不存在）。
     srv3 = [[base, 90000, 100000, 100000, 0, 100000, 0, 0, 0],        # 1h 寫入 → cohort = 1h
@@ -4012,9 +4011,9 @@ def test_acct_precision_and_server_cause():
     #   磚是 `comply_n - comply_hit`：只數 **1h cohort 且落在應命中帶**的冷啟。
     #   ② 的 `evict` 不分 cohort、也不看帶。所以磚**恆為 ② 的子集**，相等只在
     #   「樣本剛好全是 1h 帶內」時成立。
-    # ⚠ 這裡原本直接斷言相等，而 fixture 兩對都是 1h cohort → 必然相等、
-    #   抓不到任何東西（本機語料兩邊也剛好都是 14，實跑同樣蓋不到）。改成斷言真正成立的
-    #   關係，並補一組非 1h 的 evict 證明這條測試現在分得出來。
+    # ⚠ 不可以直接斷言相等：fixture 兩對都是 1h cohort → 必然相等、
+    #   抓不到任何東西（本機語料兩邊也剛好都是 14，實跑同樣蓋不到）。所以斷言真正成立的
+    #   關係，並補一組非 1h 的 evict 證明這條測試分得出來。
     mixed = [row_of(steps_of(600, miss_code=code, miss_tok=5000), []),   # 伺服器不可用（冷）
              row_of(steps_of(600), [])]                                  # 真的提早失效（冷）
     d_mix = v.build_cache_report(mixed)
@@ -4247,8 +4246,8 @@ def test_acct_separator_and_step_time(tmp_path=None):
     assert chunk_bodies, "應切得出回合"
     assert not any("換了登入帳號" in b for b in chunk_bodies), (
         "切帳號分隔線不得落進任何一則的搜尋內文")
-    # ⚠ 只比「有沒有那幾個字」釘不住：這條線**配套插進去的裝飾**（曾經有一條 `---`）一樣
-    # 不屬於任何一則，卻照樣會落進前一則。改成比對「同一場但沒切帳號」的切塊結果——
+    # ⚠ 只比「有沒有那幾個字」釘不住：這條線**配套插進去的裝飾**一樣
+    # 不屬於任何一則，卻照樣會落進前一則。所以比對「同一場但沒切帳號」的切塊結果——
     # 有沒有切帳號，都不該改動任何一則的搜尋內文。
     _, md_nosw = build("one_nosw", [
         user("a1", None, t0, sid1, "換帳號前的訊息BEFORESWITCH。"),
@@ -4626,10 +4625,10 @@ def test_acct_separator_and_step_time(tmp_path=None):
 def test_scope_notes_without_cold():
     """零冷啟時三段揭露仍要出現在 ②——它們講的是偵測範圍與樣本排除，與有沒有冷啟無關。
 
-    舊寫法把三段包在 `if total_cold:` 裡，於是「一律揭露，不看數字是不是 0」那句註解在
-    零冷啟那一支是假的：最需要保留懷疑的那一格反而什麼都不說。實測本機有 289 個
+    三段若包在 `if total_cold:` 裡，「一律揭露，不看數字是不是 0」那句註解在
+    零冷啟那一支就是假的：最需要保留懷疑的那一格反而什麼都不說。實測本機有 289 個
     「有 cache_steps、零冷啟成因」的 session，只用它們建報告時 `srv_excluded` 仍有 75 對
-    要揭露卻一句都不出。
+    要揭露——包在 `if` 裡就會一句都不出。
     """
     import importlib
     sys.path.insert(0, str(ROOT))
@@ -4803,7 +4802,7 @@ def test_forced_switch_parallel_label():
     `boundary` 的「被迫/自願」只看同一對相鄰步之間的事件，429 與切換中間夾了任何一次呼叫，
     那次被迫切換就落成 `acct`（人因、記錢、紅色徽章）。全語料實測 10 個 acct 標籤裡有 3 個
     是這種（間隔 5005／4942／11584 秒、$9.05 ＝ 人因浪費的 3.03%）。
-    Will 2026-08-21 裁決：並列顯示 ＋ 報告揭露，**不動成因也不動金額**。
+    規則：並列顯示 ＋ 報告揭露，**不動成因也不動金額**。
     """
     import importlib
     sys.path.insert(0, str(ROOT))
@@ -5075,9 +5074,9 @@ def test_history_partial_blank_sentinel(tmp_path=None):
     """**部分** history 認不得時也要出聲，不能只在全部都認不得時才說。
 
     切帳號是靠**跨帳號比對**成立的：少掉一邊，這條路徑就實質失效，而回傳值與
-    「真的沒切過」完全同形。舊條件是 `h["files"] and not by_sid`（全部都認不得），
+    「真的沒切過」完全同形。條件若寫成 `h["files"] and not by_sid`（全部都認不得），
     只要還有一份讀得出來就一聲不吭。
-    順帶釘住 `files` 只算**開得起來**的那幾份（舊寫法在 open 之前就 +1，開檔失敗時
+    順帶釘住 `files` 只算**開得起來**的那幾份（在 open 之前就 +1 的話，開檔失敗時
     `files` 與 `read_errors` 同時加一，揭露句的「讀到 N 份」高估涵蓋率）。
     """
     import importlib
@@ -5095,7 +5094,7 @@ def test_history_partial_blank_sentinel(tmp_path=None):
     good = [{"sessionId": f"s{i}", "timestamp": 1780000000000 + i * 1000} for i in range(5)]
     drift = [{"sid": f"s{i}", "ts": 1780000000000 + i * 1000} for i in range(5)]   # 欄位改名
 
-    # ① 一份好的 ＋ 兩份漂掉 → 舊條件不成立（by_sid 非空），新哨兵必須出聲
+    # ① 一份好的 ＋ 兩份漂掉 → 「全部都認不得」不成立（by_sid 非空），哨兵仍必須出聲
     h = {}
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
@@ -5200,7 +5199,7 @@ def test_durable_anchor(tmp_path=None):
 
         ⚠ 只看開標籤，不能看整段：標頭裡有個 `<span class="tanchor" id="tN">`，
         看整段會把它的 id 當成回合的 id——那樣「沒有耐久錨點的回合不該有 id」
-        這條就永遠驗不出來（第一版就是這樣，被自己的新斷言抓到）。
+        這條就永遠驗不出來。
         ⚠ 也不能用 mark 的第一次出現：session 標題取自第一則使用者訊息，
         所以 mark 常常先出現在 `<title>` 裡，那之前沒有任何 .turn。
         """
@@ -5232,14 +5231,13 @@ def test_durable_anchor(tmp_path=None):
 
     # 沒有時間的那一則：不給耐久錨點，也不給 # 連結（⚠ 不要退回 t{n} 充數）
     assert "NOTIME" in html, "沒有時間的回合仍應正常呈現"
-    # ⚠ 舊版寫 `not startswith("k")`，擋不住「退回 t{n}」這個明文禁止的作法
+    # ⚠ 只驗 `not startswith("k")` 擋不住「退回 t{n}」這個明文禁止的作法
     # ——把 kanchor 設成 anchor 的突變下，那條照樣綠。
     # 要驗的是：**那個 .turn 根本沒有 id 屬性**。
     assert _turn_id_of("NOTIME") == "", \
         f"沒有時間的回合的 .turn 不該有 id（更不可以退回 t{{n}}），實得 {_turn_id_of('NOTIME')!r}"
 
     # ⚠ **最高不變量：同一頁的 id 必須唯一。** 重複的話 getElementById 會靜默取第一個。
-    # 在這條加進來之前，這個不變量在整個 tests/ 裡是**零自動化守衛**。
     dup = _page_dup_ids(html)
     assert not dup, f"同一頁出現重複的 id：{dup}"
 
@@ -5259,8 +5257,8 @@ def test_durable_anchor(tmp_path=None):
         assert _frag in html, f"{_why}那段 JS/CSS 不見了（行為請用 scripts/probe_anchor_js.js 驗）"
 
     # MD 側：兩個錨點並存，且 {#tN} 在**同一行的前面**（_TURN_HEAD_RE 靠它切回合）
-    # ⚠ 舊版寫 `md.index("{#t1}") < md.index("{#k…}")`，那驗的是**行序不是行內序**
-    # ：兩個標記分屬不同行時照樣成立，就算 render_turn_md 改成
+    # ⚠ 只驗 `md.index("{#t1}") < md.index("{#k…}")` 的話，驗的是**行序不是行內序**：
+    # 兩個標記分屬不同行時照樣成立，就算 render_turn_md 改成
     # 先印 k 錨點（那會直接打死 _TURN_HEAD_RE）也不會紅。要驗就驗同一行上的相對位置。
     assert "{#t1}" in md and f"{{#{base}}}" in md, "MD 應同時帶兩個錨點"
     both = [ln for ln in md.splitlines() if "{#t" in ln and f"{{#{base}}}" in ln]
@@ -5269,7 +5267,7 @@ def test_durable_anchor(tmp_path=None):
         assert ln.index("{#t") < ln.index(f"{{#{base}}}"), \
             f"同一行上 {{#tN}} 必須在耐久錨點之前（_TURN_HEAD_RE 靠它）：{ln!r}"
 
-    # 全文搜尋沒有被新錨點打壞（這一格擋過一次真的回歸）
+    # 全文搜尋沒有被新錨點打壞
     r2 = subprocess.run(
         [sys.executable, str(SCRIPT), "--search", "NORMALTURN", "--out", str(out)],
         capture_output=True, text=True, encoding="utf-8")
@@ -5286,7 +5284,7 @@ def test_anchor_tiebreak_main_vs_side(tmp_path=None):
 
     ⚠⚠ **這條保證只能講到測試守得住的範圍**：註解宣稱了某個保證、卻沒有任何測試在守它，
     這條保證就會被寫錯。
-    這條測試存在的意義就是：**下次再寫錯，它會紅。**
+    這條測試存在的意義就是：**寫錯時，它會紅。**
 
     為什麼是「主回合該贏」：子代理的轉錄檔是 `<sid>/**/*.jsonl`，它在主回合**之後**才落地
     （子代理是被主對話的 Task 呼叫起來的）。所以真實會發生的情境是
@@ -5479,8 +5477,8 @@ def test_bookmark_ui(tmp_path=None):
 
     ⚠ **素材必須用 `/rename`，不能用第一則使用者訊息。** 自動標題那條路
     `first_user_text()` 有一行 `re.sub(r"<[^>]+>", "", txt)` 會先把標籤剝掉，
-    拿它當素材的話 `js_embed()` 根本沒被執行到——**測試會綠，但綠得毫無意義**
-    （第一版就是這樣寫的）。`extract_rename()` **不剝標籤**，那才是真正沒有上游防護的路徑。
+    拿它當素材的話 `js_embed()` 根本沒被執行到——**測試會綠，但綠得毫無意義**。
+    `extract_rename()` **不剝標籤**，那才是真正沒有上游防護的路徑。
     """
     sys.path.insert(0, str(ROOT))
     tmp = new_tmp(tmp_path)
@@ -5563,11 +5561,11 @@ def test_bookmark_ui(tmp_path=None):
         ("function bkImport(", "匯入"),
         ("function bkAddMonths(", "複查日期（月份不可溢位）"),
         (".bmk{", "加書籤鈕的樣式"),
-        (".bm-chip{", "單選 chip 的樣式（⚠ 不是下拉：Will 2026-08-22）"),
+        (".bm-chip{", "單選 chip 的樣式（⚠ 不是下拉）"),
     ):
         assert frag in html, f"缺少{why}：`{frag}`"
     assert f'var BK_SID="{sid}"' in html, "BK_SID 應填成這一場的 session id"
-    assert "var BK_FALLBACK='6m'" in html, "提醒複查的預設值應為半年（Will 2026-08-22 裁決）"
+    assert "var BK_FALLBACK='6m'" in html, "提醒複查的預設值應為半年"
     # ⚠ 書籤記錄裡的 url 是**相對 out/ 的**：檔名含本地時間＋專案名，絕對路徑一旦寫進
     #   匯出的 JSON 就會帶著 `C:\\Users\\<名字>\\` 出門。
     mu = re.search(r'var BK_SID=.*?, BK_URL="([^"]*)"', html)
@@ -5576,7 +5574,7 @@ def test_bookmark_ui(tmp_path=None):
     assert ":" not in mu.group(1) and not mu.group(1).startswith("/"), \
         f"BK_URL 不可以是絕對路徑，實得 {mu.group(1)!r}"
 
-    # --- 3b. 索引頁的書籤圖示（Will 2026-08-22 追加）------------------------
+    # --- 3b. 索引頁的書籤圖示 ------------------------
     # ⚠ 一樣**只驗形狀**。行為（有書籤才亮、⏰、篩選、不可注入）用
     #   `python scripts/probe_bookmarks.py --index out/index.html`（真 Chrome，6 組 17 項）。
     # ⚠ 這一段**不需要升 RENDERER_VERSION**：index.html 每次執行都無條件重產，
@@ -5668,8 +5666,8 @@ def test_bookmark_block_anchors(tmp_path=None):
     # ⚠⚠ **不可以用第一次或最後一次出現。** session 標題取自第一則使用者訊息，於是
     # 「P4USER」會出現三次：`<title>`／`<h1>`（在所有 `.turn` **之前**）、對話本體，
     # 以及頁尾 `<script>` 裡的 `BK_TITLE`（在所有 `.turn` **之後**）。
-    # 第一版用 `rindex` 撈到的是頁尾那一個，於是往前找到的是**整頁最後一個** `.blk`
-    # ——斷言照跑，只是驗錯了對象（測試自己先示範了一次「安靜指錯」）。
+    # 用 `rindex` 撈到的是頁尾那一個，往前找到的會是**整頁最後一個** `.blk`
+    # ——斷言照跑，只是驗錯了對象。
     _body = html.index('<div class="turn')
 
     def _blk_of(mark):
@@ -5726,7 +5724,7 @@ def test_bookmark_block_anchors(tmp_path=None):
     assert re.match(r"^k\d{8}T\d{9}Z-b\d+$", mu.group(1)), \
         f"沒有步的回合，其區塊應走輪內序號（不帶 -s）：{mu.group(1)}"
 
-    # --- 3. 每個可標記區塊都要有自己的 ☆（Will 2026-08-23 裁決：文字段落也要）--
+    # --- 3. 每個可標記區塊都要有自己的 ☆（文字段落也要）--
     def _blk_full(mark):
         pos = html.index(mark, _body)
         j = html.rfind('<div class="blk"', 0, pos)
@@ -5750,7 +5748,7 @@ def test_bookmark_block_anchors(tmp_path=None):
     # --- 5. 步本身也要有錨點（退化階梯的中間那一階）------------------------
     # 區塊找不到 → 退到 `k…-s<epoch>` → 再退到 `k…`。沒有中間這階的話，
     # 一個 286 個區塊的回合裡，任何一次區塊漂移都會直接彈回整輪的最上面。
-    # ⚠ 要驗**完整的那一個 id**。第一版寫成 `'id="k' in html and f'-s{ep}"' in html`，
+    # ⚠ 要驗**完整的那一個 id**。寫成 `'id="k' in html and f'-s{ep}"' in html` 的話，
     # 前半對任何頁面都成立、後半也被區塊自己的 `-s…-b1` 滿足 ⇒ 就算完全不掛步錨點也全綠。
     for name in ("P4TXTA", "P4TXTB"):
         step_id = ids[name].split("-b")[0]          # k…-s<epoch>
@@ -5767,9 +5765,9 @@ def test_bookmark_block_anchors(tmp_path=None):
     # ⚠⚠ **為什麼不走整條管線**：第三條（步有、時戳沒有）在真實與合成語料上都造不出來
     # ——沒有 timestamp 的 assistant 事件會排到整個檔案的最前面，因而**自成一輪**、
     # 那一輪連 kanchor 都沒有，走的是「整輪沒錨點」那條既有的路（§4 已經在守）。
-    # 第一版就是這樣寫的，結果 M2／M9 兩個突變**全部漏掉**：斷言看起來很像在守這件事，
+    # 走整條管線的話，M2／M9 兩個突變會**全部漏掉**：斷言看起來很像在守這件事，
     # 其實素材根本到不了那個狀態。
-    # ⚠ 這裡**不是**把它降級成「沒有素材所以不驗」（教訓 34）——契約照驗，
+    # ⚠ 這裡**不是**把它降級成「沒有素材所以不驗」——契約照驗，
     # 只是驗在唯一到得了那個狀態的地方：函式本身。
     import ai_session_viewer as v4
     assert v4.block_anchor("kX", None, 3, False) == "kX-b3", \
@@ -5796,10 +5794,10 @@ def test_bookmark_block_anchors(tmp_path=None):
 
     # --- 7b. ⚠⚠ **第二個產出端**：步驟列的 id 也不可以吐出帶號的 `-s`---
     # 上面那幾條只對 `block_anchor()` 這個純函式下斷言，而 `-s<ep>` 有**兩個**產出端：
-    # 區塊錨點與**步驟列的 id**。第一版只修了前者 ⇒ 同一個 group 裡區塊錨點正確消失，
+    # 區塊錨點與**步驟列的 id**。只修前者的話 ⇒ 同一個 group 裡區塊錨點正確消失，
     # 步驟列卻照樣輸出 `k…-s-900`——那正是 `bmGrammarOk()` 會拒絕的形狀。
-    # ⚠ **這一格必須走 renderer**，不可以再對純函式下斷言：純函式那一層永遠看不到
-    # 第二個產出端，而「同一條規則寫在兩個地方」正是這個 repo 反覆吃虧的形狀。
+    # ⚠ **這一格必須走 renderer**，不可以對純函式下斷言：純函式那一層永遠看不到
+    # 第二個產出端，而「同一條規則寫在兩個地方」本來就是兩邊容易分岔的形狀。
     neg_group = {
         "kanchor": "k19691231T235959100Z",
         "role": "assistant",
@@ -5840,8 +5838,8 @@ def test_bookmark_block_anchors(tmp_path=None):
 def test_bookmark_block_anchor_same_second(tmp_path=None):
     """區塊錨點的步時戳**必須有毫秒**，而且同毫秒時整步不給錨點。
 
-    ⚠⚠ **為什麼會有這一支**：第一版的 `-s<步epoch>` 只有**秒**
-    （`_epoch()` 是 `math.floor`），而回合錨點保留毫秒、真撞號時還會加 `-tb<n>`。
+    ⚠⚠ **為什麼會有這一支**：`-s<步epoch>` 若只有**秒**
+    （`_epoch()` 是 `math.floor`；回合錨點則保留毫秒、真撞號時還會加 `-tb<n>`），
     同一輪裡兩次 API 呼叫落在同一秒 ⇒
       ① 兩個 `<div class="step-sep">` 共用一個 id（最高不變量：同頁 id 必須唯一）
       ② 兩步底下的區塊拿到**完全相同**的 `-s<ep>-b<n>`
@@ -5849,9 +5847,9 @@ def test_bookmark_block_anchor_same_second(tmp_path=None):
          跳回去時 `openSub()` 回 `false`（＝精確命中）、`.hl` 框在第一塊、
          **沒有橫幅、還改寫網址列** ＝ 這整套設計要消滅的「安靜指錯」。
 
-    ⚠⚠ **根因是把量測讀錯**：全語料量到「同輪內步時戳撞號 0/67876」就當成保證——
-    那是「還沒發生過」，不是「不會發生」。`durable_anchor()` 的註解隔壁就寫著
-    「只截到整秒，撞號會從 1 變 31」，同一份道理沒有套到步這一層。
+    ⚠⚠ **量到 0 次撞號不是保證**：全語料量到「同輪內步時戳撞號 0/67876」只代表
+    「還沒發生過」，不代表「不會發生」。`durable_anchor()` 的註解隔壁就寫著
+    「只截到整秒，撞號會從 1 變 31」，同一份道理也適用於步這一層。
 
     ⚠ **毫秒也不是保證**（回合層實測 9047 輪撞 1 次），所以第二節那條底線也要有人守：
     同一輪內 `tms` 重複的那些步，**整步的區塊一律不給錨點**——走 `block_anchor()`
@@ -5936,7 +5934,7 @@ def test_tmp_base_env(tmp_path=None):
     在 codex 的 `workspace-write` 沙箱下，`tempfile.mkdtemp()` 建出來的目錄
     **連根目錄都寫不進去**（2026-08-23 實測），而本套件每一支都要建 `projects/<專案>/`
     ⇒ 整套一行斷言都跑不到就死掉，reviewer 於是**靜默降級成純讀碼**。
-    這個 repo 為此賠過兩輪額度。有了這個環境變數，charter 只要加一行就能讓它真的跑測試。
+    有了這個環境變數，charter 只要加一行就能讓它真的跑測試。
 
     ⚠ 所以這一格壞掉的後果是**看不見的**：本機永遠全綠（沒設那個變數），
     只有在沙箱裡才會退回 `mkdtemp()` 然後整套死掉——而那時候沒有人在看這一格。
@@ -5960,8 +5958,8 @@ def test_tmp_base_env(tmp_path=None):
         #
         # 上面那幾行在**本機**永遠會過，不管 `new_tmp()` 內部走的是 `mkdtemp()` 還是
         # `mkdir()`——因為本機沒有沙箱，兩條路都寫得進去。於是「已經解掉了」這個結論
-        # 在本機**無法被否證**，而實際上沒解：`new_tmp()` 當時仍是 `mkdtemp(dir=base)`，
-        # 跨模型輪照樣整套死在 `WinError 5`，只是死在 `work\tmpXXXX\projects` 而不是
+        # 在本機**無法被否證**：`new_tmp()` 若仍是 `mkdtemp(dir=base)`，沙箱裡照樣整套
+        # 死在 `WinError 5`，只是死在 `work\tmpXXXX\projects` 而不是
         # `mkdtemp()` 的預設位置。**換了地點，沒換機制。**
         #
         # 成因：`mkdtemp()` 建目錄時會鎖權限（Windows 上是受限的 DACL），
@@ -6024,7 +6022,7 @@ def test_bookmark_manage_pages(tmp_path=None):
     1. **`</script>` 破出**——管理頁把**每一場的標題**烤進 `BX_SESS`。標題是對話內容，
        一句 `</script>` 就能截斷整段 JS，而畫面上完全看不出來。守它的是 `js_embed()`。
        （素材必須用 `/rename`：自動標題那條路 `first_user_text()` 會先剝標籤，
-       拿它當素材等於沒測到——第 2 期就是這樣寫錯過一次。）
+       拿它當素材等於沒測到。）
     2. **管理頁的相對路徑真的走得到**——`BK_MGR` 的層數算錯是無聲的：
        頁面照樣產得出來，只是那個連結 404。這裡用 `Path.resolve()` 實際解一次，
        不是比字串。
@@ -6066,7 +6064,7 @@ def test_bookmark_manage_pages(tmp_path=None):
     # ——那是全域最遠的一對，也是 file:// origin 規則最可能出問題的地方。
     assert mgr_p.exists(), f"書籤管理頁應產在 {mgr_p}"
     assert set_p.exists(), f"設定頁應產在 {set_p}"
-    assert not (out / "bookmarks.html").exists(), "⚠ 管理頁不可以放 out/ 根（見提案〈B〉）"
+    assert not (out / "bookmarks.html").exists(), "⚠ 管理頁不可以放 out/ 根"
     assert not (out / "settings.html").exists(), "⚠ 設定頁不可以放 out/ 根"
     mgr = mgr_p.read_text(encoding="utf-8")
     st = set_p.read_text(encoding="utf-8")
@@ -6126,7 +6124,7 @@ def test_bookmark_manage_pages(tmp_path=None):
     # --- 6. 管理頁與設定頁的骨架 -------------------------------------------
     for frag, why in (
         ('id="bxList"', "書籤清單（內容由 JS 填，建置期不可能知道書籤）"),
-        ('id="bxDue"', "⚠ 「⏰ 只看該複查的」篩選（Will 明講一定要有）"),
+        ('id="bxDue"', "⚠ 「⏰ 只看該複查的」篩選（一定要有）"),
         ('id="bxCats"', "類別篩選 chip"),
         ('id="bxQ"', "搜尋框"),
         ('id="bxSorts"', "排序"),
@@ -6145,14 +6143,14 @@ def test_bookmark_manage_pages(tmp_path=None):
     ):
         assert frag in st, f"設定頁缺少{why}：`{frag}`"
     assert "<select" not in mgr and "<select" not in st, \
-        "⚠ 不要下拉（Will：「下拉使用上比較不方便」）——單選一律用 chip"
+        "⚠ 不要下拉（使用上比較不方便）——單選一律用 chip"
 
     # --- 7. session 頁的類別改成 chip（不可以還留著 datalist）---------------
     assert 'id="bkCats"' in page, "加書籤對話窗的類別 chip 容器"
     assert "bkCatNew(" in page and "＋ 新類別" in page.replace("\\uff0b", "＋"), \
         "⚠ 要有「＋ 新類別」就地新增（不可以退化成只能從設定頁選）"
     assert "list=\"bkCats\"" not in page and "<datalist" not in page, \
-        "⚠ 第 2 期的 datalist 要整個拿掉，不可以兩套控制項並存"
+        "⚠ datalist 要整個拿掉，不可以兩套控制項並存"
 
     # --- 8. 再建一次：兩頁要還在，且既有 session 頁要沿用 -------------------
     # ⚠⚠ **這一格證明的是「重建兩次之後兩頁還在」，不是「清孤兒檔那段不會吃掉它們」。**
@@ -6245,7 +6243,6 @@ def test_bookmark_link_durability(tmp_path=None):
     # 這是整條線最核心的那句話：「檔名會變，所以身分不綁檔名」。
     # ⚠ 真正的「改專案名」是**夾名與 cwd 一起變**——顯示名是從 `cwd` 推出來的
     #   （`build_project_names`），只改夾名的話檔名根本不會動，這一格就會在守空氣。
-    #   第一版就是那樣寫的，被下面那條「檔名真的變了嗎」擋下來。
     (root / "Alpha").rename(root / "Alpha-renamed")
     jf = root / "Alpha-renamed" / f"{ids['Alpha']}.jsonl"
     jf.write_text(jf.read_text(encoding="utf-8").replace('"/x/Alpha"', '"/x/Alpha-renamed"'),
@@ -6445,7 +6442,7 @@ def test_bookmark_account_label_rebuild(tmp_path=None):
 
     ⚠ 這一支的存在理由：`reusable` 裡
     `row.get("account","") == (acc_name or "")` **真的在做事**（拿掉它 `BX_SESS` 會指到
-    舊帳號目錄），但當時**整份 `test_smoke.py` 拿掉它仍然全綠**——那是一條確定存在的空心。
+    舊帳號目錄），而沒有這一支時，**整份 `test_smoke.py` 拿掉它仍然全綠**——那是一條確定存在的空心。
 
     ⚠ 兩件都要驗，缺一件就沒有承重：
       ①**素材真的生效過**（第一次建置時反查表指的是 `demo/`）；
@@ -6506,7 +6503,7 @@ def test_bookmark_all_sources_deleted(tmp_path=None):
     所以最極端的那一格反而不會執行：舊 manifest、書籤管理頁的 `BX_SESS`、索引頁
     全部原封不動留著，連結指向已經不存在的檔。
     （`test_bookmark_deleted_source_pruned` 只做
-    「兩場刪成一場」，2→0 那一格一直沒有素材走到 ⇒ 教訓 29。）
+    「兩場刪成一場」，2→0 那一格沒有素材走到。）
 
     ⚠ 同時要驗**反過來的保守面**：一個來源根都沒掃到時（`--no-claude --no-codex`）
     **什麼都不要動**——那不是「東西被刪了」，是「這次沒有去看」。
@@ -6570,7 +6567,6 @@ def test_zero_scan_keeps_out_of_scope_index(tmp_path=None):
     正常路徑用的是 `new_entries` 算出來的 rows，縮範圍時本來就會把範圍外那些一起畫。
     兩條路不一致的結果是：manifest 說有一場、`BX_SESS` 還指著它、HTML 檔還在磁碟上，
     **只有索引頁說一場都沒有**。
-    ⚠ 改之前這裡是直接 `return`、索引不會被動到，所以這是「零場也要對帳」那批**新造出來的**。
 
     ⚠ 三件都要驗：
       ①**素材真的生效過**（A＋B 兩場都在索引裡）；
@@ -6635,13 +6631,13 @@ def test_zero_scan_keeps_out_of_scope_index(tmp_path=None):
 def test_zero_scan_keeps_cache_report_links(tmp_path=None):
     """⚠⚠ **零場對帳那條路也不可以寫死 `cache_report=False, codex_report=False`。**
 
-    上一條（`test_zero_scan_keeps_out_of_scope_index`）修好的是同一個呼叫的**第一個**參數
-    （rows 改從 `new_entries` 算）；第三、四個參數當時還是寫死的 `False, False`
+    上一條（`test_zero_scan_keeps_out_of_scope_index`）守的是同一個呼叫的**第一個**參數
+    （rows 從 `new_entries` 算）；第三、四個參數若寫死成 `False, False`
     ⇒ 零場建置之後 `cache-report.html` / `cache-hypotheses.html` **檔案都還在磁碟上**，
     索引頁卻不再連到它們。**和上一條是同一個形狀**（用寫死的值取代對帳出來的狀態），
     只是換到隔壁兩個參數。
 
-    ⚠ 這一支只守「連結還在」這一件事（教訓 37：一格只守一件事）。
+    ⚠ 這一支只守「連結還在」這一件事（一格只守一件事）。
     ⚠ 前置要驗：素材真的產得出報告，否則兩次都是 False 也會通過。
     """
     tmp = new_tmp(tmp_path)
@@ -6698,7 +6694,7 @@ def test_no_uppercase_unicode_escape_in_js(tmp_path=None):
     那四大段書籤 JS 是 Python 的 `r'''...'''` 常數，裡面寫的東西**原樣進 `<script>`**。
     Python 的 `chr(92)+"U0001f516"` 在非 raw 字串裡是 🔖，在 raw 字串裡卻是十個字元；
     而 JS 看到它會把反斜線丟掉，於是頁面上出現的是那串**字面**，不是圖示。
-    實際踩到：管理頁連結、頂列書籤鈕、設定頁刪除鈕、索引頁書籤圖示，**四處全中**，
+    受影響的有：管理頁連結、頂列書籤鈕、設定頁刪除鈕、索引頁書籤圖示，**四處全中**，
     而且四支形狀測試與四個模式的探針**沒有一個會紅**（它們比對的是 id 與類別名）。
 
     ⚠ 這一支掃的是**產出來的頁面**，不是原始碼：真正會被使用者看到的是前者。
@@ -6760,7 +6756,7 @@ def test_user_turn_fidelity(tmp_path=None):
     SENT_TAIL = "這一句插在那一輪最後QUEUEDTAIL。"   # 後面沒有步驟 ⇒ 走回合結尾那道關閉
     DROPPED = "這一句被我撤回了QUEUEDDROPPED。"
     # ⚠ 拼接：這個字串是本測試要驗「不可以照原樣畫出來」的東西，
-    #    寫成字面會讓掃描類的斷言掃到測試自己（教訓 15）。
+    #    寫成字面會讓掃描類的斷言掃到測試自己。
     NTAG = "task-" + "notification"
     NOTIFY = (f"<{NTAG}>\n<task-id>bq7x</task-id>\n"
               "<summary>Background command NOTIFYSUMMARY completed</summary>\n"
@@ -6845,8 +6841,7 @@ def test_user_turn_fidelity(tmp_path=None):
                      "content": [{"type": "text", "text": "再下一步IJSTEPTWO。"}]}},
         # 第二次插話，而且**它後面沒有步驟了**（下一則是通知，會關掉這一輪）。
         # ⚠⚠ 沒有這一則，`render_turn_html` 結尾那道「還開著就收」的關閉標籤是**死碼**
-        # ——縮排框永遠在下一個步驟就收掉了，漏收 `</div>` 不會有任何斷言變紅
-        # （突變檢驗第一輪就是這樣漏掉 ⑯ 的）。
+        # ——縮排框永遠在下一個步驟就收掉了，漏收 `</div>` 不會有任何斷言變紅。
         {"type": "attachment", "uuid": "f2d", "timestamp": "2026-07-24T03:00:30.000Z",
          "sessionId": sid,
          "attachment": {"type": "queued_command", "prompt": SENT_TAIL,
@@ -6868,8 +6863,7 @@ def test_user_turn_fidelity(tmp_path=None):
          "timestamp": "2026-07-24T03:00:12.000Z", "sessionId": sid, "content": DROPPED},
         # --- ① 反例其二：**系統注入的**通知也走 queued_command ＋ remove -------
         # ⚠⚠ 它和人打的提示詞唯一的差別就是 `origin.kind`（它沒有）。
-        # 不看那一欄的話，全語料會多冒出 143 列幻影通知，而**上面每一條斷言都照樣綠**
-        # （突變檢驗第一輪就是這樣漏掉這一格的）。
+        # 不看那一欄的話，全語料會多冒出 143 列幻影通知，而**上面每一條斷言都照樣綠**。
         {"type": "attachment", "uuid": "f4b", "timestamp": "2026-07-24T03:00:13.000Z",
          "sessionId": sid,
          "attachment": {"type": "queued_command", "commandMode": "task-notification",
@@ -6914,7 +6908,7 @@ def test_user_turn_fidelity(tmp_path=None):
                      "\x00\x08NULMARK"
                      # ⚠⚠ DCS（`ESC P … ESC \`）：只剝引導字元的話 **payload 會留下來**。
                      "\x1bPDCSPAYLOAD\x1b\\DCSMARK"
-                     # ⚠⚠ **裸的 C1**（`\x80`–`\x9f`）：第一版的 `_CTRL_RE` 只到 `\x7f`。
+                     # ⚠⚠ **裸的 C1**（`\x80`–`\x9f`）：`_CTRL_RE` 只到 `\x7f` 的話剝不掉。
                      "\x80\x91\x99C1MARK"
                      "</local-command-stdout>"}},
         {"type": "assistant", "uuid": "f8", "parentUuid": "f7",
@@ -6940,7 +6934,7 @@ def test_user_turn_fidelity(tmp_path=None):
         # --- ③-b 指令的**第二種存法**：`type:system, subtype:local_command` ---------
         # ⚠⚠ 兩種存法**並存**（不是版本遷移）：全語料 `type:user` 575 則、
         # `system/local_command` 345 則（`/context`／`/status`／`/rename`／**`/rc`**…）。
-        # 只做前者＝只做到 62.5%，而 Will 驗收時第一個開的 session 用的正是 `/rc`。
+        # 只做前者＝只做到 62.5%。
         {"type": "system", "subtype": "local_command", "uuid": "f9c",
          "timestamp": "2026-07-24T03:12:40.000Z", "sessionId": sid, "isMeta": False,
          "content": "<command-name>/remote-control</command-name>\n"
@@ -7032,13 +7026,13 @@ def test_user_turn_fidelity(tmp_path=None):
                      "content": [{"type": "text", "text": "回第二輪那一句AFTERMID2。"}]}},
 
         # --- ①-g ⚠⚠ **只貼了圖、一個字都沒打**的排隊句 -------------------------
-        # 修之前它**整則不出現**：文字是空字串 ⇒ 兩道守衛各擋一次（`if p:` 與
-        # `if not c:`）⇒ 使用者真的送出去的東西在頁面上完全沒有痕跡。
+        # 文字是空字串 ⇒ 若被兩道守衛各擋一次（`if p:` 與
+        # `if not c:`），這一則就**整則不出現** ⇒ 使用者真的送出去的東西在頁面上完全沒有痕跡。
         # CLI 寫的 `prompt` 是「空的 text block ＋ 圖片」，`remove.content` 是**空字串**
         # （⚠ 不是整欄不見——那是另一回事，配對規則見產品碼註解）。
         # ⚠⚠ **位置刻意排在整場最後**：放進「插話 → 第一段 → 再下一段」那段素材中間，
         #   會讓突變 ⑱（B 改成 A）兩種畫法同形 ⇒ 那一格從「抓到」變「漏掉」。
-        #   素材決定走到哪（`notes/突變檢驗.md` §2）。
+        #   素材決定走到哪。
         {"type": "attachment", "uuid": "f19", "timestamp": "2026-07-24T03:16:30.000Z",
          "sessionId": sid,
          "attachment": {"type": "queued_command",
@@ -7062,7 +7056,7 @@ def test_user_turn_fidelity(tmp_path=None):
     assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
     # ⚠⚠ **不可以直接 `[0]`。** 分析這一場時丟了例外的話，現在的行為是「印一行、跳過
     # 這一場」（退出碼仍是 0）⇒ 一個頁面都沒有 ⇒ 死在 `IndexError`，看不出發生什麼事。
-    # 突變檢驗實測過這個形狀：那種紅**不算守衛**（教訓 60）——紅的理由是產品崩了，
+    # 那種紅**不算守衛**——紅的理由是產品崩了，
     # 不是它宣稱守的那件事。把 stderr 帶進訊息裡，紅因才看得出來。
     _pages = list(_session_pages(out))
     assert _pages, ("這一場沒有產出任何頁面——多半是分析時丟了例外、那一場被跳過了。\n"
@@ -7083,7 +7077,7 @@ def test_user_turn_fidelity(tmp_path=None):
         "不可以補成 user 回合")
     assert "中途插話" in html, "要看得出來這是助手工作到一半時插進來的"
     # ⚠⚠ MD 有**兩條各自獨立的路**，要分開驗——只驗「md 裡有沒有『中途插話』」的話，
-    # 拿掉任何一條，另一條都會讓斷言照樣綠（突變檢驗第一輪就是這樣漏掉 ⑭ 的）：
+    # 拿掉任何一條，另一條都會讓斷言照樣綠：
     #   ① 回合內部的插話 → `> **👤 你 · 中途插話…**` 引用塊
     #   ② 真跨輪的那一種 → `###` 標頭上的 `· ⏳ 中途插話（… 送出）`
     _mdl = md.splitlines()
@@ -7097,7 +7091,7 @@ def test_user_turn_fidelity(tmp_path=None):
     # 當成獨立 user 回合＝把一輪切成兩輪，畫面上變成「助手講完 → 使用者說話 →
     # 助手開新的一輪」，那是假的。
     assert 'class="ijbox"' in html, "同一輪之內的插話要畫成子框"
-    assert 'class="ijafter"' in html, "插話後的第一段回應要縮排（Will 從三種畫法挑的 B）"
+    assert 'class="ijafter"' in html, "插話後的第一段回應要縮排（B 畫法）"
     import ai_session_viewer as v
     s = v.load_session(proj / f"{sid}.jsonl", "demo-proj", "demo", v.SOURCE_CLAUDE)
     v.analyze(s)
@@ -7112,7 +7106,7 @@ def test_user_turn_fidelity(tmp_path=None):
                                                for b in g["blocks"])
                    for g in s.main_groups), "插話不可以同時又變成一個獨立的 user 回合"
     # ⚠⚠ **空的「↳ 回應這句」框不可以存在。** 插話是那一輪最後一個區塊時
-    # （他打完字、助手沒有再回任何東西），舊版照樣開框 ⇒ 框頭在說謊。
+    # （他打完字、助手沒有再回任何東西），照樣開框的話 ⇒ 框頭在說謊。
     # ⚠ 這一格和「div 平衡」是**兩件事**：撤掉開啟標籤與補上關閉標籤，div 數都會平衡，
     #   所以只驗平衡的話，把 `_close_ij()` 的 `parts.pop()` 關掉不會有任何一格變紅。
     assert '<div class="ijafter"><div class="ijafterhead">↳ 回應這句</div></div>' not in html, (
@@ -7122,7 +7116,7 @@ def test_user_turn_fidelity(tmp_path=None):
         f"頁面 div 沒有平衡（<div {html.count('<div')} / </div> {html.count('</div>')}）"
         "——`.ijafter` 的關閉標籤漏了")
 
-    # ⚠⚠ **範圍必須是「只縮第一段回應」**（Will 挑的 B，不是 A）。
+    # ⚠⚠ **範圍必須是「只縮第一段回應」**（B，不是 A）。
     # 掃 div 巢狀深度找出 `.ijafter` 真正的結束位置，再看誰在裡面、誰在外面。
     # 少了這一格，B 和 A 的產出在「插話後只有 0～1 個步驟」時完全同形，
     # 這個測試就會對「改成縮到那一輪結束」毫無反應。
@@ -7145,7 +7139,7 @@ def test_user_turn_fidelity(tmp_path=None):
     _inside = html[_s:_end]
     assert "IJSTEPONE" in _inside, "插話後的第一段回應要在縮排框**裡面**"
     assert "IJSTEPTWO" not in _inside, (
-        "再下一步要在縮排框**外面**——選的是 B（只縮第一段），不是 A（縮到那一輪結束）")
+        "再下一步要在縮排框**外面**——只縮第一段（B），不是縮到那一輪結束（A）")
 
     # --- ⚠⚠ 插話**不可以佔區塊序號**（既有區塊書籤逐字不變的唯一機械保證）------
     # 它被插進 blocks 中間；一旦算成可標記區塊，**同一步內它後面每一個區塊的序號 +1**
@@ -7190,7 +7184,7 @@ def test_user_turn_fidelity(tmp_path=None):
         f"實得 {html.count('img class=' + chr(34) + 'msg-img' + chr(34))} 張。"
         "若看到「資料無效／過大／格式不支援」佔位，那是素材的 base64 有問題")
     # ⚠ 比對的是 `class="img-ph"` 不是 `img-ph`：頁面的 CSS 裡本來就有 `.img-ph` 規則，
-    #   只找後者的話這一格**永遠是紅的**（第一版就是這樣）。
+    #   只找後者的話這一格**永遠是紅的**。
     assert 'class="img-ph"' not in html, (
         "圖片畫成了佔位（資料無效／過大／格式不支援），不是真的內嵌——"
         "這一格若鬆掉，上面那條 `<img>` 計數會驗到另一件事")
@@ -7239,7 +7233,7 @@ def test_user_turn_fidelity(tmp_path=None):
     assert "DCSMARK" in html, "DCS 那一則沒有畫出來，下面那格就沒有素材"
     assert "DCSPAYLOAD" not in html, (
         "DCS（ESC P … ESC \\）的 payload 留在頁面上了——控制字串要連內容一起吃掉")
-    # ⚠⚠ **裸的 C1**（`\x80`–`\x9f`）：舊素材只有 OSC／NUL／BS，於是 `_CTRL_RE` 的
+    # ⚠⚠ **裸的 C1**（`\x80`–`\x9f`）：素材只有 OSC／NUL／BS 的話，`_CTRL_RE` 的
     #   範圍只寫到 `\x7f` 也全綠。突變 ⑥b 是把整條規則關掉，抓不到這種「只漏幾個」。
     assert "C1MARK" in html, "C1 那一則沒有畫出來，下面那格就沒有素材"
     _c1 = [hex(ord(ch)) for ch in html if 0x80 <= ord(ch) <= 0x9f]
@@ -7256,8 +7250,8 @@ def test_user_turn_fidelity(tmp_path=None):
     # --- ①-b ⚠⚠ 中間隔著助手發言的同時戳輸出**不可以**併回前面那一列指令 --------
     # 素材：`/usage-credits`（03:14:00）→ 助手「BETWEEN」（03:14:00）→ 輸出（03:14:00）。
     # 三者同時戳，所以「時間戳相同就併」會跨過中間的發言。
-    # ⚠ 這一格守的是 `併回` 那段的 `cur is None`——先前被標成「已知到不了」，
-    #   是**素材沒走到**，不是結構上不可達。
+    # ⚠ 這一格守的是 `併回` 那段的 `cur is None`——它**不是結構上不可達**，
+    #   走不到只是**素材沒走到**。
     # ⚠⚠ **必須排在下面那條「幾列指令」的斷言前面**：兩者都會因為同一個突變變紅，
     #   而先紅的那一條決定了突變檢驗看到的紅因。數量那條講不出「錯在哪」。
     _credits = [b for g in s.main_groups for b in g["blocks"]
@@ -7288,7 +7282,7 @@ def test_user_turn_fidelity(tmp_path=None):
                 if any(b.get("type") == "_notify" and not b.get("inline")
                        for b in g["blocks"])]
     # ⚠⚠ 指令有**兩種存法**：`type:user`（`/effort`）與 `system/local_command`（`/remote-control`）。
-    # 只驗一種的話，另一種整批消失也不會有任何一格變紅（Will 驗收時就是這樣抓到 `/rc` 不見的）。
+    # 只驗一種的話，另一種整批消失也不會有任何一格變紅。
     assert "/remote-control" in html, (
         "存在 `system/local_command` 的指令也要畫出來——那是指令的另一半存法，"
         "`/context`／`/status`／`/rename`／`/rc` 都走這條")
@@ -7304,10 +7298,10 @@ def test_user_turn_fidelity(tmp_path=None):
                                      if b.get("type") == "_command"]) == 1, (
         "③-c 併不回去的那一則輸出應該掛在開著的 assistant 回合內部，"
         f"實得 {[(g['role'], sum(1 for b in g['blocks'] if b.get('type') == '_command')) for g in cmd_rows]}")
-    # ⚠ 這裡原本還有一條「不可以有 blocks 為空的 user 回合」——那是**恆真**的：
+    # ⚠ 這裡不放「不可以有 blocks 為空的 user 回合」這條——那是**恆真**的：
     # `group_turns` 建 user 回合的兩條路徑，一條要求 `special` 非空、另一條要求
     # `blocks` 非空，所以那種回合**不可能存在**。它名義上要守的事其實是被下面
-    # 兩條守住的（M1 突變確實紅在 `len(cmd_rows)`）。恆真的斷言＝裝飾品，已刪。
+    # 兩條守住的（M1 突變確實紅在 `len(cmd_rows)`）。恆真的斷言＝裝飾品。
     assert all(any(b.get("name") or b.get("args") or b.get("out")
                    for b in g["blocks"] if b.get("type") == "_command")
                for g in cmd_rows), "三格全空的指令列不該存在（它畫不出東西卻佔一個回合）"
@@ -7335,7 +7329,7 @@ def test_user_turn_fidelity(tmp_path=None):
 
     # --- 標題：指令與通知都不可以變成 session 標題 ---------------------------
     # ⚠ 素材的**第一則就是 `/context`** ⇒ 這一格真的走到 `first_user_text()` 那道守衛。
-    # （原本第一則是真提問，標題本來就對，那道守衛是死斷言、突變不會紅。）
+    # （第一則若是真提問，標題本來就對，那道守衛就是死斷言、突變不會紅。）
     assert "FIRSTASK" in s.title, f"標題應取第一句真正的提問，實得 {s.title!r}"
     assert "/context" not in s.title and "/effort" not in s.title \
         and "task-id" not in s.title, "指令與通知都不是使用者在講的事，不可以當標題"
@@ -7377,7 +7371,7 @@ def test_user_turn_fidelity(tmp_path=None):
 
     # --- ①-e ⚠⚠ 排隊句配對的兩個最小反例（**函式層**，只驗 `synth_queued_user_events`）
     # 兩者都要有一格在守：
-    # **產品修對了、但沒有測試守的話**，退回舊寫法測試照樣全綠。
+    # **沒有測試守的話**，產品碼對這兩個形狀處理錯了，測試照樣全綠。
     # ⚠ 走函式層是刻意的：這兩個形狀要控制 `_srcf` 與事件行序，用整個 CLI 造很囉唆，
     #   而要守的東西就在這一支函式裡。
     def _qev(i, srcf, **kw):
@@ -7424,8 +7418,8 @@ def test_user_turn_fidelity(tmp_path=None):
         "配對的鍵一定要帶來源檔")
 
     # --- ①-f ⚠⚠ **`prompt` 是 block 陣列**：排隊送出時**貼了圖片**的那一種。
-    # 修之前這一格不是「畫錯」，是**整支工具當場崩掉**
-    # （`AttributeError: 'list' object has no attribute 'strip'`——2026-09-01 同事回報，
+    # 處理不好的後果不是「畫錯」，是**整支工具當場崩掉**
+    # （`AttributeError: 'list' object has no attribute 'strip'`，
     #  321 個 session 檔一個頁面都沒產出）。本機語料 588 則全是字串 ⇒ **只有合成素材守得到**。
     # ⚠ `queue-operation` 那半**仍然是字串**：CLI 只在佇列項的值是字串時才記 `content`，
     #   而貼上的圖片是另一欄帶的 ⇒ 文字對得上、這一句補得回來。
@@ -7447,7 +7441,7 @@ def test_user_turn_fidelity(tmp_path=None):
     _gotb = v.synth_queued_user_events(_blocks)
     assert len(_gotb) == 1, (
         "⚠⚠ `prompt` 是 block 陣列的排隊句沒有被補回來（實得 "
-        f"{len(_gotb)} 則）——修之前這裡是 AttributeError，整支工具崩在這一行")
+        f"{len(_gotb)} 則）——處理不好時這裡是 AttributeError，整支工具崩在這一行")
     # ⚠ 補出來的內容＝「文字 block ＋ 圖片 block」，和真的 user 事件貼圖時同形。
     _cb = _gotb[0]["message"]["content"]
     assert isinstance(_cb, list) and [b.get("type") for b in _cb] == ["text", "image"], (
@@ -7465,7 +7459,7 @@ def test_user_turn_fidelity(tmp_path=None):
         "圖片的 base64 被當成文字了")
 
     # --- ①-g ⚠⚠ **只貼圖、一個字都沒打**：文字是空字串，`remove.content` 也是空字串。
-    # 修之前這一則**整則不出現**（`if p:` 擋掉、`if not c:` 又擋掉一次）。
+    # 若被 `if p:` 擋掉、`if not c:` 又擋掉一次，這一則**整則不出現**。
     _only = [
         _qev(0, "", type="attachment", timestamp="2026-08-25T13:00:00.000Z",
              attachment={"type": "queued_command",
@@ -7497,9 +7491,9 @@ def test_user_turn_fidelity(tmp_path=None):
         "「整欄不存在」和「空字串」是兩件事")
 
     # --- ①-h ⚠⚠ **崩潰不可以被換成靜默**：`prompt` 形狀認不得時要出聲 ---------
-    # 修掉 `AttributeError` 之後，`prompt` 漂成 dict／數字／list of str 時三條路都回空
+    # 只把 `AttributeError` 擋掉的話，`prompt` 漂成 dict／數字／list of str 時三條路都回空
     # ⇒ 這一則排隊句連 `human` 都進不去、頁面上又變回「答案在、問題不在」。
-    # ⚠ Codex 那一側有 13 條這種漂移哨兵，Claude 這一側先前一條都沒有。
+    # ⚠ Codex 那一側有 13 條這種漂移哨兵，Claude 這一側也要有。
     import contextlib as _ctx
     for _bad_prompt, _tag in (({"text": "hi"}, "dict"), (42, "int"), (["hi"], "list of str"),
                               # ⚠ `type` 對得上、但 `text` 欄搬走了
@@ -7602,16 +7596,16 @@ def test_user_turn_fidelity(tmp_path=None):
 def test_codex_sentinel_false_alarms(tmp_path=None):
     """兩個哨兵**不可以對完全正常的資料出聲**，但真的漏收仍然要出聲。
 
-    來源：同事 2026-09-01 的四個 rollout。工具跑完了、頁面也產出了，但 stderr 吵了四行，
-    四行**全部是誤報**：
+    下面兩種哨兵訊息對完全正常的資料都是**誤報**
+    （工具跑完了、頁面也產出了，stderr 卻吵起來）：
 
     | 哨兵 | 它以為 | 實際上 |
     |---|---|---|
-    | 「N 則助理訊息有 content 卻抽不出文字」×3 | 承載文字的元素型別改名了 | `[{"type":"output_text","text":""}]`——**型別沒改名、欄位也在，就是那一則沒有話講**（`phase=commentary`／`final_answer`）|
-    | 「N 個回合開始了卻沒收到任何使用者 prompt」×1 | 使用者那一側有東西沒解析出來 | 兩個窗都是**系統自己起的**：一個自動壓縮（外層 `compacted` ＋ `context_compacted`）、一個壓縮失敗（只留一個 `error`）|
+    | 「N 則助理訊息有 content 卻抽不出文字」 | 承載文字的元素型別改名了 | `[{"type":"output_text","text":""}]`——**型別沒改名、欄位也在，就是那一則沒有話講**（`phase=commentary`／`final_answer`）|
+    | 「N 個回合開始了卻沒收到任何使用者 prompt」 | 使用者那一側有東西沒解析出來 | 兩個窗都是**系統自己起的**：一個自動壓縮（外層 `compacted` ＋ `context_compacted`）、一個壓縮失敗（只留一個 `error`）|
 
     ⚠⚠ **這兩格在本機語料上永遠是 0**（565 份 rollout、729 個回合窗裡零個空窗），
-    所以「實測 0 誤報」那句話在這台機器上是恆真的，什麼都沒證明——**教訓 44 的又一次應驗**。
+    所以「實測 0 誤報」那句話在這台機器上是恆真的，什麼都沒證明。
 
     ⚠ 誤報比漏報更貴：這幾條哨兵的全部價值在「它一出聲就是真的」，
     對正常資料吵一次，下次真的漂移時就沒有人會讀那一行。
@@ -7692,7 +7686,7 @@ def test_codex_sentinel_false_alarms(tmp_path=None):
     assert "回合開始了卻沒收到" not in err, (
         f"自動壓縮那一輪是系統自己起的，沒有 prompt 是正常的。實得：{err!r}")
     # ⚠ 同一件事的**收尾那次計數**：壓縮窗排在檔尾。兩處各改各的，只驗中間那格會漏一半
-    #   （突變檢驗實測：㉜b 從「抓到」變「漏掉」）。
+    #   （沒有檔尾這一格，突變 ㉜b 就抓不到）。
     _n, err = run(compact_mid[:-4], "compacttail")
     assert "回合開始了卻沒收到" not in err, (
         f"壓縮窗排在檔尾時，收尾那一次計數也要認得它。實得：{err!r}")
@@ -7988,15 +7982,15 @@ def test_codex_sentinel_false_alarms(tmp_path=None):
 def test_one_bad_session_does_not_kill_batch(tmp_path=None):
     """⚠⚠ **一場壞掉不可以拖垮整批**：那一場跳過、其餘照產，而且要出聲。
 
-    2026-09-01 同事回報的真實形狀：`queued_command.prompt` 是 block 陣列時
-    `synth_queued_user_events()` 丟 `AttributeError`，而 `main()` 那一層**沒有接**
+    例如 `queued_command.prompt` 是 block 陣列時 `synth_queued_user_events()` 丟
+    `AttributeError`，而 `main()` 那一層若**沒有接**
     ⇒ **321 個來源檔一個頁面都沒產出**、退出碼非 0。
-    那個崩潰本身已經修掉（`test_user_turn_fidelity` ①-f 在守），
+    那個具體的崩潰由 `test_user_turn_fidelity` ①-f 守，
     **這一格守的是下一個還沒被發現的崩潰**。
 
     ⚠⚠ **刻意用「注入例外」而不是找一筆真的會崩的素材**：真素材一旦被修好，
-    這一格就會安靜地不再驗到任何東西、而測試照樣全綠——那正是這個 repo 反覆踩到的
-    假綠形狀。注入的例外不會被修掉。
+    這一格就會安靜地不再驗到任何東西、而測試照樣全綠——那是假綠的形狀。
+    注入的例外不會被修掉。
 
     三件事一起驗（少一件就不算守住）：
     ① 退出碼 0、好的那場**真的有產出**；② 壞的那場**沒有**留下半截頁面；
@@ -8033,8 +8027,7 @@ def test_one_bad_session_does_not_kill_batch(tmp_path=None):
 
     # 在子行程裡把 `analyze` 換成「遇到那一場就丟例外」，其餘照原本走。
     # ⚠⚠ **三個注入點各驗一次。** 壞掉的那一場有三條路會走到同一個處理器
-    #   （解析／分析／渲染），先前只有分析那一條被守著，於是「回填舊 row」只做了三分之一
-    #   ——解析、分析、渲染三條都要守。
+    #   （解析／分析／渲染），三條都要守；只守分析那一條的話，「回填舊 row」就只做到三分之一。
     def code_of(outdir, inject="analyze", extra=()):
         head = (
             "import sys\n"
@@ -8092,7 +8085,7 @@ def test_one_bad_session_does_not_kill_batch(tmp_path=None):
     # ① 整批不可以停下來，好的那一場要真的產出
     assert r.returncode == 0, (
         "⚠⚠ 一場分析失敗把整支工具帶走了（退出碼 "
-        f"{r.returncode}）——這正是同事回報的形狀。\n{r.stderr[-800:]}")
+        f"{r.returncode}）。\n{r.stderr[-800:]}")
     pages = list((out / "sessions").rglob("*.html"))
     good = [p for p in pages if GOOD[:8] in p.name]
     bad = [p for p in pages if BAD[:8] in p.name]
@@ -8445,7 +8438,7 @@ def test_archive_command_only(tmp_path=None):
     ])
 
     # ⑧ 指令 ＋ `content` 是**單一個 dict**（不是 list）⇒ 也是「看不懂」
-    # ⚠⚠ 第一版的守衛寫「不是 list 就是純字串，認得」，於是這一場照樣被搬走
+    # ⚠⚠ 守衛若寫成「不是 list 就是純字串，認得」，這一場照樣被搬走
     #    （實測 `single_dict_block: has_unknown=False kind=command_only`）。
     sid_dict = "ac0a0000-0000-4000-8000-00000000ac0a"
     w(sid_dict, [
@@ -8536,7 +8529,7 @@ def test_archive_command_only(tmp_path=None):
     assert all(Path(m["from"]).name.endswith(".jsonl") and m["reason"] == "command_only"
                for m in done), man
     # ⚠⚠ `from` 一定要是**絕對路徑**：CLI 印的是「含原始絕對路徑，可依它還原」，
-    # 而 `--claude-source` 收得下相對路徑。舊版寫未 resolve 的 `str(path)` ⇒ 那句話是假的。
+    # 而 `--claude-source` 收得下相對路徑。寫成未 resolve 的 `str(path)` 的話 ⇒ 那句話是假的。
     assert all(Path(m["from"]).is_absolute() for m in man), (
         f"⚠ 紀錄裡的來源路徑不是絕對路徑，還原時找不到原位：{[m['from'] for m in man]}")
 
@@ -8550,12 +8543,12 @@ def test_archive_command_only(tmp_path=None):
     # --- ⚠⚠ 搬移必須撐得住「來源與目的地不同磁碟機」-------------------------
     # 這正是這個功能的**典型用法**：來源在 `C:\Users\…\.claude\projects`，
     # 使用者指定的封存目錄多半在別的磁碟機。
-    # 第一版用 `Path.replace()`（＝`os.replace`），跨磁碟機直接丟 OSError ⇒
+    # 只用 `Path.replace()`（＝`os.replace`）的話，跨磁碟機直接丟 OSError ⇒
     # 92 場**全部**失敗，而失敗被收成一行「搬移失敗：OSError：92」，
-    # **跑起來像是「沒有東西需要搬」**——這一格當時是綠的，因為暫存目錄和來源同一顆碟。
+    # **跑起來像是「沒有東西需要搬」**——暫存目錄和來源在同一顆碟時，這一格照樣是綠的。
     # 這裡不能真的造出第二顆碟，所以**把「搬進封存目錄」的 `os.replace` 換成跨磁碟錯誤**
     # （`EXDEV`），驗它真的退回「凍結→複製→比對→刪」那條路而且搬得成。
-    # ⚠ 舊版這一格是 grep 原始碼裡有沒有 `shutil.move(...)`——那只證明 API 名字對，
+    # ⚠ 不能用 grep 原始碼裡有沒有 `shutil.move(...)` 來驗——那只證明 API 名字對，
     #   證明不了行為（`shutil.move` 在佔位檔前面**每一次**都退化成複製＋刪來源）。
     import ai_session_viewer as _v
     import errno as _errno
@@ -8607,9 +8600,9 @@ def test_archive_command_only(tmp_path=None):
     assert not list(proj.glob("*.archiving")), "跨磁碟搬完要刪掉凍結檔"
 
     # --- ⚠⚠ 同一顆碟：搬移要是**原子改名**，不可以是「複製＋刪來源」 ---------------
-    # 舊版 `shutil.move` 遇到我們自己的 `O_EXCL` 佔位檔，內部的 rename 失敗（Windows 的 rename
-    # 不覆蓋）⇒ **每一次**都退化成複製＋刪來源；複製完到刪來源之間寫進來的那一行會被一起刪掉
-    # 。改名的話檔案身分（inode／NTFS file id）不變——複製一定會換一個。
+    # 用 `shutil.move` 的話，遇到我們自己的 `O_EXCL` 佔位檔，內部的 rename 失敗（Windows 的 rename
+    # 不覆蓋）⇒ **每一次**都退化成複製＋刪來源；複製完到刪來源之間寫進來的那一行會被一起刪掉。
+    # 改名的話檔案身分（inode／NTFS file id）不變——複製一定會換一個。
     arc_r = tmp / "archive-rename"
     sid_r = "ac190000-0000-4000-8000-00000000ac19"
     _sr = _one_cmd_session(sid_r, "2026-07-25T16:30:00.000Z")
@@ -8735,9 +8728,9 @@ def test_archive_command_only(tmp_path=None):
     assert not [p for p in arc_rs.glob("*.jsonl") if p.name != "_archived.jsonl"], "空佔位檔要收掉"
     _stg_rs.unlink()                                    # 之後的格子不要被它干擾
 
-    # --- ⚠⚠ 唯讀的來源（C7）——同碟與跨碟都要搬得成、不可以留下擋路的檔 ------
-    # 舊版：複製把唯讀屬性一起帶到目的地、刪來源失敗 ⇒ 清理刪不掉那份唯讀的完整副本，
-    # 訊息還叫它「佔位檔」，下一次起永遠撞「目的地已有同名檔」。
+    # --- ⚠⚠ 唯讀的來源——同碟與跨碟都要搬得成、不可以留下擋路的檔 ------
+    # 複製會把唯讀屬性一起帶到目的地、刪來源失敗 ⇒ 清理若刪不掉那份唯讀的完整副本
+    # （訊息還叫它「佔位檔」），下一次起永遠撞「目的地已有同名檔」。
     for _xd, _sid_ro, _t_ro in ((False, "ac1c0000-0000-4000-8000-00000000ac1c", "2026-07-25T17:00:00.000Z"),
                                 (True, "ac1d0000-0000-4000-8000-00000000ac1d", "2026-07-25T17:10:00.000Z")):
         _arc_ro = tmp / f"archive-readonly-{'xdev' if _xd else 'same'}"
@@ -8767,7 +8760,7 @@ def test_archive_command_only(tmp_path=None):
         assert "拒絕執行" in (rr.stdout + rr.stderr), (rr.stdout + rr.stderr)[-300:]
 
     # --- ⚠⚠ 記帳寫不進去 ⇒ 必須在**任何一次搬移之前**停下來 ------------------
-    # 舊版是「搬完才開檔記帳」：manifest 不可寫時，主檔已經離開 `~/.claude/projects/`、
+    # 「搬完才開檔記帳」的話：manifest 不可寫時，主檔已經離開 `~/.claude/projects/`、
     # 目的地有檔、**而還原依據一行都沒有**（實測）。
     # 這裡用「把 `_archived.jsonl` 做成一個目錄」來造出「開不起來」，
     # 那是跨平台都成立的做法（權限位元在 Windows 上不可靠）。
@@ -8789,7 +8782,7 @@ def test_archive_command_only(tmp_path=None):
     # --- ⚠⚠ 相對來源路徑：紀錄裡的 `from` 仍然必須是絕對路徑 -------------------
     # CLI 印的是「含原始絕對路徑，可依它還原」，而 `--claude-source` 收得下相對路徑。
     # ⚠ 這一段素材**只會走到** `path.resolve()` 那一格：其他每一個案例傳的都是絕對路徑，
-    #   所以把 `resolve()` 拿掉也不會有任何一格變紅（教訓 55：先補素材，不是先加斷言）。
+    #   所以把 `resolve()` 拿掉也不會有任何一格變紅（先補素材，不是先加斷言）。
     arc4 = tmp / "archive-rel"
     sid_rel = "ac090000-0000-4000-8000-00000000ac09"
     w(sid_rel, [
@@ -8810,10 +8803,10 @@ def test_archive_command_only(tmp_path=None):
 
     # --- ⚠⚠ 記帳「已經打開、但寫到一半才失敗」------------------------------
     # 上面那一格驗的是「一開始就開不起來」。**中途失敗是另一條路**：
-    # 第一版只有 `shutil.move` 那一段有 cleanup ⇒ 注入一次 `fsync` 失敗實測到
+    # 只有 `shutil.move` 那一段有 cleanup 的話 ⇒ 注入一次 `fsync` 失敗實測到
     # `source=True target=True target_size=0 html=False md=False`
-    # ——頁面已刪、目的地留下 0 位元組佔位檔，下一次執行永遠撞「已有同名檔」
-    # 。⚠ 這一格只能在函式層驗（子行程注入不了例外）。
+    # ——頁面已刪、目的地留下 0 位元組佔位檔，下一次執行永遠撞「已有同名檔」。
+    # ⚠ 這一格只能在函式層驗（子行程注入不了例外）。
     arc5 = tmp / "archive-fsyncfail"
     sid_fs = "ac0c0000-0000-4000-8000-00000000ac0c"
     w(sid_fs, [
@@ -8843,7 +8836,7 @@ def test_archive_command_only(tmp_path=None):
 
     # --- ⚠⚠ 搬到一半失敗：目的地是**部分內容**，不是 0 位元組 -----------------
     # 跨磁碟的搬移是「複製＋刪來源」，複製寫到一半才失敗時目的地有半截檔。
-    # 舊的 cleanup 只刪 0 位元組的 ⇒ 那個半截檔留下來，下一次永遠撞「已有同名檔」
+    # cleanup 若只刪 0 位元組的 ⇒ 那個半截檔留下來，下一次永遠撞「已有同名檔」
     # （實測 `target_size=7`）。⚠ 這一格只能在函式層造。
     arc6 = tmp / "archive-partial"
     sid_pt = "ac0d0000-0000-4000-8000-00000000ac0d"
@@ -8898,7 +8891,7 @@ def test_archive_command_only(tmp_path=None):
     # --- ⚠⚠ Ctrl+C 落在「關閉佔位檔」那一刻 ---------------------------------
     # 只接 OSError 的話，這一刻中斷同樣留下 0 位元組的佔位檔、之後每一次都撞「已有同名檔」。
     # ⚠⚠ 注入的 close **先丟 Ctrl+C、還沒真的關**（第二次呼叫才關）：這樣才驗得到
-    #   「先確保 handle 關了、再收佔位檔」那一段。舊的注入是「先關、再丟」——handle 早就關了，
+    #   「先確保 handle 關了、再收佔位檔」那一段。注入成「先關、再丟」的話，handle 早就關了，
     #   產品碼重關的那一行拿掉也照樣綠（實測存活）。
     arc9 = tmp / "archive-interrupt-close"
     sid_cl = "ac110000-0000-4000-8000-00000000ac11"
@@ -9100,7 +9093,7 @@ def test_archive_command_only(tmp_path=None):
 
     # --- ⚠⚠ 判定之後、搬移之前，那一場多了一則真的問答 ⇒ 不可以搬----------
     # 判定與搬移之間隔著整批的讀取；這段時間 Claude Code 往同一場寫了真的對話，
-    # 舊版照樣把它搬走（`claude --resume` 的清單少了一場**有對話**的 session）。
+    # 照樣把它搬走的話，`claude --resume` 的清單就少了一場**有對話**的 session。
     _TALK = [
         {"type": "user", "uuid": "rt1", "timestamp": "2026-07-25T17:30:10.000Z",
          "message": {"role": "user", "content": "這是判定之後才寫進來的提問REALTALK。"}, **base},
@@ -9203,7 +9196,7 @@ def test_archive_command_only(tmp_path=None):
     os.utime(_p_rec, (_OLD, _OLD))                    # 之後的格子不要被它干擾
 
     # --- ⚠⚠ 主檔已經搬到目的地之後才 Ctrl+C ⇒ 一定要記帳、一定要講出來--------
-    # 舊版：紀錄停在 `pending`、stderr 一個字都沒有——使用者看到的是「什麼都沒發生」，
+    # 紀錄若停在 `pending`、stderr 一個字都沒有——使用者看到的是「什麼都沒發生」，
     # 實際上那一場已經不在 `~/.claude/projects/`。
     arc19 = tmp / "archive-cut-after-move"
     sid_cut = "ac210000-0000-4000-8000-00000000ac21"
@@ -9277,7 +9270,7 @@ def test_archive_command_only(tmp_path=None):
         f"子代理目錄被切成兩半，要當場講出兩處位置：{_err20.getvalue()!r}")
 
     # --- ⚠⚠ 量完內容之後來源又被**追加**、複製到一半 Ctrl+C ⇒ 來源仍完整，半截檔要收、不可以亂講 ----
-    # 舊版：保留 7 位元組的半截檔、說它「可能是原本那份的唯一完整副本」——
+    # 保留 7 位元組的半截檔、還說它「可能是原本那份的唯一完整副本」是錯的——
     # 其實來源完整（只是多了一行），而那個半截檔會擋住之後每一次執行。
     _APP = ("\n" + json.dumps({"type": "user", "uuid": "ap1", "timestamp": "2026-07-25T18:21:00.000Z",
                                "message": {"role": "user", "content": CMD_U}, **base})).encode()
@@ -9371,7 +9364,7 @@ def test_archive_command_only(tmp_path=None):
     # 造法：把那一場的 HTML 換成**目錄**，`unlink()` 就會丟 OSError。
     arc3 = tmp / "archive-lockedpage"
     # ⚠ 需要一場**還在、而且該搬**的 session：①③ 在上面已經被搬走了，
-    # ⑥⑦ 又刻意不該搬 ⇒ 這條路沒有素材（教訓 55）。現造一場。
+    # ⑥⑦ 又刻意不該搬 ⇒ 這條路沒有素材。現造一場。
     sid_lock = "ac080000-0000-4000-8000-00000000ac08"
     w(sid_lock, [
         dict(type="user", uuid="h1", timestamp="2026-07-25T08:00:00.000Z",
@@ -9403,10 +9396,10 @@ def test_build_interrupt_residue(tmp_path=None):
     """建置被中斷（Ctrl+C／硬終止）之後**不可以留下半截或擋路的檔**。
 
     ① 硬終止留下的頁面暫存檔（`*.html.tmp`）：下一次建置開頭要清掉——指定來源的建置會略過孤兒清理、
-       那一場又被沿用，舊版的半截暫存檔因此**永遠**留著。不是本工具命名的檔不碰。
-    ② Ctrl+C 落在寫頁面暫存檔途中：暫存檔當場收掉（舊版只接 `Exception`）。
+       那一場又被沿用，半截暫存檔因此會**永遠**留著。不是本工具命名的檔不碰。
+    ② Ctrl+C 落在寫頁面暫存檔途中：暫存檔當場收掉（不可以只接 `Exception`）。
     ③ 索引頁與 manifest 每次都重寫：中斷時正式檔要嘛完整的舊版、要嘛完整的新版
-       （舊版直接寫正式檔，中斷就留下截斷的索引）。
+       （直接寫正式檔的話，中斷就留下截斷的索引）。
     """
     tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "res-proj"
@@ -10189,7 +10182,7 @@ def test_sync_conflict_copies(tmp_path=None):
 #    ⚠ 反過來：**擴大 fixture 時雜湊一定會變，那時產品輸出沒變，版本不升、只更新雜湊**。
 # 範圍限制 SCOPE-RENDER-PIN-FIXTURE：釘的是這支測試的 fixture 走得到的輸出；Codex 只有「工具結果是
 #    content item 陣列」那一條，子代理、Claude 的圖片、壓縮、排隊句、未知模型這些路徑不在 fixture 裡。
-_RENDER_PIN =(73, "806c51eacf689a5c19c63266315df44ec5cf7fc45b4f222f19f325426bf2cbf4")
+_RENDER_PIN =(74, "80fadcd8bea155254ac31d92bcfbbab7c1e04d6ea218e703899c156b68685900")
 
 
 def test_ask_user_question(tmp_path=None):
@@ -10289,7 +10282,7 @@ def test_ask_user_question(tmp_path=None):
         ev("user", [{"type": "tool_result", "tool_use_id": "k9", "content": "PARALLELMARK"},
                     {"type": "tool_result", "tool_use_id": "k9b", "content": ""}], 20,
            toolUseResult={"questions": [q9], "answers": {q9["question"]: "I"}}),
-        # MultiEdit：edits 裡有不是物件的、edits 不是陣列（完整版兩個渲染器原本丟例外）
+        # MultiEdit：edits 裡有不是物件的、edits 不是陣列（完整版兩個渲染器不可以因此丟例外）
         ev("assistant", [{"type": "tool_use", "id": "m1", "name": "MultiEdit", "input": {
             "file_path": "/x/Ask/a.py", "edits": [{"old_string": "MEOLD", "new_string": "MENEW"}, "BADEDIT", 3]}}], 21),
         res(22, "m1", "ok"),
@@ -10439,7 +10432,7 @@ def test_renderer_version_pinned(tmp_path=None):
     """`RENDERER_VERSION` 要跟著頁面輸出走（把版本改回 60，整套照樣綠）。
 
     增量建置靠它判斷舊頁面要不要重產；呈現改了、版本沒升，修正在既有的 `out/` 上**完全不生效**，
-    而且沒有任何跡象（這個 repo 連續三輪漏過）。做法：固定兩場合成 session（Claude 一場涵蓋各種區塊、Codex 一場涵蓋工具結果陣列），
+    而且沒有任何跡象。做法：固定兩場合成 session（Claude 一場涵蓋各種區塊、Codex 一場涵蓋工具結果陣列），
     在固定時區（`TZ=UTC0`）與固定雜湊種子下渲染 HTML＋MD，雜湊要等於上面記的那一個。
     """
     tmp = new_tmp(tmp_path)

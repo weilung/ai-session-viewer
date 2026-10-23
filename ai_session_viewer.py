@@ -58,15 +58,13 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 # ⚠⚠ **這一格很容易漏，而漏掉是靜默的**：呈現層改了卻沒 +1，增量建置會沿用既有的
 #    HTML／MD，新的顯示在**既有頁面上永遠不出現**，而快取報告那一頁每次都重建 →
 #    變成「報告說有 N 次，逐步徽章一個都看不到」的不一致，沒有任何錯誤訊息。
-#    2026-08-22 實測抓到這件事：`out/sessions` 的 1037 個頁面只有 1 個是當天寫的，
-#    抽查到的那一份檔案時間停在 08-19，08-19 之後三批呈現層修正
-#    （單步徽章、tooltip、並列標示）全部沒生效。
-# 39 → 40（2026-08-22）：把上述三批補上。**動到 render_turn_html／render_turn_md／
+# 39 → 40（2026-08-22）：升版讓既有頁面重建，單步徽章、tooltip、並列標示這三批呈現層
+#    改動才會出現在既有頁面上。**動到 render_turn_html／render_turn_md／
 #    _cold_cause_label／_cold_cause_title 的改動，都要記得動這裡。**
 # 40 → 41（2026-08-22）：耐久回合錨點（`durable_anchor`）＋每輪標頭的 # 直達連結。
 # 41 → 42（2026-08-22）：補 hashchange 進入點、橫幅改 fixed、tiebreak 改用來源檔行序。
-#    ⚠ **前兩者是頁面 JS/CSS、第三者會改變 id 值**——三個都是呈現層。差點又漏掉這一格：
-#    改完 JS 和 CSS 很容易覺得「沒動 render_turn_html 就不算呈現層」，那是錯的。
+#    ⚠ **前兩者是頁面 JS/CSS、第三者會改變 id 值**——三個都是呈現層。
+#    頁面 JS／CSS 的改動也是呈現層（不論有沒有動到 `render_turn_html`），要升版。
 # 42 → 43（2026-08-22）：撞號後綴 `-<n>` → `-tb<n>`（錨點文法每段自帶前綴）、
 #    isK 不准後面黏垃圾、退化改以 `bmTurnId()` 當底線、`.alink` 隱藏時關掉命中測試。
 #    ⚠ **後綴格式改了＝既有的 id 值改了**，所以這也是呈現層。
@@ -86,15 +84,15 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #    包裝＋自己的 `#`／☆，錨點 `k…[-tb<n>][-s<步epoch>]-b<n>`（見 `block_anchor()`）；
 #    多步回合的步驟列掛上 `k…-s<ep>`（退化階梯的中間一階）；`bkSummary()` 改成先剔掉
 #    控制項的文字再取摘要。⚠ **HTML＋CSS＋頁面 JS 三樣都變＝呈現層，一定要升。**
-# 52 → 53（2026-08-23）：**第 4 期的冷眼輪處置**——
+# 52 → 53（2026-08-23）：**書籤第 4 期的錨點與控制項調整**——
 #    ① 區塊錨點的 `-s` 段改用**毫秒**（新增 `_epoch_ms`／`_step.tms`），
 #      並加一道底線：同一輪內 `tms` 撞號的那些步，整步不給錨點。
 #      ⚠ **錨點字串改了**，但第 4 期未出貨，沒有人存過這種書籤。
 #    ② `.blk-ctls` 容器改成透明＋`pointer-events:none`（背景移到按鈕自己身上）。
 #    ⚠ CSS 與錨點值都變了 ＝呈現層，一定要升。
-# 53 → 54（2026-08-23）：**跨模型輪的處置**——
+# 53 → 54（2026-08-23）：**子定位符的文法驗證**——
 #    新增 `bmGrammarOk()`：文法不合的子定位符一律走未命中，**不准走退化階梯**
-#    （舊版 `-s`、`-b`、`|`、引號、超長垃圾都會被剝成基底回合並框起來）。
+#    （`-s`、`-b`、`|`、引號、超長垃圾等一旦走退化階梯，都會被剝成基底回合並框起來）。
 #    另把區塊錨點的計算抽成 `turn_block_anchors()`，與探針共用。
 #    ⚠ 頁面 JS 變了 ＝呈現層。
 # 54 → 55（2026-08-25）：**使用者回合忠實度**——三種「使用者確實送出、但過去看不到或被
@@ -106,29 +104,26 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #    ③ **斜線指令／`!` bash** 變成 `_command` 列（指令＋參數＋結果），不再被
 #      `is_noise_user()` 整則吃掉。
 #    ⚠ **HTML＋CSS 都變，而且回合會變多 ⇒ 一定要升。**
-#    ⚠⚠ **只有指令列不發耐久錨點；通知列照發。** 本行第一版寫成「指令列與通知列都不發」，
-#      **那和實碼相反**（`_no_anchor` 只認 `_command`），而照著它改會弄丟 872 個既有錨點：
-#      通知列在 v55 之前就是普通 user 回合、**本來就有錨點**，不發＝破壞；
+#    ⚠⚠ **只有指令列不發耐久錨點；通知列照發**（`_no_anchor` 只認 `_command`）：
+#      通知列在 v55 之前就是普通 user 回合、**本來就有錨點**，不發會弄丟 872 個既有錨點；
 #      指令列是這一版才長出來的，沒有人存過，不發才安全。
-#      「新東西不拿」與「舊東西不再拿」在碼裡長得一樣，方向卻相反（教訓 53）。
+#      「新東西不拿」與「舊東西不再拿」在碼裡長得一樣，方向卻相反。
 # 55 → 56（2026-08-25）：排隊送出的那一句加上**「⏳ 中途插話」徽章**（HTML）與對應的
-#    MD 記號。⚠ 這是 Will 在看過 55 之後追加的：位置已經裁決成「被讀到的那一刻」
-#    ⇒ 它讀起來就像一般的一問一答，「這是助手工作到一半才收到的」如果只留在游標提示裡
-#    等於沒有講。⚠ MD 那半落在 `_TURN_HEAD_RE` 的 `rest` 段，不影響 `--search` 切回合。
-#    ⚠ **55 從未出貨**（沒有投影過），但版本照升不誤：manifest 的重建閘只認版本號，
-#    不升的話**本機已經是 55 的 `out/` 會靜默不重建**——這一場才因為類似的事
-#    整批頁面用錯版本產出過一次。
+#    MD 記號。⚠ 位置取「被讀到的那一刻」⇒ 它讀起來就像一般的一問一答，
+#    「這是助手工作到一半才收到的」如果只留在游標提示裡等於沒有講，所以要加徽章。
+#    ⚠ MD 那半落在 `_TURN_HEAD_RE` 的 `rest` 段，不影響 `--search` 切回合。
+#    ⚠ **沒有對外出貨的版本也照升**（55 就沒有出貨）：manifest 的重建閘只認版本號，
+#    不升的話**本機已經是 55 的 `out/` 會靜默不重建**。
 # 56 → 57（2026-08-25）：**中途插話不再切輪**，改成畫在該輪內部的子框。
 #    ⚠⚠ 依據是量測，不是偏好：全語料 **125/127（98.4%）的插話是在同一輪之內送達的**
-#    （前後兩個 assistant 事件之間沒有 `turn_duration`）⇒ 56 把它當獨立 user 回合，
+#    （前後兩個 assistant 事件之間沒有 `turn_duration`）⇒ 把它當獨立 user 回合，
 #    等於把一輪切成兩輪，畫面上看起來像「助手講完 → 使用者說話 → 助手開新的一輪」，那是假的。
-#    現在：`group_turns` 掛成 `_interject` 區塊；`render_turn_html` 畫成 `.ijbox` 子框，
-#    其後**第一段回應**（一個步驟）縮排在 `.ijafter` 裡（Will 從三種畫法中挑的 B）。
+#    做法：`group_turns` 掛成 `_interject` 區塊；`render_turn_html` 畫成 `.ijbox` 子框，
+#    其後**第一段回應**（一個步驟）縮排在 `.ijafter` 裡。
 #    ⚠ 真正跨輪的那 2/127 沒有開著的 assistant 回合可掛 ⇒ 自動落回一般 user 回合＋插話徽章。
-#    ⚠⚠ **插話「不」算可標記區塊，拿不到 `-b<n>`。** 本行第一版寫的是相反的，
-#      而第一版的碼也真的那樣做——結果是插話被插進 blocks 中間，
+#    ⚠⚠ **插話「不」算可標記區塊，拿不到 `-b<n>`。** 把它插進 blocks 中間的話，
 #      **同一步之內它後面每一個區塊的序號全部 +1**，既有的區塊書籤**指到別的內容**
-#      （最壞的失敗方向：不失效、不報錯、安靜地指錯）。登記為
+#      （最壞的失敗方向：不失效、不報錯、安靜地指錯）。範圍限制
 #      `SCOPE-INTERJECT-NO-BLOCK-ANCHOR`。**新長出來的東西一律不進序號。**
 #    ⚠ HTML＋CSS＋MD 都變、而且回合數會**變少**（不再切輪）＝呈現層，一定要升。
 # 57 → 58（2026-08-25）：**指令的第二種存法也補進來**。
@@ -136,8 +131,7 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #    `type:user` 內含 `<command-name>`（575 則：`/effort`／`/model`／`/exit`／`!` bash）
 #    與 `type:system, subtype:local_command`（345 則：`/context` 140、`/status` 83、
 #    `/rename` 49、**`/remote-control` 29**、`/model` 21、`/resume` 13）。
-#    57 只做了前者 ＝ **只做到 62.5%**，而 `/rc` 正好落在沒做的那一半
-#    （Will 2026-08-25 驗收時抓到：「一開場我就用 /rc，這個沒有看到」）。
+#    只處理前者就只涵蓋 **62.5%**，而 `/rc` 正好落在後者——兩種存法都要處理。
 #    `synth_local_command_events()` 把後者轉成同一種事件，**沿用同一條指令路徑**。
 #    ⚠ 兩種形狀實測**零重疊**，補了不會重複畫。
 #    ⚠ 順帶修掉一個幽靈回合：沒有輸出的指令會另寫一則空的
@@ -145,22 +139,22 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #      （`t{n}` 序號往後推）。判空條件收斂到 `user_special_blocks()` 一處。
 # 58 → 59（2026-08-26）：**使用者回合呈現的修正**。呈現層真的變了三處，
 #    所以一定要升（不升的話本機既有的 `out/` 會靜默沿用舊版）：
-#    ① **通知的摺疊改回完整原文**（原本 `event or raw` ⇒ 帶 `<event>` 的 Monitor 型會
-#       把 `<task-id>`／`<output-file>` 從 HTML 與 MD 全文索引裡弄不見，**比 v54 還差**）；
-#       原文另外過 `_strip_ansi()`（先前通知那條路完全沒剝控制碼）。
+#    ① **通知的摺疊改回完整原文**（取 `event or raw` 的話，帶 `<event>` 的 Monitor 型會
+#       把 `<task-id>`／`<output-file>` 從 HTML 與 MD 全文索引裡弄不見）；
+#       原文另外過 `_strip_ansi()`（通知那條路也要剝控制碼）。
 #    ② `turn_duration` **之後**才被讀到的排隊句改標「這一輪結束後才讀到」。
 #       ⚠ 位置**沒有變**（仍掛在該輪內部）——改成獨立回合會切輪，實測弄丟 54 個舊錨點。
-#    ③ 插話是該輪最後一個區塊時，那個空的「↳ 回應這句」框整個撤掉（先前會畫出空框）。
-#    另外：控制碼補上 DCS／SOS／PM／APC 與 C1 單位元組形式（先前只認 CSI 與 OSC，
+#    ③ 插話是該輪最後一個區塊時，那個空的「↳ 回應這句」框整個撤掉，不畫空框。
+#    另外：控制碼補上 DCS／SOS／PM／APC 與 C1 單位元組形式（只認 CSI 與 OSC 的話，
 #    `ESC P …payload… ESC \` 的 payload 會原樣進頁面）。
 #    ⚠ 錨點集合仍逐字不變：`probe_user_turns.py anchors <開工前的 commit>` 現撈。
-#    ⭐ **又補了五處**（同一個版本號，59 尚未出貨）：
+#    ⭐ **同一版另有五處**：
 #    ④ 未知內容的保守否決**只豁免 `str`**——`content` 是單一個 dict、或 list 裡混了
-#       非 dict 的非空元素，第一版都當「認得」⇒ 照樣被搬走。
+#       非 dict 的非空元素，都不能當「認得」，否則照樣被搬走。
 #    ⑤ `_turn_done` **在新的 assistant 內容抵達時要清掉**：只設不清的話，
 #       下一輪跑到一半的插話會被誤標成「上一輪結束後才讀到」。
 #    ⑥ 封存的順序改成 **佔名 → pending 落磁 → 刪頁 → 搬移**，而且**每一條失敗路徑
-#       都收回佔位檔**：第一版注入一次 `fsync` 失敗就留下「頁面已刪 ＋ 0 位元組佔位檔」，
+#       都收回佔位檔**：否則一次 `fsync` 失敗就留下「頁面已刪 ＋ 0 位元組佔位檔」，
 #       下一次執行永遠撞「目的地已有同名檔」。
 #    ⑦ 排隊句的 attachment 以 `(來源檔, prompt)` 分組，而且**每個 remove 都消耗一個
 #       時刻**（不論最後是合成事件還是真 user 事件呈現）——否則跨來源會憑空補一句，
@@ -168,8 +162,8 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #    ⑧ `_CTRL_RE` 的範圍補到 `\x9f`（裸的 C1）；指令區塊多帶 `src`（哪一種存法），
 #       那是 `render` 探針的身分，避免兩種存法互相冒領。
 # 59 → 60（2026-09-01）：**排隊送出時貼的圖片也畫出來**。
-#    先前補出來的那一則只帶文字、圖片 block 被丟掉 ⇒ 使用者貼的圖在頁面上不存在；
-#    「只貼圖、一個字都沒打」的那一則甚至**整則不出現**（文字是空的，配不到 `remove`）。
+#    補出來的那一則若只帶文字、丟掉圖片 block，使用者貼的圖在頁面上就不存在；
+#    「只貼圖、一個字都沒打」的那一則文字是空的，只看文字會配不到 `remove`，甚至**整則不出現**。
 #    ⚠⚠ **圖片畫在插話子框「裡面」，不另開可標記區塊。** `_interject` 之所以不佔
 #    `-b<n>` 序號，就是為了保住既有區塊書籤（範圍限制 SCOPE-INTERJECT-NO-BLOCK-ANCHOR）；
 #    把圖片當成獨立 block 塞進 `cur["blocks"]` 會讓**同一步之後每個區塊的序號 +1**。
@@ -184,9 +178,9 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #    ⚠ 表頭摘要**只計主對話**：子代理預設寫 5m，混進來會讓每一場都掛上這行、
 #    也會把主對話真正的 1h→5m 切換洗掉。
 #    ⚠⚠ **5m 一律紅底白字，而且不受勾選開關控制**（`.t5` 被 `body.hide-ttl` 排除）。
-#    這一條是 Will 2026-09-22 的裁決，理由是查到 `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL`
-#    ／settings 的 `subagentPromptCacheTtl` 可以把子代理設成 `1h` ⇒ **子代理的 5m 不再是
-#    「本來就這樣」的中性事實**，而是「這段快取只能活 5 分鐘」的可行動訊號。
+#    理由：`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL`／settings 的 `subagentPromptCacheTtl`
+#    可以把子代理設成 `1h` ⇒ **子代理的 5m 不再是「本來就這樣」的中性事實**，
+#    而是「這段快取只能活 5 分鐘」的可行動訊號。
 #    1h 的徽章維持可勾選（預設關），`5m+1h` 混合步維持中性色。
 #    ⭐ **同一版另加：session 表頭的「花費組成」小表**（新輸入／寫入 5m／寫入 1h／讀取／產出，
 #    各給金額與佔比），MD 表頭同步。目的是讓「要不要為 TTL 改設定」有分母可看——
@@ -194,7 +188,7 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #    而 `c966f04d` 的子代理寫入佔 32.8%：同樣一句「快取很貴」，結論相反。
 #    ⚠ `call_cost` 改成 `call_cost_parts` 的加總，**兩處共用同一份公式**（測試釘住）。
 #    ⚠ HTML 與 MD 都變 ⇒ 一定要升（不升的話既有的 `out/` 會靜默沿用舊版）。
-# 61 → 62（2026-09-29）：同一批呈現的四處更正，HTML 與 MD 都變。
+# 61 → 62（2026-09-29）：同一批呈現的更正，HTML 與 MD 都變。
 #    ① 表頭的寫入 TTL 摘要改成**讀逐步徽章那一串步驟**（同一個迴圈、同一個時間序），不再另外走
 #       原始事件的檔案行序——兩處各算一次時，行序與時間序不同的檔會讓表頭與徽章講出兩種切換。
 #       沒有可呈現內容的呼叫（沒有徽章）另列次數，「全程 1h 就不顯示」也把它們算進去。
@@ -204,13 +198,13 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #       「快取寫入 5m」，那是估價口徑，不是觀察到的 TTL。只在有這種資料時出現；總額不變。
 #    ④ 文案：5m 的後果改成「這段寫入閒置 5 分鐘就過期」（不保證整段重寫：先前用 1h 寫入、
 #       還沒過期的前綴仍可能讀得到）；子代理是「預設」5m；勾選框也控制 `5m+1h`。
-#    ⑤ 表頭的估算總額回到**最初的算式**（先加總、最後除一次）：61 版改成「各項各除一次再加」，
-#       在大約四分之一的輸入上差最後一位，半分邊界會顯示成不同的分——62 版起與 60 版逐位元相同。
+#    ⑤ 表頭的估算總額用**先加總、最後除一次**的算式，62 版起與 60 版逐位元相同；61 版的
+#       「各項各除一次再加」在大約四分之一的輸入上差最後一位，半分邊界會顯示成不同的分。
 #    ⑥ 沒有 TTL 細分的舊資料寫入，在表頭有其他檔次時另列「TTL 未知」。
 #    另外，Codex 使用者 prompt 的字串一律原樣收下、不再嘗試當成序列化的 JSON 解析（同一版一起升）。
 # 62 → 63（2026-10-03）：寫入 TTL 呈現的三處更正，HTML 與 MD 都變。
 #    ① MD 的回合列補上寫入 TTL（有切換標第一個切換，否則列出不是 1h 的檔次；純 1h 不標）：
-#       MD 不畫逐步列，原本**完全看不到** 5m 落在哪一則——表頭說有切換、每一則卻找不到。
+#       MD 不畫逐步列，回合列不標的話**完全看不到** 5m 落在哪一則——表頭說有切換、每一則卻找不到。
 #    ② 表頭步數：同一次呼叫被使用者回合切成兩段時只算一次；沒有時間戳的步不參與切換判定
 #       （它排在時間序最前面是假的位置，會把 1h→5m 講成 5m→1h）。
 #    ③ 提示文字：拿掉 tooltip 裡的 `**`／反引號、作者機器上的觀察（移到 docs）、「子代理另計」
@@ -248,7 +242,10 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 #    蓋掉先寫的。沒有副本的場次頁面不變。
 # 72 → 73（2026-10-22）：副本輸出檔名另帶的那一段改成整個 id 的 32 碼雜湊（v72 是 6 碼）。只有副本的檔名變；
 #    沿用的 row 帶著舊檔名，升版讓它們照新檔名重建。
-RENDERER_VERSION = 73
+# 73 → 74（2026-10-23）：**只改註解**——頁面內嵌的 JS／CSS 註解改寫成規則本身的講法（拿掉人名、日期、
+#    「舊版／第一版寫成」這類經過與不存在於公開 repo 的檔案指標）。行為、錨點、金額都不變；升版只是因為
+#    內嵌註解屬於頁面輸出。驗法是全語料新舊對照（剝掉 `/* … */` 之後應逐位元相同）。
+RENDERER_VERSION = 74
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 
@@ -307,7 +304,7 @@ def js_embed(obj) -> str:
     - U+2028 / U+2029：JS 的行終止符，不跳脫會把字串字面值攔腰截斷。
 
     `json.dumps` 自己**不做**這四樣，所以每個內嵌點都得補——補漏一處就白防。
-    索引頁的 memory 對照表原本就是這樣寫的，抽出來共用，不要再寫第二份。"""
+    所有內嵌點（含索引頁的 memory 對照表）共用這一支，不要再寫第二份。"""
     return (json.dumps(obj, ensure_ascii=False)
             .replace("<", "\\u003c").replace(">", "\\u003e")
             .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
@@ -506,10 +503,9 @@ API_MISS_CAUSE = {"tools_changed": "tools", "system_changed": "system",
 #      更要緊的是 `band_excluded` 走反事實差額（`cf_comply_n − comply_n`）算，而反事實的定義是
 #      「**API 自報前綴變動這條規則不存在**的世界」——伺服器側在那個世界裡照樣排除。合併成一個
 #      集合的話，這些對會落進差額、被講成「因前綴變動移出」，那是錯誤歸因。
-#      ⚠ 這裡刻意**不寫實測對數**。舊版寫「153 個相鄰步對」，之後有人拿別的量法得到 612 就以為
-#      它過期了——其實 612 是同一批資料被數了四次（本機四個 config 的 `projects/` 是 junction，
-#      指向同一實體；工具自己走 `_dedupe_by_realpath` 會收斂成一份，繞過去重的腳本不會）。
-#      對數隨語料與量法變動，寫死在註解裡只會製造這種假的「已失效」。
+#      ⚠ 這裡刻意**不寫實測對數**：對數隨語料與量法變動，寫死在註解裡，換個量法得到另一個數字
+#      就會被誤當成已失效。例如本機四個 config 的 `projects/` 是 junction、指向同一實體：
+#      工具自己走 `_dedupe_by_realpath` 會收斂成一份，繞過去重的腳本會把同一批資料數上四次。
 # ⚠ 也**不參與**「向前借用被 ctx 門檻濾掉那一步的成因」：伺服器側是同一步的狀態，借給後一步
 #   就變成推論了。
 API_OTHER_CAUSE = {"unavailable": "unavail", "unknown": "unknown"}
@@ -565,7 +561,7 @@ def rewrite_waste_usd(model, missed, c5=0, c1h=0, wrote=None):
         if missed <= 0:
             return None
     if wrote:                       # 有實際寫入量 → 用它的 5m/1h breakdown 逐段拆（同 call_cost／avoid_usd），
-        legacy = max(wrote - c5 - c1h, 0)   # 混合 TTL 不再整段按 1h（那會對前綴變動步系統性高估）
+        legacy = max(wrote - c5 - c1h, 0)   # 混合 TTL 不整段按 1h（那會對前綴變動步系統性高估）
         mult = ((legacy + c5) * CACHE_WRITE_MULT + c1h * CACHE_WRITE_MULT_1H) / wrote
     else:
         mult = CACHE_WRITE_MULT_1H if c1h > 0 else CACHE_WRITE_MULT
@@ -639,7 +635,7 @@ CONTEXT_WINDOW = {
 # opus／sonnet 的 1M 是**分版本**的，不能用裸前綴一律當 1M：
 #   1M ＝ opus 4.6／4.7／4.8／5＋、sonnet 4.6／5＋
 #   200k ＝ opus 4／4.1／4.5、sonnet 4／4.5
-# 先前裸前綴 fail-open 會把 sonnet-4-5 的 100k 脈絡算成 10%（實際 50%），差 5 倍。
+# 用裸前綴一律當 1M（fail-open），會把 sonnet-4-5 的 100k 脈絡算成 10%（實際 50%），差 5 倍。
 CONTEXT_1M_MIN = {"opus": (4, 6), "sonnet": (4, 6)}
 
 
@@ -1291,8 +1287,8 @@ def _codex_content_unconsumed(content, text_type="output_text"):
     卻還帶著字的（消費規則與它逐條對應，改一邊要改兩邊）。
 
     ⚠ 只數 block、不看內容：目的是讓「有東西被丟掉」這件事**有人數得出來**，
-    不是要把圖片也渲染出來（那是另一件事）。混合內容的 prompt（文字＋圖片）在舊寫法下
-    只留文字、其餘靜默消失，而抽得到文字就不會觸發「取不出文字」那個哨兵——
+    不是要把圖片也渲染出來（那是另一件事）。混合內容的 prompt（文字＋圖片）若只留文字，
+    其餘會靜默消失，而抽得到文字就不會觸發「取不出文字」那個哨兵——
     於是頁面看起來完整、卻少了一半內容，正是本檔一再要擋的那種形狀。"""
     if not isinstance(content, list):
         return 0
@@ -1305,7 +1301,7 @@ def _codex_container_user_like(raw):
     """事件的**容器本身不是 dict** 時，它裡面看不看得出是使用者發言。
     `item_completed` 的 `item` 與事件的 `payload` 兩層共用——兩層的失效樣態完全相同。
 
-    ⚠ 為什麼需要這個：舊寫法把非 dict 的容器直接換成 `{}`，於是那一層以下的哨兵全部看不到
+    ⚠ 為什麼需要這個：把非 dict 的容器直接換成 `{}` 的話，那一層以下的哨兵全部看不到
     東西；而外面那一層又不帶 role（實測 485 個 rollout 皆然）、`_codex_event_user_like`
     也接不到 → 整則 prompt 靜默消失、沒有任何一個計數會動。
     判準沿用同一套（型別名帶 user，或自報 role=user），只是多走一層容器。
@@ -1467,13 +1463,13 @@ def _codex_dual_shape(pending, text, kind):
     **範圍限制 SCOPE-DUAL-SHAPE-UNMARKED**，兩格：
     (a) 出聲的管道只有 stderr；兩則在**輸出頁面上不帶任何標記**，讀的人看到的是兩則相鄰的
         普通提問。
-    (b) ⚠ **這個哨兵本身也幾乎恆為 False**（2026-08-21 登記）：它只認
+    (b) ⚠ **這個哨兵本身也幾乎恆為 False**：它只認
         **緊鄰**，而 `pending_user` 會被**任何** `response_item` 無條件清掉。本機 516 份 rollout、
         672 則使用者紀錄，**672 則的前一筆事件全部都是 `response_item`** → 實跑觸發 0 次。
         所以就算上游開始雙發，中間夾一筆 `response_item` 就完全無聲。
         **不要再把「等 stderr 告警」當成回頭處理的觸發器**——要重掃 corpus 才看得到。
         放寬的作法是改成在同一個**回合窗**內比對（窗已有 `turn_prompts` 在記帳），
-        但本機沒有正例可驗證，Will 2026-08-21 選擇不動。
+        但本機沒有正例可驗證，所以不動。
     範圍限制 SCOPE-DUAL-SHAPE-UNMARKED。"""
     if not pending or not text or not text.strip():
         return False
@@ -1537,7 +1533,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     turn_error = False                       # 這個窗出現過 `event_msg:error`
     turn_ai = False                          # 這個窗真的產出過助理內容
     # 整場有沒有看過「沒有產生助理事件的助理產出」（加密、沒有摘要的 reasoning）。
-    # 收尾兩條哨兵的「有助理內容」原本只數助理事件，而那種 reasoning 一個事件都不產生 ⇒
+    # 收尾兩條哨兵的「有助理內容」不能只數助理事件：那種 reasoning 一個事件都不產生 ⇒
     # 只有它的那一場會被當成「沒有助理內容」而整條哨兵閉嘴。
     saw_unrendered_ai = False
     # `response_item` 的 payload.type 認不得的則數，與「content 元素型別漂掉、
@@ -1651,7 +1647,7 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             if ptype == "user_message":
                 raw_msg = payload.get("message")
                 # ⚠ **非字串一律走與新格式同一組檢查**，兩側對稱。
-                # 原本是 `str(payload.get("message") or "")`：`message` 從字串漂成 content block
+                # 若寫成 `str(payload.get("message") or "")`：`message` 從字串漂成 content block
                 # 陣列時，`str()` 會把 Python 的 repr 整包當成 prompt 收下——實測收到的是
                 # "[{'type': 'text', 'text': '…'}, {'type': 'image', …}]"，而三層哨兵全靜：
                 # repr 非空 → 不觸發「取不出文字」；型別名還在 → 不觸發型別哨兵；
@@ -2004,10 +2000,9 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     #   ① 被中止的回合（`turn_aborted`）；② 子代理執行緒（沒有人打字）；
     #   ③ 完全沒有助理內容的空 session；④ **系統自己起的那一輪**（自動壓縮、
     #      壓縮失敗——`turn_systemic`，見迴圈裡那段）。
-    # ⚠⚠ ④ 是 2026-09-01 才補的，而且**不是靠本機語料發現的**：本機 565 份 rollout、
-    #   729 個回合窗裡**零個**空窗，所以「0 誤報」在這台機器上永遠成立。
-    #   同事的機器上一個檔就吵了兩次，兩次都是完全正常的資料（教訓 44 的又一次應驗：
-    #   **量到 0 講的是這份語料**）。
+    # ⚠⚠ ④ **本機語料驗證不到**：本機 565 份 rollout、729 個回合窗裡**零個**空窗，
+    #   所以「0 誤報」在這台機器上永遠成立。同事 2026-09-01 的 rollout 一個檔就吵了兩次，
+    #   兩次都是完全正常的資料——**量到 0 講的是這份語料**。
     # ⚠ 不可改用「`type == "user"` 的事件數」：工具結果也是以 `user` 存的（見上方
     #   `function_call_output` 那一支），一場有工具呼叫、prompt 卻全丟時它不會是 0。
     # ⚠ **範圍限制 SCOPE-PARTIAL-TURN-LOSS**：這一條只認「整窗零則」，窗內只要還收到一則就
@@ -2143,7 +2138,7 @@ def clean_user_text(t):
 
 
 # =========================================================================
-# 使用者實際送出、但過去被靜默丟掉或誤標的三種東西
+# 使用者實際送出、卻容易被靜默丟掉或誤標的三種東西
 # -------------------------------------------------------------------------
 # 判準一律走**結構標籤／結構欄位**，不猜文字。每一個數字都由
 # `scripts/probe_user_turns.py inventory` 現產，**不要照抄文件裡的數字**。
@@ -2156,11 +2151,11 @@ def clean_user_text(t):
 #   守它的是 `tests/test_smoke.py::test_user_turn_fidelity`（兩個方向各一格斷言）
 #   與 `scripts/probe_user_turns.py anchors <開工前的 commit>`。
 # =========================================================================
-# ⚠⚠ 終端控制碼不是只有 CSI。第一版只認 `ESC [ … 字母`，於是
+# ⚠⚠ 終端控制碼不是只有 CSI（`ESC [ … 字母`）：只認 CSI 的話，
 # `ESC ] 0 ; 標題 BEL`（OSC，`/status` 這類會用來設視窗標題）、`\x00`、`\x08`
-# 全部原樣寫進 HTML。而守它的斷言（`"\x1b" not in html`）之所以綠，
-# 是因為**素材只放了 `\x1b[1m`**——「素材涵蓋到哪裡就是驗證能力的上限」的活例。
-# ⚠⚠ **第二版又漏一層**：OSC 以外還有四種「控制字串」——DCS（`ESC P`）、SOS（`ESC X`）、
+# 全部會原樣寫進 HTML。而守它的斷言（`"\x1b" not in html`）的素材若**只放 `\x1b[1m`**，
+# 它一定是綠的——「素材涵蓋到哪裡就是驗證能力的上限」。
+# ⚠⚠ **OSC 以外還有四種「控制字串」**——DCS（`ESC P`）、SOS（`ESC X`）、
 # PM（`ESC ^`）、APC（`ESC _`），它們同樣是「引導字元 … 終止字元」中間夾任意 payload。
 # 只認 OSC 的話，`ESC P …payload… ESC \` 會被最後那條「兩字元跳脫序列」吃掉 `ESC P`，
 # **payload 原封不動留在頁面上**（實測 `payload_left=True`）。
@@ -2174,14 +2169,14 @@ _ANSI_RE = re.compile(
     r"[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c|\Z)"    # …連 payload 帶終止字元一起吃掉
     r"|\x1b[@-Z\\-_]")                     # 其餘兩字元跳脫序列
 # 剝完控制碼還要濾掉裸的控制字元（NUL/BS/VT/FF 等）。⚠ 保留 \t \n \r。
-# ⚠⚠ **範圍要含 C1（`\x80`–`\x9f`），不是只到 `\x7f`。** 第一版漏掉 C1，實測
+# ⚠⚠ **範圍要含 C1（`\x80`–`\x9f`），不是只到 `\x7f`。** 漏掉 C1 的話，實測
 # `remaining_c1=['0x80', '0x91', '0x99']` 原樣進頁面。
-# ⚠ 守它的斷言要放**裸的 C1** 當素材——舊素材只有 OSC／NUL／BS，
-#   而突變 ⑥b 是把整條規則關掉，抓不到「只漏幾個 C1」這種半修（教訓 55）。
+# ⚠ 守它的斷言要放**裸的 C1** 當素材——素材只有 OSC／NUL／BS 的話，
+#   突變 ⑥b（把整條規則關掉）抓不到「只漏幾個 C1」這種半修。
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 # ⚠ 拼接不是裝飾：`tests/test_smoke.py` 有一格在掃「產品碼裡不該出現的字面」，
-#   而本模組自己就是被掃的對象之一。要找的東西不可以出現在找它的人身上（教訓 15）。
+#   而本模組自己就是被掃的對象之一。要找的東西不可以出現在找它的人身上。
 _NOTIFY_TAG = "task-" + "notification"
 # 成對的通知整段（含開閉標籤）。⚠ 用它而不是 substring，理由見 `parse_notify()`。
 _NOTIFY_SPAN_RE = re.compile(r"<%s>.*?</%s>" % (_NOTIFY_TAG, _NOTIFY_TAG), re.DOTALL)
@@ -2209,20 +2204,20 @@ def parse_notify(txt):
     """背景任務通知 → `_notify` 區塊；不是就回 None。
 
     這是**系統以 user 身分注入**的事件（子代理／背景指令／Monitor 回報），不是使用者打的字。
-    過去它照使用者發言畫出來，於是頁面上出現一坨看不懂的 XML。
+    照使用者發言畫出來的話，頁面上會出現一坨看不懂的 XML。
 
     全語料實測：命中的那些**沒有一則混雜其他文字** ⇒ 命中就代表整則都是通知，
     可以整則換成一列摘要。兩種形狀：帶 `<status>` 的（背景指令／子代理完成）
     與帶 `<event>` 的（Monitor 事件，沒有 status）。
 
-    ⚠⚠ **「實測 0 則混雜」不可以寫成 substring 判準。** 第一版只問
-    「文字裡有沒有 `<task-notification>` 這幾個字」，於是**使用者自己打的字只要提到
+    ⚠⚠ **「實測 0 則混雜」不可以寫成 substring 判準。** 只問
+    「文字裡有沒有 `<task-notification>` 這幾個字」的話，**使用者自己打的字只要提到
     這個標籤，整則就變成一列通知**——而通知在封存分類器裡**不算對話**
     ⇒ 一場「下過任一指令 ＋ 問了一句關於這個標籤的話」的 session 會被判成
     `command_only` **搬離 `~/.claude/projects/`**。
     「量到 0」講的是這份語料，不是這個判準的定義域。
 
-    現在的判準是**整則都是通知**，機械定義：
+    判準是**整則都是通知**，機械定義：
     **把通知那一段整段拿掉之後，剩下的東西 `clean_user_text()` 完是空的。**
 
     ⚠ 為什麼是「拿掉之後再 clean」而不是「檢查前後綴是空的」：通知常常被包在
@@ -2248,8 +2243,8 @@ def parse_command(txt):
     """斜線指令／`!` bash 包裝 → `_command` 區塊；沒有就回 None。
 
     使用者下的指令**本來就是他送出的東西**（而且 `/model`、`/effort` 這種會改提示前綴、
-    直接造成快取失效），過去卻因為 `_WRAP_RE` 把整段剝光、`is_noise_user()` 判為雜訊而
-    整則不畫——看紀錄的人無從得知自己下過指令。
+    直接造成快取失效），若讓 `_WRAP_RE` 把整段剝光、`is_noise_user()` 判為雜訊而
+    整則不畫，看紀錄的人就無從得知自己下過指令。
 
     四種形狀（全語料實測，各自的則數見探針）：
 
@@ -2381,9 +2376,9 @@ def _has_unknown_content_block(s) -> bool:
         if ev.get("type") not in ("user", "assistant"):
             continue
         content = (ev.get("message") or {}).get("content")
-        # ⚠⚠ **只有 `str` 可以豁免。** 第一版寫「不是 list 就是純字串，認得」——
-        # 那句話不成立：`content` 也可能是**單一個 dict**、或是別的形狀。
-        # 實測：`single_dict_block`、`scalar_inside_list`
+        # ⚠⚠ **只有 `str` 可以豁免。** 「不是 list 就是純字串，認得」這句話不成立：
+        # `content` 也可能是**單一個 dict**、或是別的形狀。
+        # 照那句話寫的話，實測 `single_dict_block`、`scalar_inside_list`
         # 都讓 `has_unknown=False`、分類成 `command_only` ⇒ **檔案照樣被搬走**。
         # 保守方向只有一個：**看不懂的一律當對話。**
         if isinstance(content, str):
@@ -2413,7 +2408,7 @@ def block_is_renderable(b, role):
     if t == "_notify":
         # ⚠⚠ **通知列要保住區塊錨點**：v55 之前它是普通 user 回合、內容是一個 `text`
         # 區塊，所以**本來就有 `k…-b1`**，使用者標得到書籤。改成 `_notify` 之後若不算
-        # 可標記區塊，那個錨點就**消失**了（探針補上區塊錨點後立刻抓到）。
+        # 可標記區塊，那個錨點就**消失**了。
         # ⚠ 這裡不會推移別人：通知列整輪只有這一個區塊（`rest` 為空才會是 metarow）。
         # ⚠ 和下面 `_interject` 的決定相反，理由也相反——那個是**新長出來的**
         #   （不發才安全），這個是**本來就有的**（不發就是破壞）。
@@ -2423,11 +2418,11 @@ def block_is_renderable(b, role):
         return not b.get("inline")
     if t == "_interject":
         # ⚠⚠ **插話不算可標記區塊——它不可以佔 `-b<n>` 的序號。**
-        # 第一版讓它算（理由是「插話是對話內容，該標得到書籤」），結果是：
-        # `_interject` 被插進 `cur["blocks"]` **中間**，於是**同一步之內它後面每一個區塊
+        # 若讓它算（理由會是「插話是對話內容，該標得到書籤」），
+        # `_interject` 會被插進 `cur["blocks"]` **中間**，於是**同一步之內它後面每一個區塊
         # 的序號 +1** ⇒ 既有的區塊書籤 `-b3` 不會失效、不會退化，
         # **它會指到別的內容**——那是最壞的失敗方向。
-        # ⚠ 這一版宣告的相容性保證原本只涵蓋**回合**錨點 `k…`；區塊錨點
+        # ⚠ 相容性保證（既有錨點逐字不變）不只涵蓋**回合**錨點 `k…`；區塊錨點
         #   `k…-s<ep>-b<n>` 同樣是使用者按 ☆ 存得下來的身分，而且**數量多一個數量級**
         #   （全語料 116758 個區塊 vs 9047 個回合）。
         # ⇒ 和指令列／通知列同一個決定：**新長出來的東西一律不進序號**，
@@ -2441,10 +2436,10 @@ def _cause_key(t, n):
     """成因 join 的鍵：時間 `t` 那一秒的第 `n` 次呼叫（n 由兩端各自依序數，順序相同）。
 
     整數秒單獨當步驟身分證會**撞號**：同一秒內的兩次呼叫共用一把鍵，後者的成因蓋掉前者。
-    自從首步也採用 API 自報成因後，撞號的後果從「推論成因貼錯」升級成「**沒有 diagnostics
+    首步也採用 API 自報成因，所以撞號的後果不只是「推論成因貼錯」，還會是「**沒有 diagnostics
     的那一步被標成 API 自報**」＝把推論講成實據，違反最高不變量①。
     這裡刻意只在**真的撞號時**才退化成 `(epoch, n)`：n==0 仍用裸 epoch，所以絕大多數
-    （沒撞秒的）資料行為與先前完全相同，不動 d88f57f 才修好的那段 join。
+    （沒撞秒的）資料的鍵與只用裸 epoch 時完全相同，成因 join 的行為不變。
     ⚠ 產生鍵與查鍵兩端**必須共用本函式**，否則一漂移就是整批成因錯位。"""
     return t if n == 0 else (t, n)
 
@@ -2568,7 +2563,7 @@ def synth_queued_user_events(events, name=""):
 
     ⚠⚠ **這一段補的不是格式，是一整句話。** 助手還在跑工具時打的字會走佇列，
     而那條路徑**在檔案裡完全沒有 `type:user` 事件**——只有 `queue-operation`
-    與 `attachment.queued_command`。過去檢視器把兩者都當記帳事件濾掉，於是
+    與 `attachment.queued_command`。把兩者都當記帳事件濾掉的話，就是
     **答案在、問題不在**：頁面上會出現一段沒有任何人問過的回應。
     全語料實測 127 則（69 個檔）是這種情形。
 
@@ -2582,19 +2577,19 @@ def synth_queued_user_events(events, name=""):
        （實測 14 次），照 `enqueue` 畫就會多出一句他撤回過的幽靈重複句。
     3. 已經有一則**真的 user 事件**帶同樣文字的就不補（實測 1 次：撤回之後又重送）。
 
-    時刻取 `remove` 的——那是它**真正被讀到**的一刻，也是 Will 2026-08-25 的裁決。
+    時刻取 `remove` 的——那是它**真正被讀到**的一刻。
     使用者按下 Enter 的時刻另外存進 `_queued_at`，由呈現層放進游標提示，
     **不讓時間軸說謊，也不在版面上多一塊噪音**。
     """
     # ⚠⚠ **逐次（occurrence）配對，不是整場一個 set／dict。**
-    # 舊版 `human` 是 `prompt -> 第一次的時刻`、`already` 是整場的文字集合，於是：
+    # 若 `human` 是 `prompt -> 第一次的時刻`、`already` 是整場的文字集合，就會：
     #   ① 同一句排隊送出兩次（「繼續」這種），第二次的**按 Enter 時刻**是錯的；
     #   ② 整場任何一則真 user 事件曾出現同一句，**所有**同文字的排隊句都不補
     #      ⇒「先正常送一次、後來排隊再送一次」的第二次整句消失
     #      （實測 `QUEUED_REPEAT synth=0`）。
     # 真實語料量測（2026-08-25，594 個檔／133 個 remove）：同檔同句 remove **全部只有 1 次**、
     # 132 個沒有對應的真 user 事件、**1 個有而且落在 remove 之後**、sidechain 裡 0 個。
-    # ⇒ 重複那一格目前語料命中 0，但結構上會發生（教訓 44），照修；
+    # ⇒ 重複那一格目前語料命中 0，但結構上會發生，所以要逐次配對；
     #   而「真 user 事件在 remove **之後**」正是那 1 個的形狀 ⇒ 消耗條件用它。
     # (來源檔, 文字) -> [(按下 Enter 的時刻, 貼上的圖片 blocks)…]（同一句可排多次，順序保留）
     human = {}
@@ -2611,8 +2606,8 @@ def synth_queued_user_events(events, name=""):
         # block 陣列：`[{"type":"text","text":<打的字>}, {"type":"image",…}]`
         # （CLI 只在 `pastedContents` 真的產得出圖片 block 時才走那條，所以本機語料
         # 588 則 `queued_command` 全是字串、這一格一則都沒驗到——**量到 0 講的是
-        # 這份語料，不是這個欄位的形狀**，教訓 44）。
-        # 舊寫法 `(a.get("prompt") or "").strip()` 遇到 list 直接 `AttributeError`，
+        # 這份語料，不是這個欄位的形狀**）。
+        # 寫成 `(a.get("prompt") or "").strip()` 的話，遇到 list 直接 `AttributeError`，
         # 而 `analyze()` 那一層**沒有接** ⇒ 整支工具當場崩掉、**一個頁面都產不出來**
         # （2026-09-01 同事回報：321 個 session 檔全滅）。
         p = content_text(a.get("prompt")).strip()
@@ -2621,11 +2616,11 @@ def synth_queued_user_events(events, name=""):
         # 頁面上等於不存在——而它們是使用者真的送出去的東西。
         imgs = [b for b in a["prompt"] if isinstance(b, dict) and b.get("type") == "image"] \
             if isinstance(a.get("prompt"), list) else []
-        # ⚠⚠ **崩潰不可以被換成靜默。** 修掉 `AttributeError` 之後，`prompt` 若漂成
+        # ⚠⚠ **崩潰不可以被換成靜默。** `prompt` 若漂成
         # 我們認不得的形狀（dict、數字、list of str…），`content_text()` 回 `""`、`imgs` 回 `[]`
         # ⇒ 下面 `if p or imgs:` 兩邊都假 ⇒ 這一則排隊句**連進都進不來**，頁面上又變回
         # 「答案在、問題不在」——而那正是這支函式存在的唯一理由。
-        # ⚠ Codex 那一側有 13 條這種漂移哨兵，Claude 這一側先前一條都沒有。
+        # ⚠ 這是 Claude 這一側的漂移哨兵；Codex 那一側有 13 條同類的。
         # 判準只認結構：`prompt` 不是 str 也不是 list，或 block 陣列裡出現既不是 `text`
         # 也不是 `image` 的元素。
         _pr = a.get("prompt")
@@ -2683,8 +2678,8 @@ def synth_queued_user_events(events, name=""):
         if not isinstance(raw_c, str) or hkey not in human:
             continue
         # ⚠⚠ **每一個對得上的 `remove` 都要消耗一個 attachment 時刻**，
-        # 不管它最後是由合成事件還是由真 user 事件呈現。舊版只在「真的合成」時才前進，
-        # 於是「第一次被真 user 代表、第二次才合成」的那一句拿到**第一次**的按 Enter 時刻
+        # 不管它最後是由合成事件還是由真 user 事件呈現。只在「真的合成」時才前進的話，
+        # 「第一次被真 user 代表、第二次才合成」的那一句會拿到**第一次**的按 Enter 時刻
         # （實測 `queued_at=['…10:00:01Z']`，實際是 `10:00:10`）。
         queued_at, queued_imgs = _take_queued_at(human, used, hkey)
         # ⚠⚠ **只消耗「同一個來源檔、而且排在這個 remove 之後」的真 user 事件。**
@@ -2709,7 +2704,7 @@ def synth_queued_user_events(events, name=""):
         out.append({
             "type": "user",
             # ⚠⚠ **沒有圖片時維持字串**，不要一律包成 block 陣列：那會讓**所有**既有的
-            # 排隊句改走另一條呈現路徑，等於為了新功能動到已經審過的舊行為。
+            # 排隊句改走另一條呈現路徑，等於為了新功能動到既有的行為。
             # 有圖片才換成 `[文字, 圖片…]`——那正是真的 user 事件貼圖時的長相，
             # 下游（呈現、MD、搜尋、封存分類）本來就都認得它。
             "message": {"role": "user", "content": _queued_content(c, queued_imgs)},
@@ -2718,7 +2713,7 @@ def synth_queued_user_events(events, name=""):
             # ⚠⚠ **不可以硬寫 `False`。** 排隊句也可能發生在子代理的轉錄檔裡，
             # 硬寫的話它會被塞進主對話。
             # ⚠ 真實語料目前 0 則落在 sidechain——照樣沿用來源事件的身分，
-            #   因為「量到 0」講的是這份語料，不是這個判準（教訓 44）。
+            #   因為「量到 0」講的是這份語料，不是這個判準。
             "isSidechain": bool(e.get("isSidechain")),
             "_srcf": e.get("_srcf") or "",
             "_dt": e.get("_dt"),
@@ -2750,8 +2745,8 @@ def _take_queued_at(human, used, key):
     `key` 是 `(來源檔, prompt)`——**來源檔一定要在鍵裡面**，否則子代理的附件會被
     主檔的 `remove` 配走。
 
-    ⚠ 舊版是 `human.get(prompt)`＝永遠回第一次的時刻，於是同一句排隊兩次時
-    第二次的游標提示顯示的是**第一次**打字的時間——時間軸在說謊，
+    ⚠ 要逐次往後走，不能用 `human.get(prompt)`＝永遠回第一次的時刻：同一句排隊兩次時
+    第二次的游標提示會顯示**第一次**打字的時間——時間軸在說謊，
     而那正是這個欄位存在的唯一理由。
     ⚠ 用完了就沿用最後一個（`remove` 比 attachment 多是壞檔，不該整句不畫）。
     """
@@ -2834,7 +2829,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
         else:
             blocks = []
         if role == "user":
-            # 指令列／通知列：**在雜訊判定之前**。這些過去被 `is_noise_user()` 整則吃掉
+            # 指令列／通知列：**在雜訊判定之前**。這些會被 `is_noise_user()` 整則吃掉
             # （全語料 1170 則指令包裝＋872 則通知），而它們確實發生過。
             special = user_special_blocks(e)
             if special:
@@ -2920,18 +2915,18 @@ def group_turns(events, per_step=True, step_by_usage=False):
                 #   通知以前就是一個 user 回合、本來就會切 ⇒ 繼續切（見下面那條路）。
                 # ⚠ 掛進回合內部不會推移序號：`_command` 在 `block_is_renderable` 回 False。
                 # ⚠⚠ **述詞是「v54 會不會把這一則當雜訊丟掉」**，不是「它是指令還是通知」。
-                # `clean_user_text(txt) == ""` 就是 `is_noise_user()` 當初的判準本身。
+                # 也就是 `is_noise_user()` 本人（見下面那條 ⚠⚠⚠）。
                 #   · 指令包裝 → 剝完是空的 → **以前被丟掉** → 不可以切輪
                 #   · `<task-notification>` **被包在 `<system-reminder>` 裡**的那種
                 #     → 也是剝完就空 → **以前也被丟掉** → 一樣不可以切輪
-                #     （這一格是實測抓到的：只看「是不是通知」的話，這種會開始切輪，
-                #      而它在真實語料裡很常見——本 session 的背景任務通知全是這個形狀）
+                #     （只看「是不是通知」的話，這種會開始切輪，
+                #      而它在真實語料裡很常見）
                 #   · 裸的 `<task-notification>` → 剝完還有字 → **以前就是一個 user 回合**
                 #     → 繼續切輪、繼續拿它的區塊錨點（不動＝不破壞）
                 # ⚠ 掛進回合內部的那些**一律不可以佔區塊序號**：帶 `inline` 標記，
                 #   由 `block_is_renderable()` 認它。
                 # ⚠⚠⚠ **一定要呼叫 `is_noise_user()` 本人，不可以重寫它的條件。**
-                # 這裡原本寫成 `clean_user_text(txt) == ""`，自以為那「就是」它的判準——
+                # 若在這裡寫成 `clean_user_text(txt) == ""`，自以為那「就是」它的判準——
                 # 但那只是它的**第二行**；**第一行是 `if ev.get("isMeta"): return True`**，
                 # 跟文字內容完全無關。
                 # 失效方向最糟：背景任務通知在真實語料裡**幾乎全掛在 `isMeta` 事件上**
@@ -2974,9 +2969,9 @@ def group_turns(events, per_step=True, step_by_usage=False):
             # 「助手講完了 → 使用者說話 → 助手開始新的一輪」——那是假的。
             # 改成掛在**開著的那個 assistant 回合**內部，成為一個 `_interject` 區塊。
             # ⚠ 真的跨輪的（`remove` 落在 `turn_duration` 之後）走下面的一般 user 回合。
-            # ⚠⚠ **靠的是 `_turn_done`，不是「沒有開著的回合」。** 本註解第一版寫的是後者，
-            #   那是錯的：`cur` 在 `turn_duration` 之後**仍然開著**（它要等下一則 assistant
-            #   事件才換），所以真正把它擋下來的是中間剛好有一則真 user 事件
+            # ⚠⚠ **靠的是 `_turn_done`，不是「沒有開著的回合」**：`cur` 在 `turn_duration`
+            #   之後**仍然開著**（它要等下一則 assistant 事件才換），所以「沒有開著的回合」
+            #   擋不到它；能擋下來的只有中間剛好有一則真 user 事件
             #   ——沒有那一則時就會掛錯。
             if (blocks and e.get("_queued_at") and cur is not None
                     and cur["role"] == "assistant"):
@@ -3112,7 +3107,7 @@ def _tiebreak_key(g):
     而一場 session 的事件來自**多個檔**（主檔 ＋ `<sid>/**/*.jsonl` 子代理轉錄，見
     `load_session`）。單拿行序比會打平，而 `list.sort` 是穩定排序 ⇒ 退回
     `s.main_groups + s.side_groups` 的位置 ⇒ 主搶子。⚠ **註解宣稱了保證卻沒人在守，這個錯很容易重犯**。
-    現在守它的是 `tests/test_smoke.py::test_anchor_tiebreak_main_vs_side`。
+    守它的是 `tests/test_smoke.py::test_anchor_tiebreak_main_vs_side`。
 
     **它保證什麼**：主檔的事件（`src_f` 為空字串）排在所有子代理檔之前。
     這是刻意的方向——子代理轉錄檔是被主對話的 Task 呼叫起來的，**它在主回合之後才落地**。
@@ -3151,7 +3146,7 @@ def durable_anchor(dt):
     **為什麼保留毫秒**：只截到整秒，撞號會從 1 變 31。
 
     **為什麼是 UTC**：檔名用的是 `s.start.astimezone()`（本地時間），機器時區一變整批就變
-    ——錨點不能再犯同一個錯。使用者要看的本地時間由 `#` 連結的 `title` 提供：
+    ——錨點不能有同樣的毛病。使用者要看的本地時間由 `#` 連結的 `title` 提供：
     **網址給機器，UI 給人。**
 
     ⚠ 開頭一律是 `k`：HTML `id` 與 URL fragment 都不該以數字開頭。
@@ -3193,8 +3188,8 @@ def analyze(s, acct_switches=None):
             if ms and e.get("type") == "assistant":
                 e["_turn_ms"] = ms
     # 注意：parentUuid 指到非 assistant（user／tool_result／system，實測約 14%）或找不到對象的
-    # turn_duration 一律不掛、該回合就不顯示 ⏱——刻意不做近似、也不改掛別的事件（G1 曾因 dur_ms
-    # 覆寫踩過「顯示 3 秒、實際 651 秒」，這裡寧缺勿錯）。
+    # turn_duration 一律不掛、該回合就不顯示 ⏱——刻意不做近似、也不改掛別的事件（耗時一旦掛錯
+    # 或被覆寫，就會顯示「3 秒、實際 651 秒」這種錯的數字，這裡寧缺勿錯）。
     # 掛上之後還有一條會丟：目標事件若沒有可呈現內容，group_turns 會跳過它——那裡另有補收（見該處註解）。
     msg = [e for e in s.events if e.get("type") in ("user", "assistant")]
     # 排隊送出的提示詞在檔案裡沒有 user 事件，補進來才畫得出（見 synth_queued_user_events）。
@@ -3239,7 +3234,7 @@ def analyze(s, acct_switches=None):
         # ⚠⚠ **只有指令列不進撞號池**（`_no_anchor` 只在 `_command` 那一種為真）。
         # ⚠⚠ **自成一列的通知照進、照拿錨點**——它在 v55 之前就是普通 user 回合、
         #    本來就有錨點，拿掉會讓標在通知上的既有書籤安靜斷掉（實測會少 872 個）。
-        #    「新東西不拿」安全、「舊東西不再拿」是破壞，兩者在碼裡長得一樣（教訓 53）。
+        #    「新東西不拿」安全、「舊東西不再拿」是破壞，兩者在碼裡長得一樣。
         # 指令列不進池子的三個理由，缺一都不足以決定：
         #  ① 它不是對話——`/effort high` 加書籤沒有意義。
         #  ② **這是「既有書籤一個都不會動到」的唯一機械保證。** 錨點是時間戳，
@@ -3672,7 +3667,7 @@ def load_account_switches(config_dirs, health=None) -> dict:
             label = str(Path(cfg).resolve()).casefold()
         except OSError:
             label = str(cfg).casefold()
-        # `files` 在 `open()` **成功之後**才加：舊寫法開檔失敗時 `files` 與
+        # `files` 在 `open()` **成功之後**才加：開檔失敗時也加的話，`files` 與
         # `read_errors` 會同時加一，於是 `_acct_scope_note` 的「讀到 N 份 history」把讀不到的
         # 那幾份也算進去了——揭露涵蓋率的句子本身高估涵蓋率，方向剛好相反。
         try:
@@ -3983,7 +3978,7 @@ def classify_cache_causes(raw, models, events, masked=None):
         #   而 `ei = j` 又把標記消費掉，真正在切換之後的那一步反而拿不到。實測三種次秒位置
         #   （T+299.4／T+300.0／T+300.6）結果完全相同 → tie-break 一律往「算在使用者頭上」倒。
         #   **行為刻意不動**（本機沒有正例可驗、且動到金額），詳見 scope-limits.md 的
-        #   SCOPE-ACCT-EVENT-SUBSEC〈2026-08-22 補上另一個方向〉那一列。
+        #   SCOPE-ACCT-EVENT-SUBSEC 那一列。
         # ⚠ 上界用**截到整秒**的事件時刻比：步驟時刻本身就是整秒，落在「當前這一步同一秒」的
         # 切換若照浮點比就會超出上界、被推到下一對去，該步的成因跟著掉。
         # 下界那條刻意維持浮點（見上面的說明）——兩條各自對齊它要比的那一端。
@@ -4046,7 +4041,7 @@ def classify_cache_causes(raw, models, events, masked=None):
                 # 任何一次 API 呼叫，那次被迫切換就會落成 `acct`（人因、記錢、紅色 🔥）。
                 # 全語料實測：10 個 `acct` 標籤裡有 3 個同場稍早出現過 limit/auth
                 # （間隔 5005／4942／11584 秒），涉及 $9.05 ＝ 人因浪費 $299.20 的 3.03%。
-                # ⚠ **只並列顯示、不動記帳**（Will 2026-08-21 裁決）：那三筆的間隔都以小時計，
+                # ⚠ **只並列顯示、不動記帳**：那三筆的間隔都以小時計，
                 #   工具判不出是不是同一件事；挑一個衰減窗把它們改判成被迫，會反過來把自願切換
                 #   洗白，而那個方向量不到。兩個都標，讓讀的人自己判斷。
                 # 「稍早」＝落在這一對的窗**之前**（`t <= prev[0]`）。窗內的那些已經進了 `kinds`，
@@ -4891,8 +4886,8 @@ def render_turn_meters(group):
             # `_masked_human_note`／`_srv_excluded_note` 對讀者寫的正是「逐步徽章會兩個都標」，
             # 那句話在這種回合上是假的——本機有**一成左右**的並列步落在單步回合，
             # 那些步在頁面上一個字都看不到。
-            # ⚠ 這裡刻意不寫死對數，理由與 `:294-296` 同一條：對數隨語料與量法變動，
-            #   而這一行原本就寫錯過一次（抄了未去重的數字，是實際值的四倍）。
+            # ⚠ 這裡刻意不寫死對數，理由與 `API_OTHER_CAUSE` 上方那段同一條：對數隨語料與量法變動，
+            #   未去重的量法會得到實際值的四倍。
             # 這裡讓整段徽章直接吃該步的 cause／cause_masked，規則與下方多步的 ❄ 完全一致：
             # 成因平時只進 title（版面已經很擠），「同一步還成立別的條件」才攤到版面上。
             _mp, _mi, mc, mcold, mmask = coldest_step(group)
@@ -4906,7 +4901,7 @@ def render_turn_meters(group):
                     # 兩句話互相否定。這種步改用不預判的措辭，讓成因自己講。
                     # ⚠ 只動文字、**不動著色**：`turn_cold_class`／`_cold_display` 要不要把並列
                     #   條件納入顏色判斷是另一個問題（會改全語料所有並列步的顏色），
-                    #   Will 2026-08-21 選擇不在這條裡一起動。
+                    #   不在這條裡一起動。
                     ctitle = "整段命中率低"
                 ctitle += "；" + _cold_cause_title(mc, mmask, "這一步的成因")
                 ctag = f"·{_cold_cause_label(mc, mmask)}" if mmask else ""
@@ -5004,7 +4999,7 @@ def step_anchor(kanchor, step_ep):
     **兩邊一律走這一支**，不可以各寫一份判斷（例：
     只在 `block_anchor()` 擋負值，於是同一個 group 裡區塊錨點正確消失、
     步驟列照樣輸出 `k…-s-900`——而那正是 `bmGrammarOk()` 會拒絕的字串，
-    使用者點了只會得到「找不到」）。**同一條規則寫兩次就會分岔**，這條線為此付過三次。
+    使用者點了只會得到「找不到」）。**同一條規則寫兩次就會分岔**。
 
     不給的兩種情況：
     - `step_ep is None`——那一步沒有時戳，或同輪內撞號被呼叫端歸零。
@@ -5224,7 +5219,7 @@ def render_command_html(b):
 
 
 def render_notify_html(b):
-    """背景任務通知：收成一列摘要，原文收進摺疊（Will 2026-08-25 的選擇）。
+    """背景任務通知：收成一列摘要，原文收進摺疊。
 
     ⚠ 摘要取 `<summary>`；Monitor 型沒有 `<status>`、內容在 `<event>`。
     ⚠ 兩者都可能是空的（新版 CLI 隨時會長出新形狀）——**空的時候要退回原文**，
@@ -5234,8 +5229,8 @@ def render_notify_html(b):
     那個「或」是**只修一半**：帶 `<event>` 的那種（Monitor 型）於是只剩 event 內容，
     同一則的 `<task-id>`、`<output-file>` **從頁面和 MD 全文索引裡消失**
     ——而那些欄位在 v55 之前是搜得到的（整則原文就畫在頁面上）
-    ⇒ 這一版把它變成**比舊版更差**（實測 `task_in_md=False`）。
-    現在的做法：event 當摘要用，摺疊裡永遠是完整原文。
+    ⇒ 會變成**比 v55 之前更差**（實測 `task_in_md=False`）。
+    做法：event 當摘要用，摺疊裡永遠是完整原文。
     """
     summ = b.get("summary") or ""
     status = b.get("status") or ""
@@ -5314,7 +5309,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         bi += 1
         t = b.get("type")
         if t == "_step":
-            # 「插話之後」的縮排**只包第一段回應**（Will 2026-08-25 從三種畫法裡挑的）：
+            # 「插話之後」的縮排**只包第一段回應**：
             # 插話後的第一個步驟留在框內，**下一個步驟開始之前就收**。
             if ij_open:
                 ij_steps += 1
@@ -5330,7 +5325,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
                     b.get("cause_masked"),
                     anchor=step_anchor(kanc, step_ep)))
             continue
-        # ⚠ 一律先算出 `html` 再統一包裝：舊版每個分支自己 `parts.append`，那樣「這一塊算不算
+        # ⚠ 一律先算出 `html` 再統一包裝：每個分支自己 `parts.append` 的話，「這一塊算不算
         # 一個可標記區塊」會散在五個地方，序號遲早對不上。空字串＝不渲染＝不佔序號。
         html = ""
         extra = ""          # 只有 tool_use 用得到：子代理區塊是它的**兄弟**，不進包裝
@@ -5409,10 +5404,10 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
     dt = group.get("dt")
     when = local_str(dt, "%H:%M:%S")
     when_full = (day_label(dt) + " " + when) if dt else ""   # 游標停留顯示完整日期
-    # 排隊送出的那一句：**畫在它被讀到的時刻**（Will 2026-08-25 的裁決），但按下 Enter
+    # 排隊送出的那一句：**畫在它被讀到的時刻**，但按下 Enter
     # 的時刻不能就這樣消失——時間軸會變成在說謊，所以進游標提示。
-    # ⚠⚠ **而且要在版面上看得出來這是「助手工作到一半時插進來的」**（Will 2026-08-25 追加）：
-    # 位置本身已經被裁決成「被讀到的那一刻」＝它看起來就像一般的一問一答，
+    # ⚠⚠ **而且要在版面上看得出來這是「助手工作到一半時插進來的」**：
+    # 位置取「被讀到的那一刻」＝它看起來就像一般的一問一答，
     # 於是「這是插話」如果只留在游標提示裡，等於沒有講。所以另給一個徽章。
     _qa = parse_ts(group.get("queued_at")) if group.get("queued_at") else None
     q_badge = ""
@@ -5545,8 +5540,8 @@ def acct_sep_label(ts, day=""):
 #   守這四項的是 `test_bookmark_core_contract`（三頁各驗一次）。
 _BOOKMARK_CORE_JS = r"""
 var BK_KEY='asv_bm_v1', BK_SKEY='asv_bmset_v1';
-/* 複查間隔：**單選**（Will 的原話是「下拉使用上比較不方便」），預設半年。
-   ⚠ 到期只是一個狀態，**書籤永遠不會自動刪**（Will 2026-08-22 裁決）。 */
+/* 複查間隔：**單選**（下拉使用上比較不方便），預設半年。
+   ⚠ 到期只是一個狀態，**書籤永遠不會自動刪**。 */
 var BK_SPANS=[['0','不提醒'],['14d','兩週'],['1m','一個月'],['3m','三個月'],
               ['6m','半年'],['1y','一年']];
 var BK_FALLBACK='6m';   /* 設定頁還沒被寫過時的出廠值 */
@@ -5599,9 +5594,9 @@ function bkTs(v,now){
    全部包 try/catch：`file://` 下 localStorage 可能丟例外、也可能回 null
    （lsGet/lsSet 已經擋了一層，這裡擋的是 JSON 壞掉那一層）。 */
 /* ⚠⚠ **「讀不到」和「確定沒有書籤」是兩種狀態，不可以混成同一種。**
-   舊版解析失敗就回空陣列，於是**下一次任何寫入**（加一筆、移除、匯入）都把那個空
-   狀態寫回原鍵，把還救得回來的原始字串**永久輾掉**——等於所有書籤自動消失
-   現在壞掉時帶 `bad:1` ＋ `raw`，由 `bkStore()` 一律拒寫，
+   解析失敗若回空陣列，**下一次任何寫入**（加一筆、移除、匯入）都會把那個空
+   狀態寫回原鍵，把還救得回來的原始字串**永久輾掉**——等於所有書籤自動消失。
+   所以壞掉時帶 `bad:1` ＋ `raw`，由 `bkStore()` 一律拒寫，
    footer 給一條「⛑ 匯出原始資料」的救援路。
    守它的是探針的 `corrupt_store_not_overwritten`／`corrupt_store_drop_also_blocked`。 */
 function bkLoad(){
@@ -5613,8 +5608,8 @@ function bkLoad(){
  if(!o||!Array.isArray(o.items))return {v:1,items:[],bad:1,raw:r};
  /* ⚠ items 裡的**每一筆**也要驗。`{items:[null]}` 是合法 JSON、根形狀也對，
     但 `bkCatsAll()` 一碰就 `TypeError` ⇒ **整頁死掉**。
-    ⚠ 個別壞掉的紀錄直接丟掉、**不封鎖寫入**：它們連 sid/anchor 都沒有，
-    沒有任何可救的內容，而一個 null 不該讓使用者從此不能再加書籤。
+    ⚠ 個別壞掉的紀錄**不封鎖寫入**（原樣留著，見下面的 `kept`）：
+    一個 null 不該讓使用者從此不能再加書籤。
     這和上面那個「整份讀不到」是**不同等級**的壞，處置也不一樣。 */
  var out=[],kept=[],i,x,sid,anch;
  for(i=0;i<o.items.length;i++){
@@ -5622,22 +5617,22 @@ function bkLoad(){
   sid=(x&&typeof x==='object')?bkIdPart(x.sid):'';
   anch=(x&&typeof x==='object')?bkIdPart(x.anchor):'';
   if(!sid||!anch){
-   /* ⚠⚠ **認不出來的不可以就這樣丟掉。** 舊版直接 `drop++;continue;`，而
+   /* ⚠⚠ **認不出來的不可以就這樣丟掉。** 若直接 `drop++;continue;`，
       `bkStore()` 只寫 `st.items` ⇒ **下一次任何寫入就把它們永久移除**，
-      連帶把裡面的備註一起弄丟。註解當時寫「它們連 sid/anchor 都沒有，
-      沒有任何可救的內容」——**那句是錯的**：`{sid:"",note:"還沒補錨點的筆記"}`
+      連帶把裡面的備註一起弄丟。它們連 sid/anchor 都沒有，
+      卻不是沒有任何可救的內容：`{sid:"",note:"還沒補錨點的筆記"}`
       有滿滿的可救內容。這和「書籤永遠不會自動刪」直接牴觸。
-      改成**原樣留著**（`kept`），由 `bkStore()` 一起寫回去：不顯示、不參與合併，
+      所以**原樣留著**（`kept`），由 `bkStore()` 一起寫回去：不顯示、不參與合併，
       但也絕不消失，`⬇ 完整備份`（`pay.kept`，見 `bkExport`）與 `⛑ 匯出原始資料`
       都救得到。⚠ 「救得到」＝**檔案裡有**，不是「匯入會還原」——它們沒有 sid，
       匯入端一定會略過。
       ⚠ 不走 `bad:1` 拒寫那條路：那會讓一筆垃圾紀錄害使用者從此不能再加書籤。
       守它的是探針的 `unreadable_record_survives_write`。 */
    kept.push(x);continue;}
-  /* ⚠⚠ **逐欄位正規化，不是只驗 sid／anchor 就把原物件塞回去。** 舊版 `out.push(x)`
-     ⇒ `{sid:'s',anchor:'k',cat:{}}` 過得了這一關，然後 `bkCatsUsed()` 的
+  /* ⚠⚠ **逐欄位正規化，不是只驗 sid／anchor 就把原物件塞回去。** 若直接 `out.push(x)`，
+     `{sid:'s',anchor:'k',cat:{}}` 過得了這一關，然後 `bkCatsUsed()` 的
      `(cat||'').replace` 直接 `TypeError`＝**整頁死掉**。那正是 `{items:[null]}`
-     那一條的同一個病，只是換到欄位層——當時只補了最外層。
+     那一條的同一個病，只是換到欄位層——外層與欄位層都要驗。
      ⚠ **`url` 刻意不在這裡過 `bkSafeRel`**：那會讓匯出端那道閘再也沒有素材走得到
      （手改進去的絕對路徑會在載入時就被清掉），縱深就變成只剩一道而且量不到。
      形狀驗證留給匯出端（`export_gate_drops_hand_edited_url` 在守）。
@@ -5662,7 +5657,7 @@ function bkLoad(){
    守它的是探針的 `quota_failure_is_reported`。
    ⚠⚠ **壞掉的 store 一律拒寫，而且擋在這裡**——這是唯一的寫入口，
    `bkCommit`／`bkDrop`／`bkUndo`／`bkImport` 全部經過它。擋在各呼叫端就會漏
-   （教訓：**保險只寫在一條分支上等於沒寫**）。 */
+   （**保險只寫在一條分支上等於沒寫**）。 */
 function bkStore(st){
  if(st&&st.bad)return false;
  /* ⚠⚠ **認不出形狀的紀錄要原樣寫回去**（見 `bkLoad()` 的 `kept`）。
@@ -5706,15 +5701,15 @@ function bkRescue(){
  var st=bkLoad(), raw=st.bad?(st.raw||''):(lsGet(BK_KEY)||'');
  /* ⚠⚠ **沒有原始字串就不要下載**：照存下去就是一個 0 位元組的檔 ＋ 一句
     「已把原始資料存成檔案」——訊息和實際發生的事相反。
-    ⚠⚠ **但訊息要跟著實際狀態走。** 舊版一律說「瀏覽器拒絕存取 localStorage」，
-    理由寫的是「`lsGet` 丟例外時 `bkLoad()` 回 `{bad:1,raw:''}`」——**那個狀態到不了**：
+    ⚠⚠ **但訊息要跟著實際狀態走**，不是一律說「瀏覽器拒絕存取 localStorage」。
+    「`lsGet` 丟例外時 `bkLoad()` 回 `{bad:1,raw:''}`」這個狀態**到不了**：
     `lsGet` 自己就 try/catch 回 `null`，`bkLoad` 的 `if(!r)` 先把它接走 ⇒ 永遠不是 `bad`。
-    ⚠⚠ **訂正：整個 `if(!raw)` 分支從 UI 都到不了，不只 `st.bad` 那半。**
+    ⚠⚠ **整個 `if(!raw)` 分支從 UI 都到不了，不只 `st.bad` 那半。**
     `bkFoot()` 的救援鈕**只在 `st.bad` 為真時**畫得出來，而 `bkLoad()` 在 `st.bad` 時
     `raw` 必定非空（`if(!r)` 先把 null 接走了，JSON 壞掉那條一定帶著原字串）
     ⇒ 按得到鈕的時候 `raw` 一定有東西。
-    這裡原本寫「真正到得了這一格的只有『store 完全正常、只是還沒有任何書籤』」——
-    **也不成立**（那個狀態下鈕根本不會出現）。
+    「store 完全正常、只是還沒有任何書籤」這個狀態也到不了這一格
+    （那個狀態下鈕根本不會出現）。
     ⇒ **這整段是純防禦**：唯一走得到的是探針**直接呼叫** `bkRescue()`。
     留著它的理由是「訊息不可以和實際發生的事相反」這條規則不該有例外，
     **不是**因為有哪個使用者操作序列走得到。
@@ -5754,10 +5749,10 @@ function bkCatTimes(src,cats){
   t=Number(Object.prototype.hasOwnProperty.call(src,cats[i])?src[cats[i]]:0);
   if(isFinite(t)&&t>0)out[cats[i]]=t;}
  return out;}
-/* ⚠⚠ **「壞掉就拒寫」原本只做在書籤那把鍵上。** 類別清單是使用者自己建的資料、
-   同樣只活在 localStorage 裡（README 特別說明過），卻是舊行為：解析失敗就當成
-   「這台還沒有設定」，然後**下一次任何寫入**（加一個類別、按一顆間隔 chip、匯入）
-   就把原字串輾掉。又一次「保險只寫在一條分支上」——兩把鍵同一個等級，只守了一把。
+/* ⚠⚠ **「壞掉就拒寫」兩把鍵都要做，不是只做書籤那把。** 類別清單是使用者自己建的資料、
+   同樣只活在 localStorage 裡（README 特別說明過）：解析失敗若當成
+   「這台還沒有設定」，**下一次任何寫入**（加一個類別、按一顆間隔 chip、匯入）
+   就把原字串輾掉。保險要寫在每一條分支上——兩把鍵同一個等級，兩把都要守。
    守它的是探針的 `corrupt_settings_not_overwritten`。 */
 function bkSetBad(){
  var r=null;
@@ -5768,7 +5763,7 @@ function bkSetBad(){
               &&(typeof o.rv==='string'||Array.isArray(o.cats)));}
  catch(e){return true;}}
 function bkSettings(){
- /* ⚠⚠ **`rv` 缺漏不可以整份丟掉。** `{"cats":["甲","乙"]}` 原本會回 null ⇒
+ /* ⚠⚠ **`rv` 缺漏不可以整份丟掉。** `{"cats":["甲","乙"]}` 若回 null ⇒
     對話窗與設定頁的**整份類別清單直接消失**，看起來像「你沒有任何類別」，
     接著第一次存偏好就寫成 `cats:[]`，永久。`cats` 是陣列就先救回來，
     `rv` 退回出廠值。守它的是探針的 `settings_without_rv_keeps_cats`。 */
@@ -5817,7 +5812,7 @@ function bkNum(v,def){var n=Number(v);return isFinite(n)?n:def;}
    `newer=incWhen>bkWhen(cur)` 對「未知時間戳（0）」的匯入檔**恆真**，
    而 `cur.mt` 只在 `newer&&incWhen>0` 時才寫回去 ⇒ 那個條件恆假
    ⇒ 同一份檔案每匯一次就再判一次衝突、備註尾巴每次長一截（＝不冪等）。
-   ⚠⚠ **但這個夾制是純防禦，沒有素材走得到**（教訓 29）：`bkLoad()` 是唯一的讀取口，
+   ⚠⚠ **但這個夾制是純防禦，沒有素材走得到**：`bkLoad()` 是唯一的讀取口，
    它已經用 `bkDueOk` 把 `mt` 正規化掉負值了，所以進到這裡的 `x.mt` 不可能是負的。
    突變檢驗實測：只把這裡的夾制拿掉，探針**全綠**。
    ⇒ **不要在這裡寫「守它的是 XXX」。** 真正在守那個不冪等症狀的是
@@ -5826,7 +5821,7 @@ function bkNum(v,def){var n=Number(v);return isFinite(n)?n:def;}
    `bkNum(x.mt, bkNum(x.ct,0))` 然後夾下界——`bkLoad()` 現在會把缺漏的 `mt`
    正規化成 **0**（而 0 是 finite），於是那個寫法再也不會退回 `ct`，
    所有舊格式紀錄的時刻一起變成 0 ⇒「最近用過」的排序整個垮掉。
-   （這一格是探針的 `recent_used_first` 當場抓到的。） */
+   （這一格由探針的 `recent_used_first` 守著。） */
 function bkWhen(x){
  var m=bkNum(x&&x.mt,0); if(m>0)return m;
  var c=bkNum(x&&x.ct,0); return c>0?c:0;}
@@ -5836,10 +5831,10 @@ function bkWhen(x){
 function bkOrd(x){return bkNum(x&&x.ct,0)||bkNum(x&&x.im,0);}
 
 /* ── 合併一筆（匯入 ↔ 本機，兩個方向共用同一段）─────────────────────
-   ⚠⚠ **「只增不減」是這一套的最高不變量**，而它一度是假的：舊版是**整筆勝者制**
-   ——較新那一筆的非空欄位直接取代本機，輸家的 note/cat/sum **原地消失、不留痕跡**；
-   反向分支自稱「只補缺欄位」卻漏掉 `url`／`town`／獨立的 `due`。
-   「兩個方向都逐欄位、只增不減」這個保證**對非空衝突不成立**，所以要有測試守它（探針 ⑭c）。
+   ⚠⚠ **「只增不減」是這一套的最高不變量**：採**整筆勝者制**
+   （較新那一筆的非空欄位直接取代本機）的話，輸家的 note/cat **原地消失、不留痕跡**；
+   「只補缺欄位」的那條路也要涵蓋 `url` 與獨立的 `due`，不能漏（`town` 另有規則，見下）。
+   「兩個方向都逐欄位、只增不減」這個保證**對非空衝突也要成立**，所以要有測試守它（探針 ⑭c）。
 
    欄位分兩類，處置不同：
    · **使用者自己寫的**（`note`／`cat`）：一個字都不可以掉。兩邊都有而且不同、
@@ -5852,8 +5847,8 @@ function bkOrd(x){return bkNum(x&&x.ct,0)||bkNum(x&&x.im,0);}
    · **快取欄位**（`url`／`stitle`／`sum`）：本來就可以重算（見 `bkEditRec`），
      新的贏、缺的補，衝突不記——那不是資料損失。
    · **`town`**：**永遠不吃匯入端的**，理由見 `bkImport` 裡那一段。
-   ⚠ 兩個方向共用這一段，是因為「保險只寫在一條分支上等於沒寫」——這條線上
-   同一個保證已經連續寫錯過三次，全部都是分支之間漏掉一邊。 */
+   ⚠ 兩個方向共用這一段，是因為「保險只寫在一條分支上等於沒寫」——
+   分支之間漏掉一邊，這個保證就破了。 */
 var BK_LOST='—— 合併時保留的另一份值：';
 function bkKeepLost(note,lost){
  if(!lost)return note||'';
@@ -5881,13 +5876,13 @@ function bkMerge(cur,inc,incWhen){
     ⚠⚠ **`cur.span==='0'` 不可以放進這個條件裡。** `'0'` 是使用者在對話窗裡
     **明確關掉提醒**的結果，不是「還沒設定」；把它當成缺值去補，就會讓一份**較舊**的
     備份把關掉的提醒無聲復活，而且連 `due` 一起帶回來 ⇒ 立刻算「該複查了」。
-    這和下面那一行的註解本來是同一條規則，卻只寫在下面那半——又一次
-    「保險只寫在一條分支上」：下面那道守著的東西，上面這道先放行了。
+    這和下面那一行的註解是同一條規則，兩半都要寫——保險要寫在每一條分支上：
+    下面那道守著的東西，上面這道不可以先放行。
     只有「**根本沒有這個欄位**」（舊格式）才補。
     守它的是探針的 `older_import_does_not_revive_off_reminder`。 */
  if(inc.span!=='0'&&(newer||!cur.span)){
   cur.span=inc.span;cur.due=inc.due;n++;}
- /* ⚠⚠ **本機已經有間隔、卻沒有到期日**時才單獨補 `due`（那正是舊版漏掉的一格）。
+ /* ⚠⚠ **本機已經有間隔、卻沒有到期日**時才單獨補 `due`（這一格不可以漏）。
     ⚠ 反過來**不可以**在 `cur.span==='0'` 時補 `due`：那是使用者明確關掉的提醒，
     補了會讓它無聲復活（`bkOverdue` 只看 `due`，畫面上的 chip 卻寫著「不提醒」）。 */
  else if(cur.span&&cur.span!=='0'&&!cur.due&&inc.due){cur.due=inc.due;n++;}
@@ -5952,7 +5947,7 @@ function bkSafeRel(u){
    ⚠ 判準刻意比 `bkSafeRel` 窄：只認 `/`、`\` 與開頭的磁碟機代號。
    拿「有沒有 `:`」當判準會誤殺時間戳形狀的識別字，而那不是洩漏。
    ⚠⚠ **這道閘的正當性不建立在「`sid` 來自哪裡」，而是建立在「像路徑就遮」。**
-   （曾經寫成「`sid` 的來源是檔名主幹，任何平台上都不會含分隔符」——**那對 Codex 不成立**：
+   （不能把理由寫成「`sid` 的來源是檔名主幹，任何平台上都不會含分隔符」——**那對 Codex 不成立**：
    Claude 的 `session_id` 確實是 `path.stem`，但 Codex 的來自 **JSONL 檔內**的
    `session_meta.payload.id`，那是資料不是檔名。實務上兩者都是 uuid，所以閘不會誤殺，
    但**別拿那個推理當放寬這道閘的理由**——store 裡的值本來就可能是手改的。）
@@ -5967,7 +5962,7 @@ function bkSafePart(s){
 /* ── 類別 ──────────────────────────────────────────────────────────
    來源有兩個：**設定頁管理的清單**（有順序、可含沒被用到的）與**書籤實際用到的**。
    ⚠⚠ 合起來才是完整清單。只認設定頁那一份的話，就退化成「只能從 Settings 選」
-   ——那正是 Will 自己點出的那個問題（`bookmarks-proposal.md`〈類別的裁決〉）。 */
+   ——那正是要避免的問題。 */
 function bkCatsUsed(st){
  var seen=Object.create(null),out=[],i,c;
  for(i=0;i<st.items.length;i++){c=(st.items[i].cat||'').replace(/^\s+|\s+$/g,'');
@@ -5983,17 +5978,17 @@ function bkCatsAll(st){
  return out;}
 function bkCatsRecent(st){
  /* 「最近用過的排前面」：用每個類別最後一次被存下的時間排。
-    ⚠ 這個順序**只給對話窗用**——現場加書籤要快，不該要求 Will 手動維護顯示順序。
+    ⚠ 這個順序**只給對話窗用**——現場加書籤要快，不該要求使用者手動維護顯示順序。
     Array.sort 是穩定的，所以同分時仍照 bkCatsAll 的順序。 */
  /* ⚠ 這裡要用 `mt`（最後修改）不是 `ct`（建立）：`ct` 只在新建時寫，
     把一筆舊書籤改成類別 X 之後 X 不會往前排——那和「最近用過」這個名字不符。
     ⚠ 剛用「＋ 新類別」建出來、還沒有任何書籤的類別沒有「用過」的時刻可用，
     但**剛建好的下一秒就被收進「更多…」是最糟的**。
-    ⚠⚠ 舊版把**所有**沒被用到的類別都給 `Infinity`：於是它們全部同分，
+    ⚠⚠ 不可以把**所有**沒被用到的類別都給 `Infinity`：它們會全部同分，
     穩定排序保留 `bkCatsAll` 的順序（設定頁的手動順序），而新類別是**接在尾端**的
     ⇒ 已經有六個未使用類別時，剛建好的那顆排第七、直接被藏起來。
-    ⚠ 而舊探針只造了**一個**未使用類別，所以它必定排第一——**那一格是空心的**。
-    改法：用 `cta`（什麼時候建的）當它的時刻，和「什麼時候用過」**同一把尺**比。
+    ⚠ 探針若只造**一個**未使用類別，那一個必定排第一——**那一格是空心的**，測不到這一點。
+    做法：用 `cta`（什麼時候建的）當它的時刻，和「什麼時候用過」**同一把尺**比。
     沒有建立時刻的（舊資料、匯入來的）給 0：那種類別本來就不算「最近」。
     守它的是 `just_created_cat_ranks_first`／`reused_cat_moves_up`
     ＋`new_cat_visible_among_many_unused`（六個未使用類別的那一格）。 */
@@ -6016,15 +6011,15 @@ function bkSay(m){var e=document.getElementById('bkMsg');if(e&&m)e.textContent=m
    ⚠ session 頁**覆寫**成打開「這一頁的書籤」清單——那一頁沒有別的清單可以回。 */
 function bkList(){bkClose();}
 
-/* 類別 chip：一排可點的 chip ＋ 最後固定一顆「＋ 新類別」（Will 2026-08-22 裁決）。
+/* 類別 chip：一排可點的 chip ＋ 最後固定一顆「＋ 新類別」。
    ⚠ **新增就地做、整理才去設定頁**：現場想到新類別時跑一趟設定頁太麻煩。 */
 function bkCatChips(cur){
  var st=bkLoad(), all=bkCatsAll(st), rec=bkCatsRecent(st);
  var show=[], seen=Object.create(null), h='', rest=0, i, c;
  /* ⚠⚠ 目前選著的那一顆**一定要看得見**，否則使用者會以為類別被清掉了。
-    ⚠ 這條保險**收合與展開共用**，一定要放在分岔之前。原本只寫在收合分支，
-    於是展開之後、選著的那顆若不在聯集裡（帶空白的、被 60 字截斷的、
-    設定清單已滿 200 的）就整個消失——畫面看起來「沒有選類別」，
+    ⚠ 這條保險**收合與展開共用**，一定要放在分岔之前。只寫在收合分支的話，
+    展開之後、選著的那顆若不在聯集裡（帶空白的、被 60 字截斷的、
+    設定清單已滿 200 的）就會整個消失——畫面看起來「沒有選類別」，
     但 `BK_CAT` 還在、一存就把它寫回去。
     守它的是探針的 `unlisted_cat_still_visible_when_expanded`／`_collapsed`。 */
  if(cur){show.push(cur);seen[cur]=1;}
@@ -6176,10 +6171,10 @@ function bkCommit(){
  var clash=(!isNew&&BK_EDIT.mt0!==null
             &&(bkWhen(rec)!==BK_EDIT.mt0||bkNum(rec.lr,0)!==BK_EDIT.lr0));
  /* ⚠⚠ **類別也要保留輸家，不是只有備註。** 上面那句「和匯入衝突走同一個
-    `bkKeepLost()`，不要在這裡另寫一套」寫對了原則，實作卻只做了 `note` 那半
+    `bkKeepLost()`，不要在這裡另寫一套」的原則，`note` 與 `cat` 兩半都要做到
     ——`bkMerge()` 對同一件事的處置是「一筆只能掛一個類別，所以本機那個即將被
-    取代的名字要寫進備註，不然它就真的沒了」，這裡漏了 ⇒ 另一個分頁選的類別
-    **無聲消失、不留痕跡**。這正是「同一條規則寫兩次就會分岔」自己應驗了。
+    取代的名字要寫進備註，不然它就真的沒了」，這裡漏了的話 ⇒ 另一個分頁選的類別
+    **無聲消失、不留痕跡**。「同一條規則寫兩次就會分岔」，兩份的做法要保持一致。
     守它的是探針的 `concurrent_edit_keeps_lost_cat`。 */
  /* ⚠⚠ **`rec.note!==note` 那個守門條件也要抄過來。** `bkMerge` 那半寫的是
     `if(inc.note&&inc.note!==cur.note)`——**兩邊一樣就不記**，因為那時候
@@ -6188,8 +6183,8 @@ function bkCommit(){
     使用者一個字都沒改按下儲存，備註就被貼上自己一份，**每觸發一次長一截**
     （實測 48→111→237→489 字，唯一的煞車是 `bkLoad` 的 20000 字截斷）。
     那直接和「同一份檔案匯入兩次結果必須相同」那條不變量打架。
-    ⚠ 這正是「同一條規則寫兩次就會分岔」第二次應驗——上一次漏的是 `cat`（就在下一行），
-    這一次漏的是 `note` 的守門條件。**兩半的形狀現在一致了，改一邊要改兩邊。**
+    ⚠ 這也是「同一條規則寫兩次就會分岔」的例子：`cat`（就在下一行）和 `note` 的守門條件
+    都要和 `bkMerge` 那半一致。**兩半的形狀要保持一致，改一邊要改兩邊。**
     守它的是探針的 `clash_does_not_duplicate_unchanged_note`，
     對照組 `clash_still_keeps_really_lost_note`（真的有東西要消失時仍要保留）。 */
  if(clash){
@@ -6258,7 +6253,7 @@ function bkUndo(){
  BK_UNDO=null;
  bkRefresh('\u5df2\u5fa9\u539f\u3002');}
 
-/* ── 匯出／匯入那一排（**和存檔鈕同一批出貨**）────────────────────
+/* ── 匯出／匯入那一排（**有存檔鈕就要有這一排**）────────────────────
    ⚠⚠ 真正的耐久保證是匯出的 JSON，不是 localStorage：第一顆書籤存下去的那一刻，
    資料就只在瀏覽器裡，一次「清除瀏覽資料」就沒了。所以這一排**就放在存完之後
    會看到的那一頁**，不是藏在別處。 */
@@ -6292,17 +6287,17 @@ function bkFoot(st){
   +'<input type="file" id="bkFile" accept="application/json,.json" style="display:none"'
   +' onchange="bkImport(this)"></div><div class="bm-msg" id="bkMsg"></div>';}
 
-/* 遮蔽規則（2026-08-22 設計諮詢，方向和初稿相反）：
+/* 遮蔽規則：
    · **備註不遮** ——那是使用者自己知情打進去的字，而他按的是「備份」。
      **有損的備份是壞掉的備份**，這比洩漏風險更該優先。
    · **摘要要遮** ——那是真的對話內容，他不見得意識到被一起存進去了。
    · **自動標題也要遮** ——`s.title` 沒改名時就等於「第一則使用者訊息」，一樣是對話內容；
      使用者自己改過名的（town=1）才留著。
-   · **路徑要過形狀閘** ——⚠⚠ 原本這裡寫的是「`url` 本來就是相對路徑，沒有絕對路徑
-     可洩漏」。**那句話對「本機自己存的」成立，對「匯入進來的」不成立**
+   · **路徑要過形狀閘** ——⚠⚠ 「`url` 本來就是相對路徑，沒有絕對路徑
+     可洩漏」這句話**對「本機自己存的」成立，對「匯入進來的」不成立**：
      匯入端若原樣收下 `url`，遮蔽匯出又無條件把它吐回去。
-     現在匯入端擋一次（`bkSafeRel`）、這裡再擋一次——**入口與出口各一道**，
-     因為「只寫一條分支」正是這條線上重複踩的那個坑。
+     所以匯入端擋一次（`bkSafeRel`）、這裡再擋一次——**入口與出口各一道**，
+     因為保險只寫在一條分支上等於沒寫。
    ⚠ **設定也要一起匯出**（含類別清單）：只在 localStorage 裡＝一次「清除瀏覽資料」就沒了。 */
 function bkExport(full){
  var st=bkLoad(), out=[], i;
@@ -6331,12 +6326,12 @@ function bkExport(full){
    o.sid=bkSafePart(o.sid); o.anchor=bkSafePart(o.anchor);
    o.id=(o.sid&&o.anchor)?bkId(o.sid,o.anchor):'';}
   /* ⚠⚠ **遮蔽匯出一律不留 `stitle`，不看 `town`。**
-     舊寫法是 `(full||x.town)`＝**無條件相信紀錄自己宣稱的 `town`**。匯入端雖然
+     `(full||x.town)` 這種寫法＝**無條件相信紀錄自己宣稱的 `town`**。匯入端雖然
      把 `town` 歸零了（`bkImport`），但那只擋住「從匯入進來」那一條路：
-     手改過的 localStorage、別的工具寫的、或**這次修正之前那版**匯入寫進去的資料，
-     都帶著 `town:1` 躺在 store 裡，於是一個由**第一則使用者訊息**衍生的標題
-     就從「只匯書籤」流出去了。註解當時寫「入口與出口各一道」——那對 `url` 成立
-     （`bkSafeRel` 在這裡再驗一次），對 `town`/`stitle` **從來沒有出口那一道**。
+     手改過的 localStorage、別的工具寫的、或**舊版**匯入寫進去的資料，
+     都可能帶著 `town:1` 躺在 store 裡，於是一個由**第一則使用者訊息**衍生的標題
+     就會從「只匯書籤」流出去。「入口與出口各一道」只對 `url` 成立
+     （`bkSafeRel` 在這裡再驗一次），對 `town`/`stitle` **沒有出口那一道**。
      ⚠ 為什麼不做「出口交叉驗證」而是直接遮掉：靜態頁沒有任何**不可偽造**的本機
      所有權證據可用——`town` 就在使用者可改的 localStorage 裡，怎麼比都是拿它自己
      證明它自己。而這是隱私保證（最高不變量 ①），**認不出來時寧可多遮**。
@@ -6410,7 +6405,7 @@ function bkImport(inp){
     var x=items[i];
     if(!x||typeof x!=='object'){skip++;continue;}
     /* ⚠⚠ **型別要真的是字串**，不可以 `String()` 硬轉——見 `bkIdPart` 的說明。
-       `{sid:{},anchor:{}}` 原本會造出 id 為 `[object Object]|[object Object]`
+       `{sid:{},anchor:{}}` 硬轉會造出 id 為 `[object Object]|[object Object]`
        的幽靈書籤。 */
     var sidI=bkIdPart(x.sid), anchI=bkIdPart(x.anchor);
     if(!sidI||!anchI){skip++;continue;}
@@ -6424,7 +6419,7 @@ function bkImport(inp){
     var ctI=bkTs(x.ct,nowI), mtI=bkTs(x.mt,nowI)||ctI;
     var rec={id:ridI,sid:sidI,anchor:anchI,
              /* ⚠⚠ **`url` 一律過 `bkSafeRel()`**。匯入檔可以塞
-                絕對路徑，而「只匯書籤」原本無條件把 `url` 再吐出去 ⇒「可以拿給別人」
+                絕對路徑，而「只匯書籤」若無條件把 `url` 再吐出去 ⇒「可以拿給別人」
                 這個保證整個破掉，而且 `bkSafeRel()` 在這條路上**完全沒被用到**。
                 對不到形狀就丟掉——那個路徑本來就是可以用 sid 重算的快取
                 （見 `bxHref`），丟了不是資料損失。 */
@@ -6454,12 +6449,12 @@ function bkImport(inp){
     if(by[rec.id]===undefined){st.items.push(rec);by[rec.id]=st.items.length-1;add++;}
     else{
      /* ⚠⚠ **比 `mt` 不是 `ct`。** `ct` 只在新建時寫（`bkCommit` 從不更新它），
-        同一筆在兩台機器上**永遠相等** ⇒ 舊規則的 `>=` 讓匯入檔一定贏 ⇒
+        同一筆在兩台機器上**永遠相等** ⇒ 用 `>=` 比的話匯入檔一定贏 ⇒
         「先加書籤、之後才補備註」的人一匯入舊備份就被空字串洗掉。
         而 UI 一直在勸使用者匯出備份——**有損的備份是壞掉的備份**。
         平手（兩邊都沒有 `mt` 的舊格式）一律**保留本機**。
         ⚠ 逐欄位的規則、以及非空衝突怎麼處理，**全部在 `bkMerge()` 裡**（兩個方向共用
-        同一段——這條線上同一個保證已經因為「只寫了一條分支」錯過三次）。 */
+        同一段——保險只寫在一條分支上等於沒寫）。 */
      if(bkMerge(st.items[by[rec.id]],rec,mtI))upd++; else skip++;}}
    /* 設定：**類別清單取聯集**（那是清單，只增不減），`rv` 這種單值偏好**本機優先**
       ——本機已經有設定就代表使用者刻意選過（若在本機已有設定時
@@ -6472,7 +6467,7 @@ function bkImport(inp){
        ⚠⚠ **但這一行不是承重的，不要以為它在守什麼。** 真正把類別正規化的是
        `bkSaveSet()`（它對每一次寫入都跑 `bkCatsClean`），所以就算這裡把 `os.cats`
        原封不動傳下去，髒資料**也到不了 localStorage**。
-       這一行純粹是對稱／防禦，**沒有任何素材只會走到它**（教訓 29）。
+       這一行純粹是對稱／防禦，**沒有任何素材只會走到它**。
        ⚠ 突變檢驗實測：把這裡改回 `cats:os.cats`，探針**全綠**。所以不要在這裡寫
        「守它的是 XXX」——那會變成又一句沒有東西在守的保證。真正在守正規化的是
        `bkSaveSet` 那一層（探針 `first_import_cleans_setting_cats` 測的是那一層）。
@@ -6518,7 +6513,7 @@ addEventListener('keydown',function(ev){if(ev.key==='Escape')bkClose();});
    別的分頁寫一次 localStorage 就讓所有開著的 session 分頁跳出全螢幕對話窗、
    或把使用者正在打的類別名洗掉——那是把「跟著更新」做成了「打斷你」。
    ⚠ 而且那道 `bkModalEl()` 的保險在**設定頁結構上不可能生效**（那一頁沒有對話窗、
-   `bkModalEl()` 恆回 null）——又一次「保險只寫在一條分支上」。
+   `bkModalEl()` 恆回 null）——保險要寫在每一條分支上。
    所以另立 `bkSync()`：語意是「**別人**改的，跟著更新，但**絕不改變這一頁目前的
    開闔與編輯狀態**」。各頁自己覆寫（和 `bkRefresh` 一樣是逐頁覆寫的慣例）。
    守它的是探針的 `storage_event_does_not_open_modal`（session 頁）／
@@ -6538,7 +6533,7 @@ _BOOKMARK_PAGE_JS = r"""
    組出來，專案改名或機器換時區就全變。BK_URL 存的是**相對 out/ 的相對路徑**
    ——順帶把「匯出檔含 C:\Users\<名字>\」那個洩漏面整個消掉。 */
 var BK_SID=__BK_SID__, BK_URL=__BK_URL__, BK_TITLE=__BK_TITLE__, BK_TOWN=__BK_TOWN__;
-var BK_ONLY_DUE=false;  /* ⏰ 該複查了：Will 要求它能當篩選條件 */
+var BK_ONLY_DUE=false;  /* ⏰ 該複查了：要能當篩選條件 */
 
 function bkMine(st){var out=[];
  for(var i=0;i<st.items.length;i++)if(st.items[i].sid===BK_SID)out.push(st.items[i]);
@@ -6670,9 +6665,9 @@ function bxSess(sid){
  return (BX_SESS&&Object.prototype.hasOwnProperty.call(BX_SESS,String(sid)))
         ?BX_SESS[String(sid)]:null;}
 /* ⚠⚠ 連結**只認以 sid 重算出來的檔名**，對不到就不生連結。
-   一度寫成「對不到就退回記錄裡的 `url`」——那正是這整套設計要避免的事：
+   不可以「對不到就退回記錄裡的 `url`」——那正是這整套設計要避免的事：
    sid 對不到的原因八成就是**檔名變了或那一場沒了**，此時那個快取路徑幾乎一定是死的，
-   拿它生一個看起來正常的連結＝安靜地把過期資訊當現況。改成講清楚、另外把
+   拿它生一個看起來正常的連結＝安靜地把過期資訊當現況。要講清楚、另外把
    舊位置當**文字**印出來當線索。守它的是探針的 `missing_session_no_link`。
    ⚠ `bkSafeRel` 留著是對**我們自己烤進去的那張表**再驗一次形狀（便宜的不變量）。
    這一頁在 `out/sessions/` 底下、而路徑相對 `out/` ⇒ 前面補一層 `../`。 */
@@ -6764,7 +6759,7 @@ function bxRender(){
  if(!rows.length)
   h='<li class="bmi-sum" id="bxEmpty">'
    /* ⚠⚠ **「讀不到」和「確定沒有書籤」不可以講成同一句。** 這整套 `bad:1` 的出發點
-      就是這件事，而 `bkFoot()` 分開了、這裡沒有：store 壞掉時主畫面會印
+      就是這件事，`bkFoot()` 分開了，這裡也要分開：store 壞掉時主畫面若印
       「還沒有任何書籤。到任一場對話頁…就能加」——那是把使用者往「重新開始建」推，
       正是最糟的建議（原始資料還在，一動就沒了）。
       守它的是探針的 `manage_bad_store_does_not_say_empty`。 */
@@ -6805,7 +6800,7 @@ bxRender();
 # ⚠⚠ 同樣是**普通 raw 字串，不是 f-string**（單大括號）。
 # 設定頁（第 3 期）：個人偏好的預設值 ＋ 類別管理。
 # ⚠ 分界：**新增類別就地在對話窗做**（很頻繁），**整理才來這一頁**（改名／合併／刪除／排序，
-#   一個月一次）。Will 2026-08-22 的裁決，理由見 `bookmarks-proposal.md`〈類別的裁決〉。
+#   一個月一次）。
 _SETTINGS_JS = r"""
 var BS_REN=-1;        /* 正在就地改名的那一列（-1＝沒有）*/
 var BS_ADD=false;     /* 「＋ 新增類別」的輸入框開著沒 */
@@ -6861,15 +6856,15 @@ function bkPick(btn){        /* ⚠ 覆寫 core 的版本：這一頁的 chip �
  for(i=0;i<all.length;i++)all[i].setAttribute('aria-checked','false');
  btn.setAttribute('aria-checked','true');
  var s=bkSet(); s.rv=btn.getAttribute('data-v');
- /* ⚠⚠ **寫入的回傳值一定要看。** 這一頁原本改名／刪除／復原／排序／預設值
-    幾乎全部忽略回傳值，然後照樣宣稱成功——
+ /* ⚠⚠ **寫入的回傳值一定要看。** 這一頁的改名／刪除／復原／排序／預設值
+    若忽略回傳值，就會照樣宣稱成功——
     使用者以為存好了，重新整理才發現什麼都沒變。 */
  if(!bkSaveSet(s)){bsRender();bkSay(bkWhySetFail());return;}
  bsRender();
  bkSay('已存：之後新加的書籤預設「'
        +bkSpanLabel(s.rv)+'」。已經存過的書籤不受影響。');}
 
-/* ② 改名——⚠ **要連動**：改了名，所有用到它的書籤一起改（Will 2026-08-22 裁決）。
+/* ② 改名——⚠ **要連動**：改了名，所有用到它的書籤一起改。
    不連動的話改名就只是多造一個孤兒類別。改成一個已經存在的名字＝合併，刻意允許。 */
 function bsRen(i){BS_REN=i;BS_ADD=false;bsRender();}
 function bsRenCancel(){BS_REN=-1;bsRender();}
@@ -7119,7 +7114,7 @@ var BK_MGR='';        /* 這一頁自己就是管理頁，footer 不畫那個連
 
 
 def render_settings_html() -> str:
-    """設定頁 → `out/sessions/settings.html`（Will 2026-08-22 裁決：**獨立一頁**）。
+    """設定頁 → `out/sessions/settings.html`（**獨立一頁**）。
 
     ⚠ 和管理頁同一層，理由同上。一樣每次執行都無條件重產，不必升 `RENDERER_VERSION`。
     """
@@ -7367,9 +7362,9 @@ function bmGrammarOk(id){{
  /* 槽位是**有序**的：回合 tiebreak → 步 → 區塊 → 子定位符自己的 tiebreak。
     ⚠ 最後那一格不是多餘的：第 1 期的逐段退化規則就設計成「`k…-s…-tb2` 的 tb 屬於
     子定位符、要連它一起退」，而 `probe_anchor_js.js` 的第 ④ 組一直在守那個保證。
-    ⚠⚠ **但它只准接在 `s` 後面**：原本只靠「槽位往後走」
-    這一條，於是 `b → tb` 也被放行 ⇒ `-b1-tb2` 通過守門、退化後框住基底回合＝**安靜指錯**，
-    而上面那段註解自己寫著「`-b1-tb2`（順序反）必須被拒」——**實作與註解當時是相反的**。
+    ⚠⚠ **但它只准接在 `s` 後面**：只靠「槽位往後走」
+    這一條，`b → tb` 也會被放行 ⇒ `-b1-tb2` 通過守門、退化後框住基底回合＝**安靜指錯**，
+    而上面那段註解寫著「`-b1-tb2`（順序反）必須被拒」。
     差別在**前一段是誰**，不在「有沒有末尾 tb」，所以這裡要記住上一個吃掉的槽位。
     守它的是第 ⑬ 組的 `-b1-tb2`，對照組是第 ④ 組的 `-s…-tb2`（**必須仍然合法**）。 */
  var SLOT=['tb','s','b','tb'], p=id.split('-'), wi=0, last=-1, i, j;
@@ -8578,7 +8573,7 @@ def cost_summary(rows):
 # ⚠ 這一段**不需要升 RENDERER_VERSION**：`index.html` 每次執行都無條件重產，
 #   不受 manifest 版本閘管（那個閘只管 session 頁）。
 _INDEX_BOOKMARK_JS = r"""
-/* ── 索引頁的書籤圖示（Will 2026-08-22 要求）───────────────────────────
+/* ── 索引頁的書籤圖示 ───────────────────────────────────────────────
    ⚠ 讀的是和 session 頁**同一個** localStorage 鍵；`file://` 在 Chrome 眼裡是單一
    origin，所以索引頁讀得到 session 頁存的東西（第 1.5 期已實測過這個前提）。 */
 function bkIndexMark(){
@@ -8637,8 +8632,8 @@ function bkIndexMark(){
   /* ⚠⚠ **藏起來的篩選不可以還在生效。** 上一行只是把控制項藏起來，`af()` 讀的仍是
      `fb.checked` ⇒ 勾著的狀態下，別的分頁移除最後一筆書籤時：勾選框消失、篩選照跑
      ⇒ **整張表 0 列，而畫面上沒有任何東西解釋為什麼**。
-     ⚠ 這個狀態是新的 storage listener 造出來的：這個函式以前只在載入時跑一次，
-     那時 `fb` 必定沒勾，所以到不了。**每加一條同步路徑，就要問它造出了哪些新狀態。**
+     ⚠ 這個狀態是 storage listener 造出來的：載入時這個函式只跑一次，
+     那時 `fb` 必定沒勾，所以只有重跑時才到得了。**每加一條同步路徑，就要問它造出了哪些新狀態。**
      ⚠ 只在 `total===0`（＝控制項真的被藏起來）時取消勾選；鈕還看得見時勾著就該繼續生效
      （對照組 `visible_bm_filter_still_applies` 在守這一半）。
      守它的是索引探針的 `hidden_bm_filter_does_not_blank_table`。 */
@@ -8654,8 +8649,8 @@ bkIndexMark();
 af();      /* 圖示會改變 data-bm，重跑一次篩選讓「只看有書籤的」立刻生效 */
 /* ⚠⚠ **索引頁自己要有這一段。** core 的 `storage` listener 只寫在
    `_BOOKMARK_CORE_JS` 裡，而索引頁**不內嵌 core**（它只有這一段）
-   ⇒ 「在 session 頁加了書籤，開著的索引頁跟著出現 🔖」原本根本沒有實作，
-   但 core 的註解與 README〈開著好幾個分頁〉都寫成有。
+   ⇒ 「在 session 頁加了書籤，開著的索引頁跟著出現 🔖」（core 的註解與
+   README〈開著好幾個分頁〉都這樣寫）只能靠這一段實現。
    這一頁沒有對話窗、也沒有任何編輯狀態，所以直接重畫就好。
    守它的是索引探針的 `index_storage_event_redraws`。 */
 addEventListener('storage',function(ev){
@@ -8843,19 +8838,16 @@ function lsSet(k,v){{try{{localStorage.setItem(k,v);return true;}}catch(e){{retu
 var FKEY='idx_filter_v1';
 /* ⚠ `b` ＝「只看有書籤的」。它和其他七個條件一樣要被記住：實際用法是**勾著它來來回回**
    （索引 → 某一場 → 回索引 → 下一場），而每次回索引都是一次重新載入。
-   ⚠ 還原就在 `restoreF()` 裡（往下十行，那裡有完整的理由）。
-   ⚠⚠ **這裡原本寫著「還原不在 `restoreF()` 裡，在 `bkIndexRestoreFilter()`」——那是 2026-08-23
-   修好之前的舊說法，而且 `bkIndexRestoreFilter` 這個名字整份 repo 裡不存在。**
-   留著它會讓下一個人照錯的那條改，直接重演教訓 39。
-   ⇒ 一般化：**改了承重的機制，就要去找「解釋舊機制」的那幾段註解**，
+   ⚠ 還原就在 `restoreF()` 裡（那裡有完整的理由）。
+   ⚠⚠ **改了承重的機制，就要去找「解釋舊機制」的那幾段註解**，
    它們不會跟著程式一起變紅。 */
 function saveF(){{lsSet(FKEY,JSON.stringify({{q:Q.value,s:FS?FS.value:'',p:FP.value,m:FM.value,a:FA?FA.value:'',k:FK?FK.value:'',w:(FW&&FW.checked)?1:0,b:(FB&&FB.checked)?1:0}}));}}
 function setSel(el,v){{if(!el||!v)return;for(var i=0;i<el.options.length;i++){{if(el.options[i].value===v){{el.value=v;return;}}}}}}
 /* ⚠⚠ **`b`（只看有書籤的）一定要在這裡還原，不可以拖到 `bkIndexMark()` 那邊。**
    下一行就是 `restoreF();af();`，而 **`af()` 尾端會 `saveF()`** ⇒ 還原晚一步的話，
    那一次 `af()` 會拿「此刻還沒勾」的狀態把 `b` 覆寫成 0，於是永遠記不住。
-   2026-08-23 真的這樣出貨過一次：探針全綠、實際使用無效——因為探針是「存完馬上手動還原」，
-   中間**沒有那一次 `af()`**，恆綠（教訓 39）。
+   「存完馬上手動還原」這種探針，中間**沒有那一次 `af()`**，
+   會恆綠、實際使用卻無效。
    ⚠ 這裡勾起來時每一列的 `data-bm` 還沒填 ⇒ 第一次 `af()` 會把整張表濾成空的。
    **那不會被看到**：整段（含 `_INDEX_BOOKMARK_JS`）是同一個同步 `<script>`，
    `bkIndexMark();af();` 在第一次繪製之前就跑完了。
@@ -9122,11 +9114,11 @@ def build_cache_report(rows, stratify=True, acct_health=None):
         events = r.get("cache_events") or []
         # 與 classify_cache_causes 同一份（兩處是刻意的雙胞胎）：整條時間軸上的
         # limit/auth 時刻，判「這次 acct 之前同場有沒有撞過 limit」。不走會前進的事件游標。
-        # ⚠⚠ **名字不可以叫 `limit_ts`**（Blocker）：迴圈外 `:4100` 有一個同名的
+        # ⚠⚠ **名字不可以叫 `limit_ts`**：迴圈外有一個同名的
         #   **跨 session 累加器**（收折疊後的 429，餵報告 ④「什麼時候撞到 limit」）。在迴圈內
         #   重新繫結那個名字會把累加器整個蓋掉：`limits_n` 從 100 掉到 **0**，而 `if d["limits_n"]:`
         #   是整段 ④ 的開關 → **那一章連同時段表一起靜默消失**，沒有任何提示。
-        #   本檔的 per-row 區域變數一律加 `row_` 前綴，避免再撞到迴圈外的累加器。
+        #   本檔的 per-row 區域變數一律加 `row_` 前綴，避免撞到迴圈外的累加器。
         row_limit_ts = sorted(float(t) for t, k in events if k in ("limit", "auth"))
         for st in raw:
             tok_read += st[1]
@@ -9257,7 +9249,7 @@ def build_cache_report(rows, stratify=True, acct_health=None):
                     # 直接的帳號邊界證據勝過由間隔推論的 intra／evict，不分間隔長短。
                     cause = "acct"
                     # 這一步之前同場出現過 limit/auth ⇒ 這次切換可能是被迫的。
-                    # ⚠ **只計數、只揭露，不動成因也不動金額**（Will 2026-08-21 裁決）；
+                    # ⚠ **只計數、只揭露，不動成因也不動金額**；
                     #   顯示端的並列標示在 `classify_cache_causes` 那側，兩邊同一個判準。
                     if row_limit_ts and row_limit_ts[0] <= prev[0]:
                         acct_limit_earlier += 1
@@ -9908,7 +9900,7 @@ def _acct_scope_note(d, html=True) -> str:
     兩種報告共用同一份文字：分成兩份寫，遲早只有一邊會被改到，那時就有一種輸出在隱瞞。
     ⚠ 一律輸出、不看次數是不是 0——0 有三種意思（真的沒切過／這台只有一個帳號／
     history 讀不到或列格式變了），涵蓋率就是分辨它們的那份資料。
-    ⚠ **兩個方向都要講。** 原本只揭露漏報（「顯示 0 不代表沒發生過」），
+    ⚠ **兩個方向都要講。** 只揭露漏報（「顯示 0 不代表沒發生過」）的話，
     讀者會以為這個數字只會少不會多；而誤報那一格是**會記到錢**的（多算一次人因浪費）。
     範圍限制 SCOPE-CFG-PATH-IDENTITY。"""
     b = "<b>{}</b>" if html else "**{}**"
@@ -10063,8 +10055,8 @@ def render_cache_report_html(d) -> str:
     # 三段揭露**在 `if total_cold:` 之外算好**：它們講的是「偵測範圍／被實據遮蔽
     # 的人因／被移出樣本的對數」，三件事在零冷啟時照樣成立且照樣有話要說——實測本機有 289 個
     # 「有 cache_steps、零冷啟成因」的 session，只用它們建報告時 `_srv_excluded_note` 仍有
-    # 75 對要揭露，而舊寫法一句都不出。三個函式各自守門（沒東西講就回空字串），所以無條件串接
-    # 不會吐出空段落。
+    # 75 對要揭露，放在 `if total_cold:` 裡面的話就一句都不出。
+    # 三個函式各自守門（沒東西講就回空字串），所以無條件串接不會吐出空段落。
     scope_notes_html = (_acct_scope_note(d, html=True) + _masked_human_note(d, html=True)
                         + _srv_excluded_note(d, html=True))
     if total_cold:
@@ -10088,7 +10080,7 @@ def render_cache_report_html(d) -> str:
         # 只有一個帳號／history 讀不到或列格式變了）。只在 >0 時才附註，等於讓最需要保留懷疑
         # 的那個數字裸奔——讀者會把「沒偵測到」讀成「沒發生」。
         # ⚠ 這句話成立的前提是它**兩個分支都出**（見上面 `scope_notes_html`）：
-        #   之前它只長在這一支裡，於是「一律揭露」在零冷啟那一支是假的。
+        #   只長在這一支裡的話，「一律揭露」在零冷啟那一支就是假的。
         ins2 += scope_notes_html
         if api_n:
             ins2 += (f"「前綴變動」是 API 自報的（工具定義 {ct['tools']}／系統提示 {ct['system']}／"
@@ -11008,10 +11000,10 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
 .tanchor{position:absolute;width:0;height:0;overflow:hidden}  /* ⚠ 必須 absolute：`display:inline-block` 時它仍是 `.turn .head` 的 flex item，會吃掉一份 `gap:8px`；而 `.compact-sep span{padding:0 12px}` 是**後代選擇器**、連它也 match，加上 `box-sizing:border-box`，`width:0` 縮不掉那 24px。實測每個回合標頭偏移 8px、每條 compact 分隔線偏移 24px。 */
 /* 書籤指向的回合找不到時的橫幅。⚠ 沒有它的話「找不到」是徹底靜默的
    （openSub 的第一行就 return），使用者分不出「沒跳」和「本來就在頁首」。 */
-/* ⚠⚠ **一定要 fixed。** 之前是文件流裡的一塊、插在 body 最前面，而 `scrollIntoView`
+/* ⚠⚠ **一定要 fixed。** 放在文件流裡（插在 body 最前面）的話，`scrollIntoView`
    已經把使用者帶到頁面深處——實測橫幅落在視窗上方 1928px 處，精確命中與退化命中在使用者
    視窗裡**逐像素相同**。fixed 之後它永遠在視窗內，也不再造成版面位移（out of flow）。
-   ⚠⚠ **但一定要放在「底部」，不能放頂端。** 第一版放 `top:12px`，而
+   ⚠⚠ **但一定要放在「底部」，不能放頂端。** 放 `top:12px` 的話，
    `scrollIntoView({block:'start'})` 會把目標輪貼到視窗頂端（y=0）——實測橫幅佔 12–79px，
    **蓋住的正好是那一輪的標頭**：`.hl` 外框上緣、時間戳、`#` 直達連結全在底下。
    「.hl 是跳成功的唯一訊號」而它被自己的提示遮掉，等於白做。 */
@@ -11051,20 +11043,19 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
    ⚠⚠ **顯形範圍一定要縮到 `.blk`，不能沿用 `.turn:hover`。** 全語料實測一輪的可標記
    區塊數 p99＝101（Codex 129、max 412）——沿用整輪的規則，滑過任何一處就會同時亮起
    一百組按鈕。上面兩條 `.turn:hover` 規則因此加了 `:not(.blk-ctl)` 把區塊那組排除掉。
-   ⚠ 用 `>` 直接子選擇器。**但這裡原本寫的理由是假的**：
-   舊版說「工具區塊裡可能巢著子代理的回合，那裡面又有 `.blk`」——**不會**：
+   ⚠ 用 `>` 直接子選擇器。**理由不是**「工具區塊裡可能巢著子代理的回合，那裡面又有 `.blk`」：
    `render_turn_html` 把子代理區塊放在 `extra`、當成工具區塊的**兄弟**，
    實測真頁上 `.blk .blk` 恒為 0，而且探針的 `subagent_not_wrapped_in_block`
    正好在保證它永遠為 0。
-   → `>` 留著是因為它**比較窄、而且未來真的巢起來時不會壞**，
+   → `>` 的理由是它**比較窄、而且未來真的巢起來時不會壞**，
    不是因為現在有巢狀結構。**理由寫錯比沒寫更貴**：下一個人會拿它去推別的事。 */
 .blk{position:relative}
 /* ⚠⚠ **容器一定要 `pointer-events:none` ＋ 透明背景。**
-   第一版把 `background:var(--panel)` 放在容器上、`opacity:0` 只加在**子元素**上 ⇒
+   把 `background:var(--panel)` 放在容器上、`opacity:0` 只加在**子元素**上的話 ⇒
    每個區塊右上角固定有一塊 49×24px 的不透明方塊，**不管有沒有滑過**：
    蓋住第一行右端（code fence、寬表格、長工具摘要），而且那塊區域的文字**選不起來也點不到**。
    實測 `elementFromPoint(控制項內 2px)` 回的是 `SPAN.blk-ctls` 而不是底下的字。
-   背景移到按鈕自己身上——按鈕平常 `opacity:0`，只有顯形時才連背景一起出現。 */
+   背景放在按鈕自己身上——按鈕平常 `opacity:0`，只有顯形時才連背景一起出現。 */
 .blk-ctls{position:absolute;right:4px;top:0;z-index:2;display:inline-flex;align-items:center;
  line-height:1.6;pointer-events:none;background:transparent}
 .blk-ctls .blk-ctl{opacity:0;pointer-events:none;transition:opacity .12s;
@@ -11092,7 +11083,7 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
 .bm-prev{background:var(--panel2);border:1px solid var(--border);border-radius:8px;
          padding:7px 9px;color:var(--muted);font-size:12.5px;max-height:66px;overflow-y:auto;
          word-break:break-word}
-/* ⚠ 單選用「一排 chip」而不是下拉：Will 的原話是「下拉使用上比較不方便」。
+/* ⚠ 單選用「一排 chip」而不是下拉：下拉使用上比較不方便。
    語意仍然是單選（role=radio + aria-checked），只是長得比較好按。 */
 .bm-chips{display:flex;flex-wrap:wrap;gap:6px}
 .bm-chip{border:1px solid var(--border);background:var(--panel2);color:var(--text);
@@ -11113,7 +11104,7 @@ mark{background:rgba(210,153,34,.45);color:inherit;border-radius:3px;padding:0 1
   border-color:var(--accent);color:var(--accent);font-weight:600}
 .bm-card button.dang:hover,.bm-item button.dang:hover,.bs-cat button.dang:hover{
   border-color:var(--err);color:var(--err)}
-/* ⚠ 匯出／匯入和存檔鈕**同一批出貨**：第一顆書籤存下去的那一刻，資料就只在
+/* ⚠ 有存檔鈕就要有匯出／匯入：第一顆書籤存下去的那一刻，資料就只在
    localStorage 裡，一次「清除瀏覽資料」就沒了。真正的耐久保證是匯出的 JSON。 */
 .bm-foot{margin-top:14px;padding-top:12px;border-top:1px solid var(--border);
          display:flex;flex-wrap:wrap;gap:8px;align-items:center;
@@ -11378,7 +11369,7 @@ def save_manifest(out: Path, entries: dict):
 
 def _write_atomic(path: Path, text: str):
     """先寫 `<檔名>.tmp` 再 `os.replace` 換上：中斷（Ctrl+C）或寫到一半失敗時，正式檔永遠是
-    完整的舊版或完整的新版——索引頁、manifest 這類每次都重寫的檔，舊版直接寫正式檔，
+    完整的舊版或完整的新版——索引頁、manifest 這類每次都重寫的檔，若直接寫正式檔，
     中斷就留下一個截斷的索引（實測 `idx_ok=False`）。
     暫存檔在任何失敗下都收掉；硬終止留下的由下一次建置開頭清掉（`_sweep_stray_tmp`）。
 
@@ -11436,11 +11427,12 @@ def manifest_key(source_kind: str, path: Path) -> str:
 def _index_rows(entries: dict, include_empty: bool) -> list:
     """manifest entries → 索引頁要畫的 rows。
 
-    ⚠⚠ **正常路徑與「零場對帳」那條路一定要用同一段。** 那兩處曾經各寫一份，
-    結果零場那份**漏掉了 `empty` 的過濾**（曾用 `--include-empty` 建過的話，
+    ⚠⚠ **正常路徑與「零場對帳」那條路一定要用同一段。** 各寫一份的話，
+    零場那份會**漏掉 `empty` 的過濾**（曾用 `--include-empty` 建過的話，
     manifest 裡會留著 `empty:true` 的 row，之後一次不帶那個旗標的零場建置就會把它畫進索引）
-    ——同一份輸入在兩條路上長得不一樣。    ⚠ 抽成函式**本身就是修法**：把條件複製一份、再叮嚀「兩邊要一致」，是這條線上
-    重複失效的那個做法（`bkMerge` 與 `bkCommit` 的守門條件也是這樣分岔的）。
+    ——同一份輸入在兩條路上長得不一樣。
+    ⚠ 要抽成函式共用，**不要**把條件複製一份、再叮嚀「兩邊要一致」：那是這條線上
+    重複失效的做法（`bkMerge` 與 `bkCommit` 的守門條件也是這樣分岔的）。
     ⚠ 誠實邊界：`empty` 那一格**沒有專屬的測試素材**（要造 `n_turns==0` 的語料）。
     現在它承重的理由是「兩條路共用同一段」這個結構，不是有一格斷言在守它——
     不要在這裡寫「守它的是 XXX」。
@@ -11486,20 +11478,19 @@ def session_content_kind(s) -> str:
                 # 直接 `continue`）⇒ 底下那條 `block_is_renderable` 一定先回
                 # `"conversation"`。突變檢驗實測：把這一行改成 `pass`，**沒有任何一格會紅**。
                 # ⇒ 留著是因為「插話 ＝ 對話」這條語意本身正確，
-                #   但**不要把它算進「已驗證的防線」**（教訓 29）。
+                #   但**不要把它算進「已驗證的防線」**。
                 #   它會變成有效守衛的條件：哪天 `_interject` 能掛進沒有可呈現內容的回合。
                 return "conversation"
             elif t == "_step":
                 pass                      # 只是步驟分隔，本身沒有內容
             elif block_is_renderable(b, g["role"]):
                 # ⚠⚠ **user 與 assistant 走同一支判準，不可以各寫一份。**
-                # 舊版 user 那條只看 `clean_user_text(b["text"])` ⇒ **使用者貼的圖片
+                # user 那條若只看 `clean_user_text(b["text"])` ⇒ **使用者貼的圖片
                 # （`{"type":"image"}`，沒有 `text` 欄）不算對話** ⇒ 一場「只貼了一張圖
                 # ＋下過任一指令」的 session 會被判成 `command_only` **搬離
                 # `~/.claude/projects/`**——而那張圖在頁面上是畫得出來的
                 # （`render_image_block`）。
-                # 那正是本函式 docstring 說「另寫一份判準遲早和畫面分岔」要避開的事，
-                # 而它自己就分岔了。
+                # 那正是本函式 docstring 說「另寫一份判準遲早和畫面分岔」要避開的事。
                 # ⚠ `_command`／`_notify`／`_step`／`_interject` 都在前面的 elif 攔掉了，
                 #   這裡不會誤收；`tool_result` 與純空白本來就不是可呈現區塊，判 False 正確。
                 return "conversation"
@@ -11586,7 +11577,7 @@ def archive_command_only(sessions, dest: Path, scanned_roots, out: Path) -> tupl
        ⚠ **舊版（2026-08-25 之前）的那些行沒有 `state` 欄**——沒有 `state` 一律當
        `moved`，那批已經獨立驗過 92/92 完整。
     5. **記帳寫得進去，才可以開始搬**：manifest 一開始就打開並整趟持有，
-       開不起來直接 `SystemExit`。舊版是搬完才開檔，於是「來源已經不在、
+       開不起來直接 `SystemExit`。搬完才開檔的話，「來源已經不在、
        還原依據一行都沒有」是一條真的路徑。
 
     ⚠ 子代理外部轉錄（`<sid>/` 目錄）跟著一起搬——只搬主檔會留下孤兒目錄。
@@ -11597,7 +11588,7 @@ def archive_command_only(sessions, dest: Path, scanned_roots, out: Path) -> tupl
     ＝**看不見、但仍含私密對話**的檔案留在磁碟上。
     """
     # ⚠ 用 plain dict 不用 `collections.Counter`：本模組刻意沒有 import collections，
-    # 為了一個計數器多一個 import 不划算（`--version` 那條線也還沒動過這裡）。
+    # 為了一個計數器多一個 import 不划算。
     moved, skipped = [], {}
 
     def _skip(why):
@@ -11623,7 +11614,7 @@ def archive_command_only(sessions, dest: Path, scanned_roots, out: Path) -> tupl
     man = dest / ARCHIVE_MANIFEST
 
     # ⚠⚠ **第 5 道閘：記帳寫得進去，才可以開始搬。**
-    # 舊版是「搬完才開檔記帳」⇒ manifest 不可寫（權限／磁碟滿／它其實是個目錄）時，
+    # 若是「搬完才開檔記帳」⇒ manifest 不可寫（權限／磁碟滿／它其實是個目錄）時，
     # 主檔已經離開 `~/.claude/projects/`、目的地有檔、**而還原依據一行都沒有**
     # （實測 `archive_rc=1 source_exists=False manifest_is_dir=True`）。
     # 先開起來、整趟持有這個 handle：寫不進去就在**任何一次搬移之前**停下來。
@@ -11727,7 +11718,7 @@ def _restore_staging(staging, path):
 def _archive_move(path, target, src_id, staging):
     """把來源搬到 `target`（這一趟用 `O_EXCL` 搶到的空佔位檔）。正常回來＝搬完了。
 
-    ⚠⚠ **同一顆磁碟一律用 `os.replace`**（原子地取代我們自己的佔位檔）。舊版用 `shutil.move`：
+    ⚠⚠ **同一顆磁碟一律用 `os.replace`**（原子地取代我們自己的佔位檔），不用 `shutil.move`：
       佔位檔讓它內部的 `rename` 失敗（Windows 的 rename 不覆蓋），於是**每一次都退化成「複製＋刪來源」**，
       而「複製完、刪來源之前」那段時間 Claude Code 寫進來源的那一行會跟著來源一起被刪掉，紀錄還寫 `moved`。
       原子改名沒有那段窗：之後才依路徑寫入的東西會落在原處一個**新建的檔**，不會被刪。
@@ -11835,7 +11826,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         # 失敗方向要選可自癒的那一邊。
         # ⚠⚠ **順序是：原子佔名 → pending 落磁 → 刪頁 → 確認內容還是判定時那份 → 搬移**，
         # 而且**任何一步失敗都要把佔位檔收回來**。
-        # 第一版把「刪頁」排在「佔名」之前、又只有搬移那一段有 cleanup ⇒
+        # 把「刪頁」排在「佔名」之前、又只有搬移那一段有 cleanup 的話 ⇒
         # 注入一次 `fsync` 失敗就實測到：`source=True target=True target_size=0
         # html=False md=False`——**頁面已經刪了、目的地留下 0 位元組的佔位檔，
         # 而下一次執行會撞到「目的地已有同名檔」永遠略過這一場。**
@@ -11864,9 +11855,9 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             硬終止／斷電之後留下的檔沒有跨次的恢復機制，會擋住那一場的後續封存
             （資料仍在；跨磁碟時來源可能以 `.archiving` 的名字留在原處旁）。
 
-            ⚠⚠ **刪不掉要講出來，不可以吞掉。** 舊版 `except OSError: pass` ⇒
+            ⚠⚠ **刪不掉要講出來，不可以吞掉。** `except OSError: pass` 的話 ⇒
             輸出只講「fsync 失敗」，完全沒提「而且佔位檔清不掉」，
-            使用者不會知道下一次會撞牆（同一輪實測 `UNLINK_FAIL`）。
+            使用者不會知道下一次會撞牆（實測 `UNLINK_FAIL`）。
             回 `True` 代表收乾淨了。
             """
             tgt = tgt if tgt is not None else target
@@ -11900,7 +11891,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
         def _record_cut(exc, side_note="", side_to=""):
             """主檔**已經在目的地**、這一場卻被中斷：記一行 `moved`（附註中斷與兩處位置），當場印復原說明。
 
-            ⚠⚠ 舊版這裡只接 `Exception`：主檔搬完之後（或子代理目錄搬到一半）按 Ctrl+C ⇒
+            ⚠⚠ 這裡不能只接 `Exception`：主檔搬完之後（或子代理目錄搬到一半）按 Ctrl+C ⇒
               `_archived.jsonl` 停在 `pending`、stderr 一個字都沒有，子代理目錄一半在來源、一半在封存目錄
               ——違反本迴圈自己的規矩「主檔一離開來源目錄，下一件事就必須是記帳」。"""
             _sn = side_note or ("子代理目錄未處理" if side.is_dir() else "")
@@ -12028,7 +12019,7 @@ def _archive_loop(sessions, dest: Path, out: Path, _journal, moved, _skip):
             # 落地之後才冒出來的一般例外：搬移本身已經完成，照成功記帳（下面那段）。
 
         # ⚠⚠⚠ **主檔一離開來源目錄，下一件事就必須是「記帳」。**
-        # 舊版把子代理目錄的搬移放在同一個 `try` 裡、失敗就 `continue` ⇒
+        # 子代理目錄的搬移若放在同一個 `try` 裡、失敗就 `continue` ⇒
         # **主檔已經不在 `~/.claude/projects/` 了，而 `_archived.jsonl` 一行都沒寫**，
         # 畫面還回報「搬走 0 場」——使用者被告知什麼都沒發生，實際上少了一場
         # `claude --resume` 入口，**而且沒有任何還原依據**
@@ -13084,7 +13075,7 @@ def main():
               f"{Path(args.archive_command_only)}")
         for why, n in sorted(_skipped.items()):
             print(f"  (略過) {why}：{n}")
-        # ⚠⚠ **「什麼都沒發生」和「一場都沒搬成」在輸出上必須長得不一樣**（教訓 57）。
+        # ⚠⚠ **「什麼都沒發生」和「一場都沒搬成」在輸出上必須長得不一樣。**
         # 前者是「本來就沒有符合條件的」，後者是「全部撞牆了」——後者要能一眼看出來。
         if not _moved and _skipped:
             print(f"  ⚠ 一場都沒搬成：{sum(_skipped.values())} 場全部落在上面的略過原因裡。"
@@ -13122,13 +13113,13 @@ def main():
         print(f"Codex 來源：{', '.join(a for a, _ in codex_accounts)}")
     if not files:
         print("沒有找到任何 session 檔。")
-        # ⚠⚠ **零場也要對帳。** 舊寫法在這裡直接 `return`，於是
+        # ⚠⚠ **零場也要對帳。** 在這裡直接 `return` 的話，
         #     「來源被刪到一場不剩」時整個對帳流程根本不會執行：舊 manifest、
         #     書籤管理頁的 `BX_SESS` 反查表、索引頁全部原封不動留著，
         #     連結指向已經不存在的檔。`prune_gone_sources` 位在這個 return 之後，
         #     所以它守的那件事在**最極端的那一格**反而失效。
         #     ⚠ `test_bookmark_deleted_source_pruned` 只做「兩場刪成一場」，
-        #       所以這一格一直沒有素材走到（教訓 29）。
+        #       沒有素材走到這一格。
         #     守它的是 `tests/test_smoke.py::test_bookmark_all_sources_deleted`。
         scanned_roots = [root for _, root in accounts] + [root for _, root in codex_accounts]
         # ⚠ 一個來源根都沒掃到（`--no-claude --no-codex`、或來源設定錯）時**什麼都不要動**：
@@ -13150,16 +13141,16 @@ def main():
         if want_html:
             # ⚠⚠ **索引頁要用對帳後的 `new_entries` 重畫，不可以寫死。**
             #     `new_entries` 在縮範圍時保留了範圍外的紀錄（正常路徑本來就會把它們
-            #     一起畫出來），這裡卻曾經寫 `render_index_html([], False, False, False)`
+            #     一起畫出來），這裡若寫成 `render_index_html([], False, False, False)`
             #     ⇒ manifest 說有、`BX_SESS` 也還指著、HTML 檔還在磁碟上，
             #     **只有索引頁說一場都沒有**。
-            #     ⚠ 改之前這個分支是直接 `return`（索引不會被動到），所以那是「零場也要
-            #       對帳」自己造出來的新缺陷——正是這條線上重複出現的那個樣態。
-            #     ⚠⚠ **而第一次修的時候只換掉第一個參數**，第三、四個（要不要連到快取報告）
-            #       還是寫死的 `False` ⇒ 報告檔還在磁碟上、索引卻不連它了。**同一個形狀，
-            #       隔壁兩個參數。** 所以現在四個參數全部照正常路徑算一次。
-            #     ⚠ rows 一律走 `_index_rows()`：兩條路各寫一份就會分岔（`empty` 的過濾
-            #       第一次修的時候也漏了）。
+            #     ⚠ 這個分支一旦對帳就會動到索引（不對帳、直接 `return` 的話索引不會被動到），
+            #       所以這裡畫的索引必須和正常路徑一樣。
+            #     ⚠⚠ **四個參數全部照正常路徑算一次，不能只換第一個**：第三、四個
+            #       （要不要連到快取報告）寫死 `False` 的話 ⇒ 報告檔還在磁碟上、
+            #       索引卻不連它了。**同一個形狀，隔壁兩個參數。**
+            #     ⚠ rows 一律走 `_index_rows()`：兩條路各寫一份就會分岔（例如其中一份漏掉
+            #       `empty` 的過濾）。
             #     守它的是 `tests/test_smoke.py::test_zero_scan_keeps_out_of_scope_index`
             #     （列還在）與 `::test_zero_scan_keeps_cache_report_links`（連結還在）。
             zero_rows = _index_rows(new_entries, args.include_empty)
@@ -13259,16 +13250,16 @@ def main():
             n_reuse += 1
             continue
 
-        # ⚠⚠ **壞掉的那一場只有一個處理器。** 先前解析失敗與分析失敗各寫一份，於是
-        # 「把上一次的 row 放回去」只做在分析那一半 ⇒ **解析失敗照樣會刪掉舊頁面**
-        # 。兩條路共用這一支，之後再長第三條也是。
+        # ⚠⚠ **壞掉的那一場只有一個處理器。** 解析失敗與分析失敗各寫一份的話，
+        # 「把上一次的 row 放回去」可能只做在其中一條路（例：只做在分析那一半
+        # ⇒ **解析失敗照樣會刪掉舊頁面**）。兩條路共用這一支，之後再長第三條也是。
         def _broken(kind, exc):
             nonlocal n_broken, n_broken_kept
             print(f"  ! {kind} {sf.name}: {type(exc).__name__}: {exc}", file=sys.stderr)
             n_broken += 1
             # ⚠⚠ **要先確認上一次的輸出真的還在磁碟上**。無條件回填的話，舊 row 指向的
             # 頁面若早就不見了（被清過、被手動刪過），索引就會多一條**指向不存在的檔**
-            # 的連結——那和這一條原本要修的缺陷是同一種傷害，只是方向相反。
+            # 的連結——那和「不放回去」留下的壞連結是同一種傷害，只是方向相反。
             # ⚠ 旗標要照**磁碟上實際在、而且原本就標成同步的檔**改寫：上一次若只建了其中一種格式
             #   （`--format md`／`html`），這一次又失敗，兩份索引都照舊旗標連結的話，就會有一份連到
             #   不存在的頁面。索引頁與書籤反查表都看 `has_html`／`has_md` 決定連哪一種。
@@ -13295,7 +13286,7 @@ def main():
             continue
         if not any(e.get("type") in ("user", "assistant") for e in s.events):
             continue
-        # ⚠⚠ **一場壞掉不可以拖垮整批。** 這一層過去沒有接例外，於是任何一場分析出事
+        # ⚠⚠ **一場壞掉不可以拖垮整批。** 這一層不接例外的話，任何一場分析出事
         # （例：`queued_command.prompt` 是 block 陣列時的 `AttributeError`）就整支停在
         # 那裡、**一個頁面都產不出來**——2026-09-01 同事回報時是 321 個來源檔全滅。
         # 形狀刻意和上面那段「解析失敗」同款：印一行到 stderr、跳過這一場、其餘照產。
@@ -13304,7 +13295,7 @@ def main():
         # ⚠ 例外類別也要印（`{type(e).__name__}`）：`AttributeError` 這種只印訊息時
         #   （「'list' object has no attribute 'strip'」）看不出是什麼錯。
         # ⚠ 這一段**包到渲染完為止**，不是只包 `analyze()`：宣稱的性質是「一場壞掉不可以
-        #   拖垮整批」，而渲染層拿到的是同一份髒資料（本批新增的碼有一半在渲染層）。
+        #   拖垮整批」，而渲染層拿到的是同一份髒資料。
         # ⚠⚠ **不放回上一次的 row 的話**：這一場不進 `rows` ⇒ `allowed` 不含它 ⇒ **孤兒清理
         # 會刪掉上一次建好的頁面**；而同一次執行寫 `bookmarks.html` 用的是磁碟上那份舊
         # manifest（`prune_gone_sources()` 只對掉「來源檔不見了」的，來源檔還在）⇒ 管理頁
@@ -13327,9 +13318,9 @@ def main():
         s.mem_href = ""
         if source_kind == SOURCE_CLAUDE and get_mem(s.account, s.proj_munged):
             s.mem_href = memory_rel_path(s.account, s.proj_munged)
-        # ⚠⚠ **護欄要真的包到渲染。** 先前只包了 `analyze()`，而註解卻寫著「包到渲染完為止」
-        # ——那是**只修一半、而且註解在說謊**。
-        # 渲染層拿到的是同一份髒資料，而這條線新增的碼有一半在渲染層。
+        # ⚠⚠ **護欄要真的包到渲染，不能只包 `analyze()`**：只包一半、註解卻寫著「包到渲染完為止」，
+        # 就是**註解在說謊**。
+        # 渲染層拿到的是同一份髒資料。
         # ⚠⚠ **先寫到暫存檔、全部成功才換上正式檔。** 直接寫正式檔的話，寫到一半失敗（或 HTML
         #   寫好了、MD／`session_to_row` 才失敗）時，磁碟上留下的是**寫壞的新頁面**或「新 HTML ＋舊 MD」，
         #   而 `_broken` 會把上一次的 row 放回去 ⇒ manifest 信任一個壞掉的頁面，下一次建置還會沿用它。

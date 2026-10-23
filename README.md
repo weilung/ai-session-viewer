@@ -1,9 +1,9 @@
 # AI Session 對話檢視器
 
-把 Claude Code CLI 的 session 紀錄（`~/.claude/projects/<專案>/<sessionId>.jsonl`）與 Codex session 紀錄
-（`~/.codex/sessions/**/*.jsonl`）轉成
+把 Claude Code CLI 的 session 紀錄（`~/.claude/projects/<專案>/<sessionId>.jsonl`）、Codex session 紀錄
+（`~/.codex/sessions/**/*.jsonl`）與 Antigravity CLI 的對話（`~/.gemini/antigravity-cli/conversations/<id>.db`）轉成
 方便「翻閱」的 **HTML** 與方便 grep／存檔的 **Markdown**。零外部相依，只用 Python 3 標準函式庫，
-**跨平台**（Windows / Debian / macOS），並支援**多個 Claude 帳號**與 Codex 來源。
+**跨平台**（Windows / Debian / macOS），並支援**多個 Claude 帳號**與 Codex、Antigravity 來源。
 
 > ### ⚠ 這兩塊的審查狀態
 >
@@ -27,7 +27,7 @@ Windows（PowerShell）：
 ```powershell
 py ai_session_viewer.py            # 全部帳號/專案 -> .\out，同時輸出 HTML + Markdown
 py ai_session_viewer.py --open     # 轉換後自動打開 out\index.html
-py ai_session_viewer.py --no-codex --open      # 只轉 Claude（預設會連 ~/.codex 一起轉）
+py ai_session_viewer.py --no-codex --no-antigravity --open      # 只轉 Claude（預設會連 Codex、Antigravity 一起轉）
 ```
 或直接**雙擊 `run.cmd`**。
 
@@ -59,6 +59,8 @@ AI 的提問（`AskUserQuestion`）例外：畫成不收合的卡片——每題
 | `--codex-source <路徑>` | 指定 Codex `sessions` 目錄或單一 JSONL，可多次指定，亦可寫成 `標籤=路徑`；覆寫自動偵測 |
 | `--no-claude` | 不讀取 Claude Code 紀錄 |
 | `--no-codex` | 不讀取 Codex 紀錄（預設會自動偵測 `~/.codex/sessions`） |
+| `--antigravity-source <路徑>` | 指定 Antigravity CLI 的對話目錄（`conversations`）或單一 `.db`，可多次指定，亦可寫成 `標籤=路徑`；覆寫自動偵測 |
+| `--no-antigravity` | 不讀取 Antigravity 紀錄（預設會自動偵測 `~/.gemini/antigravity-cli/conversations`） |
 | `--out <路徑>` | 輸出資料夾（預設 `./out`） |
 | `--format html\|md\|both` | 輸出格式（預設 `both`） |
 | `--project <字串>` | 只轉名稱含此字串的專案，例如 `--project Obts` |
@@ -73,7 +75,8 @@ AI 的提問（`AskUserQuestion`）例外：畫成不收合的卡片——每題
 
 呈現多個來源的通用方式就是**指定輸入目錄與輸出目錄**：用一個或多個 `--claude-source` 指向各自的 `projects` 目錄，
 輸出到同一個 `--out`。索引頁會多一個「帳號」欄與下拉篩選，各來源的輸出會依工具與帳號分開，
-Claude Code 會放在 `out/sessions/claude-code/<標籤>/`，Codex 會放在 `out/sessions/codex/<標籤>/`。
+Claude Code 會放在 `out/sessions/claude-code/<標籤>/`，Codex 會放在 `out/sessions/codex/<標籤>/`，
+Antigravity 會放在 `out/sessions/antigravity/<標籤>/`。
 
 ```bash
 # 明確指定多個來源（適合作業系統多使用者、或紀錄放在非預設位置）
@@ -89,7 +92,8 @@ python3 ai_session_viewer.py \
 python3 ai_session_viewer.py --no-claude --out ~/codex-logs --open
 ```
 
-未加任何來源參數時，**Claude 與 Codex 都會自動偵測**：`~/.claude*` 下所有含 `projects` 的目錄、以及 `~/.codex/sessions`（沒有 `projects` 子目錄的、
+未加任何來源參數時，**三種都會自動偵測**：`~/.claude*` 下所有含 `projects` 的目錄、`~/.codex/sessions`、
+以及 `~/.gemini/antigravity-cli/conversations`（沒有 `projects` 子目錄的、
 例如某些第三方工具的設定夾，會自動略過）。若你的多帳號剛好是 `~/.claude` 與 `~/.claude-<名稱>` 這種命名，
 也可以用捷徑 `--account <名稱>`。
 
@@ -162,11 +166,14 @@ out/
 │  │  │  └─ 20260529-1456__ProjectA__1672668c.{html,md}
 │  │  └─ work/
 │  │     └─ 20260601-1030__ProjectB__fe081c1a.{html,md}
-│  └─ codex/
+│  ├─ codex/
+│  │  └─ default/
+│  │     └─ 20260615-1452__ProjectC__7c2e90b4.{html,md}
+│  └─ antigravity/
 │     └─ default/
-│        └─ 20260615-1452__ProjectC__7c2e90b4.{html,md}
+│        └─ 20261023-1646__ProjectD__f2a9f576.{html,md}
 │                    檔名為  日期__專案__session id 的 8 碼
-│                    （Claude 取開頭；Codex 的 id 開頭是時間戳，取結尾）
+│                    （Claude、Antigravity 取開頭；Codex 的 id 開頭是時間戳，取結尾）
 ├─ ai/             ← --ai-md 產的給 AI 讀的精簡版（….ai.md）與完整版（….md），目錄結構同 sessions/
 └─ memory/         ← 各 Claude 專案的 memory 檢視（該專案有 memory/ 才產生）
    └─ claude-code/
@@ -189,6 +196,34 @@ out/
   Markdown 連結只允許 http/https/mailto/相對/錨點等安全 scheme，其餘降為純文字。
 - 子代理（subagent）對話：同檔內的 `isSidechain` 事件、或外部
   `<sessionId>/subagents/*.jsonl`，都會收進該 session 的「子代理對話」摺疊區。
+
+## Antigravity（CLI 版）
+
+Antigravity CLI（`agy`）一場對話存成一個 SQLite 檔，每一步是一則沒有公開 schema 的 protobuf。本工具自己解
+（欄位號取自 CLI 本體內嵌的描述；用量與工具呼叫那兩個訊息的欄位號，是拿 CLI 自己報的 token 總數對出來的），
+畫法和 Claude、Codex 一樣：你的發言、AI 的思考／回應／工具呼叫（輸出附在呼叫底下）、壓縮點（`/compact`）。
+
+- **只讀，而且不在來源夾留下任何檔、也不改動任何一個檔**：這些檔是 SQLite 的 WAL 模式，一般的唯讀開法會在旁邊
+  建出 `-shm`／`-wal`（已經在的話會寫進去），所以改用不碰檔案的開法；CLI 正開著、還沒寫回主檔的內容（`-wal`）
+  照樣讀得到（先複製到暫存資料夾再讀）。
+- **標題**取 CLI 自動產生的標題（`conversation_summaries.db`），沒有就用第一句。
+- **子代理**是另一場對話（自己一個檔）：併進父對話那一頁，接在派它出去的那一次 `invoke_subagent` 底下；
+  父對話不在來源裡的，自己一列。
+- **同一場對話的另一個檔**（檔名不是 `<對話 id>.db`：同步工具的衝突副本、手動備份）自己一列、自己一頁，
+  標「副本 <檔名>」（內容可能和原檔一樣，也可能各自接著聊過）；兩份共同的那一段在花費與統計裡算兩次。
+- **背景任務完成、代理之間的訊息、系統通知、錯誤**畫成一列摺疊（原文收在裡面）；工具被擋下、出錯、
+  紀錄停在「執行中」的，都照實標出來。AI 的回應（或其他步驟）沒有完成的——停在半路、被取消、出錯——
+  內容照紀錄畫，那一則標「狀態不是完成」。
+- **一個壞掉的檔只影響它自己那一場**：讀不起來的檔記成「壞掉跳過」、其餘照常建；結構不像 CLI 寫的檔
+  （例如查詢永遠跑不完）不讀。父對話的檔讀不起來時，它的子代理自己一列。
+- **成本**：用量來自每一次模型回應，加總與 CLI 自己報的數字一致。⚠ 紀錄裡**沒有快取寫入量**，所以估價只含
+  輸入、快取讀取與產出（Claude 模型的估價因此偏低），頁面上會標「不含快取寫入」；Gemini 等沒有單價的模型不估、標 `+?`。
+  Antigravity 不進快取健檢與假說報告（那兩份是 Anthropic 的 TTL 模型）。
+- **格式會變**：CLI 會自動更新。認不得的步驟型別或狀態、拆不開的步驟、用量裡沒見過的欄位、取不出文字的發言、
+  讀不起來的子代理，一律在頁面上那個位置標出來並在執行時印警告，不猜。附在你發言或工具結果裡的圖片目前只畫佔位
+  （「🖼️ 圖片」）。
+- 你打的字照原樣畫：Claude Code 那些系統注入的標籤（`<system-reminder>` 之類）在 Antigravity 的紀錄裡不存在，
+  出現了就是你自己打的。
 
 ## 成本與快取（估算）
 
@@ -352,7 +387,7 @@ py ai_session_viewer.py --search "關鍵字" --open            # 空白分隔多
 py ai_session_viewer.py --search "快取 OR cache"            # 獨立大寫 OR = 任一命中；A B OR C ＝ A 且 (B 或 C)
 py ai_session_viewer.py --search "'cache read' 命中"        # 引號包片語（單雙皆可）逐字比對，片語內空白可跨換行
 py ai_session_viewer.py --search readme --match-case        # 區分大小寫（預設不分）
-py ai_session_viewer.py --search "關鍵字" --project Obts    # 縮範圍：--account / --no-claude / --no-codex 同理
+py ai_session_viewer.py --search "關鍵字" --project Obts    # 縮範圍：--account / --no-claude / --no-codex / --no-antigravity 同理
 ```
 
 沒有 `AND` 關鍵字——空白就是 AND；要搜「OR」這個字面詞就用引號（`"OR"`）。

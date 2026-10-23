@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 r"""
 ai_session_viewer.py
-把 Claude Code / Codex 的 JSONL session 轉成可「翻閱」的 HTML 與 Markdown。
+把 Claude Code / Codex 的 JSONL session（與 Antigravity CLI 的對話檔）轉成可「翻閱」的 HTML 與 Markdown。
 跨平台（Windows / Debian / macOS）、零外部相依（只用 Python 3 標準函式庫）。
 
 用法：
-    python3 ai_session_viewer.py                 # 自動偵測 Claude(~/.claude*) + Codex(~/.codex/sessions) -> ./out
+    python3 ai_session_viewer.py                 # 自動偵測 Claude(~/.claude*) + Codex(~/.codex/sessions)
+                                                 #   + Antigravity(~/.gemini/antigravity-cli/conversations) -> ./out
     python3 ai_session_viewer.py --open          # 完成後打開 index.html
-    python3 ai_session_viewer.py --no-codex      # 只轉 Claude（--no-claude 則只轉 Codex）
+    python3 ai_session_viewer.py --no-codex      # 不轉 Codex（--no-claude、--no-antigravity 同理）
     python3 ai_session_viewer.py --account work  # 只轉 ~/.claude-work
     python3 ai_session_viewer.py --claude-source a=~/.claude/projects --codex-source b=/path/sessions
     python3 ai_session_viewer.py --project Obts --format html
@@ -20,6 +21,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import collections
 import errno       # 封存搬移時認「跨磁碟」（EXDEV／WinError 17），見 `_archive_move()`
 import hashlib
 import html
@@ -28,8 +30,12 @@ import math
 import os          # 封存的原子建檔（O_EXCL）與紀錄落磁（fsync）需要，見 `_archive_loop()`
 import re
 import shutil
+import sqlite3     # Antigravity 的對話是一場一個 SQLite 檔（只讀）
 import stat        # 封存清理時解除唯讀（Windows 上唯讀的檔刪不掉）
 import sys
+import tempfile
+import urllib.parse
+import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
@@ -245,9 +251,13 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 # 73 → 74（2026-10-23）：**只改註解**——頁面內嵌的 JS／CSS 註解改寫成規則本身的講法（拿掉人名、日期、
 #    「舊版／第一版寫成」這類經過與不存在於公開 repo 的檔案指標）。行為、錨點、金額都不變；升版只是因為
 #    內嵌註解屬於頁面輸出。驗法是全語料新舊對照（剝掉 `/* … */` 之後應逐位元相同）。
-RENDERER_VERSION = 74
+# 74 → 75（2026-10-23）：① 程式碼區塊的語言字串放進 `class` 屬性時照屬性跳脫（`esc_attr`）。② 完整版 MD 工具框
+#    `<summary>` 那一行：開得出標籤或註解的 `<` 換成 `&lt;`、斷行壓成空格（`_md_html_text`）。兩者只在原文帶那幾種
+#    字元的頁面上變。③ 新來源 Antigravity（CLI 版）。
+RENDERER_VERSION = 75
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
+SOURCE_ANTIGRAVITY = "antigravity"
 
 # session 型態（自動分類）：review／exec／chat（一般互動）。快取統計上 review/exec 與互動
 # session 是不同母體（2026-07-18 以 175 個本機 rollout 實測：本語料 85% 為 exec），故標記＋可篩選、
@@ -272,6 +282,7 @@ KIND_TITLES = {"review": "首句為 reviewer 角色／review prompt——cross-m
 SOURCE_LABELS = {
     SOURCE_CLAUDE: "Claude Code",
     SOURCE_CODEX: "Codex",
+    SOURCE_ANTIGRAVITY: "Antigravity",
 }
 
 
@@ -281,7 +292,7 @@ def source_label(kind: str) -> str:
 
 # 對話裡 AI 那一方的顯示名（回合標頭用）：Claude Code → Claude、Codex → Codex。
 # 注意：MD 標頭的「🤖 <名>」被全文搜尋的 _TURN_HEAD_RE 比對，改這裡要同步放寬該正則。
-AI_NAMES = {SOURCE_CLAUDE: "Claude", SOURCE_CODEX: "Codex"}
+AI_NAMES = {SOURCE_CLAUDE: "Claude", SOURCE_CODEX: "Codex", SOURCE_ANTIGRAVITY: "Antigravity"}
 
 
 def ai_name(kind: str) -> str:
@@ -873,7 +884,7 @@ def md_to_html(text: str) -> str:
     def restore_block(ph):
         idx = int(re.match(r"\x00B(\d+)\x00", ph).group(1))
         lang, code = blocks[idx]
-        cls = f' class="language-{esc(lang)}"' if lang else ""
+        cls = f' class="language-{esc_attr(lang)}"' if lang else ""
         return f"<pre><code{cls}>{html.escape(code, quote=False)}</code></pre>"
 
     def inline_fmt(s: str) -> str:
@@ -1016,7 +1027,7 @@ class Session:
         self.n_user = self.n_assistant = self.n_tools = 0
         self.out_html = ""
         self.out_md = ""
-        self.sync_note = ""         # 同步副本的說明「同步副本 <主機> <時間>」（見 sync_copy_label）
+        self.sync_note = ""         # 副本的說明：Claude「同步副本 <主機> <時間>」（見 sync_copy_label）、Antigravity「副本 <檔名>」
 
 
 def load_events(path: Path, sidechain_force=False):
@@ -2047,6 +2058,788 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
     return s
 
 
+# =========================================================================
+# Antigravity（CLI 版）：一場對話一個 SQLite 檔，每一步是一則 protobuf（`gemini_coder.Step`）
+# =========================================================================
+# 沒有公開的 schema。CLI 本體內嵌了 `.proto` 的描述，欄位號照那份描述取（旁邊註明欄位名）；
+# 用量（`ModelUsageStats`）與工具呼叫（`ChatToolCall`）的描述撈不到，那幾個欄位號是拿 CLI 自己報的
+# 總數對出來的，旁邊標「實測」。CLI 會自動更新、欄位可能變：認不得的步驟型別、狀態、拆不開的步驟、
+# 用量裡沒見過的欄位，一律出聲（stderr），頁面上也標出來，不猜。
+# 工具本身零相依：這裡自己走 protobuf 的 wire format。
+AG_STEP_USER_INPUT = 14      # CortexStepType.USER_INPUT
+AG_STEP_PLANNER = 15         # PLANNER_RESPONSE：模型回應（文字、思考、工具呼叫）
+AG_STEP_ERROR = 17           # ERROR_MESSAGE
+AG_STEP_CHECKPOINT = 23      # CHECKPOINT：壓縮（`/compact` 或自動）
+AG_STEP_SYSTEM = 101         # SYSTEM_MESSAGE：背景任務完成、代理之間的訊息、系統通知
+AG_STEP_GENERIC = 132        # GENERIC：一次工具呼叫的結果
+AG_STATUS_DONE, AG_STATUS_INVALID, AG_STATUS_CANCELED, AG_STATUS_ERROR = 3, 4, 6, 7
+AG_STATUS_INTERRUPTED = 12
+# CortexStepStatus 的其餘值：還沒跑完的幾種（紀錄停在那裡＝沒有結果）與 CLEARED
+AG_STATUS_UNFINISHED = frozenset((1, 2, 8, 9, 11))      # PENDING／RUNNING／GENERATING／WAITING／QUEUED
+AG_STATUS_KNOWN = frozenset((3, 4, 5, 6, 7, 12)) | AG_STATUS_UNFINISHED
+# 認得、但不是 DONE 的狀態 → 頁面上那一句。模型回應：那一則的最後標「⚠ 模型回應的狀態不是完成」；
+# 使用者輸入、系統訊息、錯誤、壓縮點：那一步之後標「⚠ 步驟的狀態不是完成」（也出聲）。工具結果照它自己那一套畫。
+_AG_NOT_DONE = {AG_STATUS_CANCELED: "被取消（內容可能不完整）", AG_STATUS_ERROR: "出錯（內容可能不完整）",
+                AG_STATUS_INTERRUPTED: "被打斷（內容可能不完整）", AG_STATUS_INVALID: "無效",
+                5: "CLEARED（被清除；這個狀態的意思沒有樣本可對）",
+                **{s: "紀錄停在這一步、還沒跑完（內容可能不完整）" for s in AG_STATUS_UNFINISHED}}
+# ModelUsageStats 認得的欄位（實測）：1 模型 enum、2 輸入（不含快取讀取）、3 產出（含思考）、5 快取讀取、
+# 6 供應端 enum、7 回應 id、8 工作階段資訊、9 思考、10 回應產出、11 請求 id。
+# 沒見過的欄位（例如快取寫入量哪天出現了）沒有算進花費 ⇒ 出聲。
+_AG_USAGE_FIELDS = frozenset((1, 2, 3, 5, 6, 7, 8, 9, 10, 11))
+AG_COST_NOTE = ("Antigravity 的紀錄沒有快取寫入量：估價只含輸入、快取讀取與產出（Claude 模型的估價因此偏低）；"
+                "沒有單價的模型（Gemini 等）不估")
+
+
+def _pb_varint(buf, i):
+    val = shift = 0
+    while True:
+        if i >= len(buf) or shift > 63:
+            raise ValueError("varint")
+        b = buf[i]
+        i += 1
+        val |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return val, i
+        shift += 7
+
+
+class _PbFixed:
+    """fixed32／fixed64 欄位的值（`raw`：那 4／8 個位元組）。刻意不是 bytes：它和 length-delimited 都是一段位元組，
+    混成同一型別的話，字串或巢狀訊息的欄位放的若是它，`_pb_str`／`_pb_msg` 會當成正常的值收下。"""
+    __slots__ = ("raw",)
+
+    def __init__(self, raw):
+        self.raw = raw
+
+
+def _pb_fields(buf):
+    """一段 protobuf 訊息拆成 `{欄位號: [值, …]}`（同一欄位出現幾次就幾個，依出現順序）。
+
+    值：varint 是整數；length-delimited 是 bytes——字串、bytes 與巢狀訊息在編碼上分不出來，由呼叫端照欄位的定義
+    解讀（`_pb_str`／`_pb_msg`）；fixed32／fixed64 是 `_PbFixed`（三種存取都不收它：欄位形狀不對）。
+    拆不乾淨就丟 `ValueError`，不猜。"""
+    out, i, n = {}, 0, len(buf)
+    while i < n:
+        key, i = _pb_varint(buf, i)
+        fn, wt = key >> 3, key & 7
+        if fn == 0:
+            raise ValueError("field 0")
+        if wt == 0:
+            v, i = _pb_varint(buf, i)
+        elif wt == 2:
+            ln, i = _pb_varint(buf, i)
+            if ln > n - i:
+                raise ValueError("length")
+            v, i = bytes(buf[i:i + ln]), i + ln
+        elif wt in (1, 5):
+            w = 8 if wt == 1 else 4
+            if w > n - i:
+                raise ValueError("fixed")
+            v, i = _PbFixed(bytes(buf[i:i + w])), i + w
+        else:
+            raise ValueError("wire type")
+        out.setdefault(fn, []).append(v)
+    return out
+
+
+def _pb_msg(fields, fn):
+    """欄位 `fn`（取最後一個）當成巢狀訊息拆開；沒有這個欄位回 `{}`。形狀不對（不是 length-delimited、拆不開）丟 `ValueError`。"""
+    vals = fields.get(fn)
+    if not vals:
+        return {}
+    if not isinstance(vals[-1], bytes):
+        raise ValueError(f"field {fn} is not a message")
+    return _pb_fields(vals[-1])
+
+
+def _pb_str(fields, fn):
+    """欄位 `fn`（取最後一個）當成字串；沒有回 `""`。不是 length-delimited（整數、fixed32／fixed64）丟 `ValueError`。"""
+    vals = fields.get(fn)
+    if not vals:
+        return ""
+    if not isinstance(vals[-1], bytes):
+        raise ValueError(f"field {fn} is not a string")
+    return vals[-1].decode("utf-8", "replace")
+
+
+def _pb_int(fields, fn, default=0):
+    """欄位 `fn`（取最後一個）當成 varint；沒有回 `default`。不是整數丟 `ValueError`。"""
+    vals = fields.get(fn)
+    if not vals:
+        return default
+    if not isinstance(vals[-1], int):
+        raise ValueError(f"field {fn} is not a varint")
+    return vals[-1]
+
+
+def _ag_time(ts):
+    """`google.protobuf.Timestamp`（1 秒、2 奈秒）→ aware datetime（UTC）；沒有或不合理回 None。"""
+    try:
+        sec, nanos = _pb_int(ts, 1), _pb_int(ts, 2)
+    except ValueError:
+        return None
+    if sec <= 0 or not 0 <= nanos < 1_000_000_000:
+        return None
+    try:
+        return datetime.fromtimestamp(sec, timezone.utc) + timedelta(microseconds=nanos // 1000)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _ag_connect(path):
+    """唯讀開一場 Antigravity 的 SQLite，**不在來源夾留下任何檔、也不改動任何一個檔**。回傳 `(連線, 暫存目錄或 None)`，
+    用完交給 `_ag_close`。
+
+    ⚠ 這些檔是 WAL 模式。SQLite 一般的讀者（`mode=ro` 也是）一定會碰 `-shm`：不在就在旁邊建出 `-shm` 與 `-wal`
+      （實測：開一次就多兩個檔），在的話也會寫進去（讀者要在共享記憶體登記自己讀到哪裡；實測 `-shm` 的位元組變了）。
+      所以分兩種：
+    - 旁邊沒有 `-wal`、或它是空的：內容全在主檔 ⇒ `immutable=1`（不上鎖、不碰 `-shm`、不建任何檔）。
+    - `-wal` 有內容（CLI 正開著，或上次沒收乾淨）：把 `-wal` 與主檔複製到暫存目錄、開複本——讀得到還沒寫回主檔的
+      那幾步，來源夾的檔一個位元組都不動。先複製 `-wal`：CLI 若在兩次複製之間把它寫回主檔，主檔的複本已經含有
+      那幾頁、舊 `-wal` 再套一次是同樣的內容；反過來的順序會拿到舊主檔配新 `-wal`，少掉寫回的那幾頁。
+    暫存目錄用 `Path.mkdir` 開（隨機名），不用 `tempfile.mkdtemp()`；POSIX 上權限 0700（`/tmp` 是大家共用的）。
+    ⚠ Windows 上不指定 0700：Python 3.13 起那會換成一份不繼承的權限（只剩 SYSTEM、Administrators、OWNER RIGHTS），
+      沙箱化的行程連自己開的目錄都寫不進去；使用者的暫存夾本來就只有本人讀得到，繼承它的權限就夠。
+    範圍限制 SCOPE-AG-IMMUTABLE-RACE：`immutable=1` 不上鎖、複製也不是一瞬間——CLI 剛好在那一刻把 `-wal` 寫回主檔，
+    可能讀到一半的頁、這一場解析失敗（建置照「壞掉跳過」處理，下一次建置重讀）。
+    開好之後一律經 `_ag_guard`：檔是別人給的，一個檔最多只能讓這一場讀不起來，不可以讓整批停在它身上。"""
+    path = Path(path)
+    wal = Path(str(path) + "-wal")
+    try:
+        wal_n = wal.stat().st_size
+    except OSError:
+        wal_n = 0
+    if wal_n <= 0:
+        con, tmp = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True), None
+    else:
+        tmp = Path(tempfile.gettempdir()) / f"asv-ag-{uuid.uuid4().hex}"
+        if os.name == "nt":
+            tmp.mkdir()
+        else:
+            tmp.mkdir(mode=0o700)
+        try:
+            shutil.copyfile(wal, tmp / "c.db-wal")
+            shutil.copyfile(path, tmp / "c.db")
+            con = sqlite3.connect(str(tmp / "c.db"))
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+    try:
+        _ag_guard(con)
+    except BaseException:
+        _ag_close(con, tmp)
+        raise
+    return con, tmp
+
+
+# 一個連線最多跑幾個 SQLite 指令（VM instruction）。實測（2026-10-23）：最大的真實對話（266 步、4 MB）照本工具的讀法
+# 全部讀完不到兩千個；這個上限是它的兩萬多倍，真實的檔碰不到；跑不完的查詢在那台機器上約兩秒中止。
+AG_SQL_BUDGET = 50_000_000
+_AG_TABLES = ("steps", "gen_metadata", "trajectory_meta", "trajectory_metadata_blob", "conversation_summaries")
+
+
+def _ag_guard(con):
+    """給剛開的連線兩道限制，讓一個檔的代價最多是它自己那一場（丟例外，由呼叫端照「讀不起來」處理）：
+    - 本工具會查的那幾個名字一定要是資料表：檢視表（view）可以是一段永遠跑不完的遞迴查詢，CLI 寫的檔沒有檢視表；
+    - 執行預算：這個連線累計跑過 `AG_SQL_BUDGET` 個指令就中止當下那一句（`sqlite3.OperationalError: interrupted`）。"""
+    left = [AG_SQL_BUDGET // 10_000]
+
+    def tick():
+        left[0] -= 1
+        return 1 if left[0] < 0 else 0          # 非 0：SQLite 中止當下那一句
+
+    con.set_progress_handler(tick, 10_000)
+    bad = con.execute("select name, type from sqlite_master where lower(name) in (%s) and type != 'table'"
+                      % ", ".join("?" * len(_AG_TABLES)), _AG_TABLES).fetchall()
+    if bad:
+        raise sqlite3.DatabaseError("不是資料表：" + "、".join(f"{n}（{t}）" for n, t in bad)
+                                    + "——不像 Antigravity CLI 寫的檔，不讀")
+
+
+def _ag_close(con, tmp):
+    try:
+        con.close()
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _file_uri_path(uri):
+    """`file:///D:/a/%E5%B0%88` → `D:/a/專`；不是 file URI 就原樣回。"""
+    u = str(uri or "")
+    if not u.lower().startswith("file://"):
+        return u
+    p = urllib.parse.unquote(urllib.parse.urlparse(u).path)
+    if re.match(r"^/[A-Za-z]:", p):
+        p = p[1:]
+    return p
+
+
+def antigravity_conv_info(path):
+    """一場的身分與歸屬（不讀步驟內容）：`{id, path, parent, call, agent, agent_name, cwd, branch}`。讀不起來丟例外。
+
+    - id：`trajectory_meta.cascade_id`（就是對話 id；檔名可以被改，不拿檔名認人），沒有才退回檔名。
+    - 父對話、子代理型別與名字、工作目錄、分支：`trajectory_metadata_blob` 那一列（`CortexTrajectoryMetadata`：
+      1 workspaces（實測 1＝工作目錄 URI、4＝分支）、5 parent_conversation_id、7 workspace_uris、
+      8 subagent_spec（實測 1＝型別、2＝名字））。
+    - 觸發這個子代理的那一次 `invoke_subagent` 呼叫：子代理的第一步是父代理傳來的訊息（SYSTEM_MESSAGE 的
+      `agent_message`），它的 `source_metadata`（實測：1 對話 id、3 那一次工具呼叫）指回父對話的那一次呼叫。"""
+    path = Path(path)
+    info = {"id": path.stem, "path": path, "parent": "", "call": "", "agent": "", "agent_name": "",
+            "cwd": "", "branch": ""}
+    con, tmp = _ag_connect(path)
+    try:
+        try:
+            row = con.execute("select cascade_id from trajectory_meta").fetchone()
+        except sqlite3.Error:
+            row = None
+        if row and isinstance(row[0], str) and row[0].strip():
+            info["id"] = row[0].strip()
+        try:
+            blob = con.execute("select data from trajectory_metadata_blob where id = 'main'").fetchone()
+        except sqlite3.Error:
+            blob = None
+        first = con.execute("select step_type, step_payload from steps order by idx limit 1").fetchone()
+    finally:
+        _ag_close(con, tmp)
+    if blob and blob[0]:
+        try:
+            tm = _pb_fields(bytes(blob[0]))
+            ws = _pb_msg(tm, 1)
+            info["cwd"] = _file_uri_path(_pb_str(ws, 1) or _pb_str(tm, 7))
+            info["branch"] = _pb_str(ws, 4)
+            info["parent"] = _pb_str(tm, 5)
+            spec = _pb_msg(tm, 8)
+            info["agent"], info["agent_name"] = _pb_str(spec, 1), _pb_str(spec, 2)
+        except ValueError:
+            pass                    # 形狀認不得：當成沒有父對話（自己一列），內容照讀
+    if info["parent"] and first and first[0] == AG_STEP_SYSTEM and first[1]:
+        try:
+            am = _pb_msg(_pb_msg(_pb_fields(bytes(first[1])), 114), 4)
+            src = _pb_msg(_pb_msg(am, 12), 1)
+            if _pb_str(src, 1) == info["parent"]:
+                info["call"] = _pb_str(_pb_msg(src, 3), 1)
+        except ValueError:
+            pass                    # 對不到那一次呼叫：子代理照樣併進父對話，畫在頁尾（同 Claude 的孤兒子代理）
+    return info
+
+
+def _find_antigravity_summaries(source):
+    """從對話目錄（或單一 `.db`）往上層找 `conversation_summaries.db`，止於 `antigravity-cli` 目錄或檔案系統根。"""
+    start = source if source.is_dir() else source.parent
+    for d in [start, *start.parents]:
+        cand = d / "conversation_summaries.db"
+        if cand.is_file():
+            return cand
+        if d.name == "antigravity-cli":
+            break
+    return None
+
+
+def load_antigravity_summaries(source):
+    """`conversation_summaries.db` → `{對話 id: {"title", "parent", "agent"}}`。標題是 CLI 自動產生的
+    （同 Claude 的自動標題）；沒有這個檔、或讀不起來就回 {}（標題退回第一句）。"""
+    db = _find_antigravity_summaries(Path(source))
+    out = {}
+    if db is None:
+        return out
+    try:
+        con, tmp = _ag_connect(db)
+    except (OSError, sqlite3.Error):
+        return out
+    try:
+        cols = {r[1] for r in con.execute("pragma table_info(conversation_summaries)")}
+        if "conversation_id" not in cols:
+            return out
+        pick = [c for c in ("title", "parent_conversation_id", "agent_name") if c in cols]
+        for row in con.execute(f"select conversation_id, {', '.join(pick) or 'null'} from conversation_summaries"):
+            d = dict(zip(pick, row[1:]))
+            if isinstance(row[0], str) and row[0]:
+                out[row[0]] = {"title": str(d.get("title") or "").strip(),
+                               "parent": str(d.get("parent_conversation_id") or "").strip(),
+                               "agent": str(d.get("agent_name") or "").strip()}
+    except sqlite3.Error:
+        pass
+    finally:
+        _ag_close(con, tmp)
+    return out
+
+
+def iter_antigravity_files(source):
+    """對話目錄底下的 `<id>.db`（不遞迴；`-wal`／`-shm` 不算），或單一 `.db` 檔。"""
+    if source.is_file() and source.suffix.lower() == ".db":
+        yield source
+        return
+    if not source.is_dir():
+        print(f"找不到 Antigravity 對話資料夾：{source}", file=sys.stderr)
+        return
+    for sf in sorted(source.glob("*.db")):
+        if sf.is_file():
+            yield sf
+
+
+def antigravity_is_copy(info):
+    """這個檔是不是副本：CLI 自己寫的檔就叫 `<對話 id>.db`，檔名不是它的（同步工具的衝突副本、手動備份、改過名）就是。
+    只看這個檔自己，不看同一批裡有沒有本人：這一場的身分與輸出檔名才不會隨別的檔存不存在而變。"""
+    return Path(info["path"]).stem != info["id"]
+
+
+def antigravity_session_id(info):
+    """這一場在本工具裡的 session id：對話 id；副本是「對話 id@檔名主幹」——和本人分得開（輸出檔名、`--ai-md`、
+    書籤都以它為身分），又以對話 id 開頭（`--ai-md` 給對話 id 的開頭也找得到它）。"""
+    return f"{info['id']}@{Path(info['path']).stem}" if antigravity_is_copy(info) else info["id"]
+
+
+def antigravity_tree(paths, summaries=None):
+    """把一批對話檔排成「主對話 → 子代理」的樹。回傳 `(主對話的 info 清單, {主對話路徑: [子孫 info, …]})`。
+
+    子代理是**另一場對話**（自己一個檔）：併進父對話那一頁，接在觸發它的那一次 `invoke_subagent` 底下
+    （同 Claude 的 Task）；父對話不在這一批裡的，自己一列。
+    ⚠ 讀不起來的檔照樣自己一列（建置時會在「解析失敗」那裡講出來），不可以安靜消失；它也**不當父對話**：
+      子代理接到它的話會跟著它一起讀不起來（一個壞檔賠上另一場讀得起來的對話）⇒ 那些子代理自己一列。
+      範圍限制 SCOPE-AG-BROKEN-PARENT-LATE：父對話的身分讀得起來、步驟讀到一半才壞的，併進它的子代理跟著那一場
+      算壞掉（stderr 那一行講出連帶了幾個子代理）。
+    ⚠ 副本（檔名不是 `<對話 id>.db`，見 `antigravity_is_copy`）一律自己一列、不併進父對話：本人也在的話，
+      父對話那一頁會有同一個子代理兩份。同一個 id 的父對話有本人也有副本時，子代理接到本人。
+      範圍限制 SCOPE-AG-COPY-FORK-STATS：副本和本人共同的那一段在花費與統計裡算兩次；副本那一頁不含子代理。
+    ⚠ 父子關係成環（資料壞掉）時，環上的每一場都當主對話。走子孫用迴圈、不用遞迴：父子鏈多深都不會撞到
+      Python 的遞迴上限（那個例外在每一場的例外處理之外，整批會停下來）。"""
+    summaries = summaries or {}
+    infos = []
+    for p in paths:
+        try:
+            info = antigravity_conv_info(p)
+        except Exception:
+            info = {"id": Path(p).stem, "path": Path(p), "parent": "", "call": "", "agent": "",
+                    "agent_name": "", "cwd": "", "branch": "", "unreadable": True}
+        sm = summaries.get(info["id"]) or {}
+        info["title"] = sm.get("title", "")
+        info["parent"] = info["parent"] or sm.get("parent", "")
+        info["agent"] = info["agent"] or sm.get("agent", "")
+        infos.append(info)
+    by_id = {}
+    for info in sorted(infos, key=antigravity_is_copy):      # 本人優先；都是副本就取排序在前的那一份
+        if not info.get("unreadable"):                       # 讀不起來的不當父對話（見上）
+            by_id.setdefault(info["id"], info)
+    kids = {}
+    for info in infos:
+        par = by_id.get(info["parent"]) if info["parent"] else None
+        if par is not None and par is not info and not antigravity_is_copy(info):
+            kids.setdefault(id(par), []).append(info)
+
+    def _desc(root, seen):
+        out, stack = [], [iter(kids.get(id(root), ()))]
+        while stack:
+            k = next(stack[-1], None)
+            if k is None:
+                stack.pop()
+            elif id(k) not in seen:
+                seen.add(id(k))
+                out.append(k)
+                stack.append(iter(kids.get(id(k), ())))
+        return out
+
+    roots = [i for i in infos if antigravity_is_copy(i)
+             or not (i["parent"] and by_id.get(i["parent"]) not in (None, i))]
+    reached, tree = set(), {}
+    for r in roots:
+        seen = {id(r)}
+        tree[str(r["path"])] = _desc(r, seen)
+        reached |= seen
+    for i in infos:                                  # 環上的（沒有一個主對話走得到）：自己一列
+        if id(i) not in reached:
+            seen = {id(i)}
+            roots.append(i)
+            tree[str(i["path"])] = _desc(i, seen)
+            reached |= seen
+    return roots, tree
+
+
+def antigravity_signature(info, desc=()):
+    """變動指紋：主檔與 `-wal`、每一個子代理檔與它的 `-wal` 的 (檔名, mtime, 大小)，加上頁面用到、卻不在這些檔裡的值——
+    `conversation_summaries.db` 給的標題與子代理型別（`antigravity_tree` 補進 info 的）。那個檔每跑一次 CLI 都會變，
+    不拿它的 mtime，只拿用到的值；頁面多用一個它給的值，這裡就要多收一個。"""
+    parts = []
+    for i in [info, *desc]:
+        for p in (Path(i["path"]), Path(str(i["path"]) + "-wal")):
+            try:
+                st = p.stat()
+                parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}")
+            except OSError:
+                pass
+    parts.append("title:" + str(info.get("title") or ""))
+    parts += [f"agent:{d.get('id', '')}:{d.get('agent') or ''}" for d in desc]
+    return "|".join(parts)
+
+
+def _ag_model_names(con):
+    """模型 enum → 模型 id：每一次生成在 `gen_metadata` 記一列（`data.1`：實測 3＝模型 enum、19＝模型 id）。"""
+    names = {}
+    try:
+        rows = con.execute("select data from gen_metadata").fetchall()
+    except sqlite3.Error:
+        return names
+    for (data,) in rows:
+        try:
+            g = _pb_msg(_pb_fields(bytes(data or b"")), 1)
+            e, mid = _pb_int(g, 3, None), _pb_str(g, 19)
+        except ValueError:
+            continue
+        if isinstance(e, int) and mid and e not in names:
+            names[e] = mid
+    return names
+
+
+def _ag_notify(label, summary, raw):
+    """系統訊息、背景任務完成、認不得的步驟：畫成和 Claude 背景任務通知同一種摺疊列（原文收在摺疊裡）。"""
+    return {"type": "_notify", "label": label, "summary": summary, "status": "", "event": "", "raw": raw}
+
+
+def _ag_events(path, conv_id, srcf, warn, ids=None):
+    """一場對話的步驟 → 本工具的事件（與 Claude 同形）。`warn` 收集出聲的計數（`{說明: 次數}`）；
+    `ids`（有給的話）填這一場「原始呼叫 id → 第一次出現時的內部 id」，子代理接回觸發它的那一次呼叫時用。
+
+    | 步驟 | 變成 |
+    |---|---|
+    | USER_INPUT | 使用者發言（`user_response`；沒有就退回 `items` 的文字、再退回 `query`）|
+    | PLANNER_RESPONSE | 一次模型呼叫：思考、回應文字、工具呼叫；用量掛在這裡（`metadata.model_usage`）；狀態不是完成的，那一則的最後標出來 |
+    | GENERIC | 那一次工具呼叫的結果（呼叫本身在模型回應裡；模型回應沒有它時，用工具步驟自己帶的呼叫補一個）|
+    | SYSTEM_MESSAGE | 子代理的第一步（父代理傳來的任務）是一則發言；其餘畫成摺疊列 |
+    | ERROR_MESSAGE | 摺疊列「⚠ 錯誤」|
+    | CHECKPOINT | 壓縮點（同 Claude 的 compact：分隔線＋收起來的摘要）|
+    | 其他型別 | 摺疊列「⚠ 認不得的步驟」＋出聲 |
+
+    ⚠ 每一個出聲（`warn`，建置時印到 stderr）都在頁面上那一步的位置標一列（`note`）：只在 stderr 講的話，
+      看頁面的人不知道那裡少了什麼、哪個值不可信。
+    工具呼叫與結果的配對：
+    - 呼叫 id 前面加對話 id（`call_id`）：父對話與子代理併進同一頁、共用一張結果表，各自編的 id 不可以撞在一起。
+    - 內部 id 一律經 `alloc` 發：已經發出去的就接 `#2`、`#3`…往下編，直到沒人用過（原始 id 本身可以長得像 `x#2`）。
+      同一個 id 出現第二次起另編一個：結果依出現順序各配各的，不會蓋掉別次呼叫的結果。
+    - 沒有 id 的：照「工具名＋參數原文」配到模型回應裡同樣沒有 id 的那一次；配不到就用工具步驟自己帶的呼叫補一個。
+    範圍限制 SCOPE-AG-CALL-ORDER-PAIRING：後兩種靠出現順序配，結果的順序和呼叫不一樣時會配錯（頁面上那兩種都標了）。"""
+    con, tmp = _ag_connect(path)
+    try:
+        rows = con.execute("select idx, step_type, status, step_payload from steps order by idx").fetchall()
+        models = _ag_model_names(con)
+    finally:
+        _ag_close(con, tmp)
+    evs = []
+    last_model = ""              # 最近一次模型回應的模型（補呼叫的事件沿用：它沒有用量，不可以讓花費變成「+?」）
+    last_dt = None               # 上一步的時刻：拆不開、或沒有時刻的步驟沿用它，才會排在原來的位置（不會跑到整場最前面）
+    n_seen = collections.Counter()   # 呼叫 id → 出現過幾次（模型回應裡的呼叫，加上補出來的呼叫）
+    used = set()                 # 這一場已經發出去的內部 id
+    first_ids = {} if ids is None else ids
+    pending = {}                 # 呼叫 id → [還沒配到結果的內部 id, …]（依出現順序）
+    pending_noid = {}            # (工具名, 參數原文) → [沒有呼叫 id、還沒配到結果的內部 id, …]
+
+    def ev(kind, idx, dt, msg, suffix="", **extra):
+        e = {"type": kind, "uuid": f"ag-{conv_id}-{idx}{suffix}",
+             "timestamp": dt.isoformat() if dt else None, "_dt": dt, "_i": idx, "sessionId": conv_id,
+             "message": msg}
+        if srcf:
+            e["_srcf"] = srcf
+        e.update(extra)
+        evs.append(e)
+        return e
+
+    def note(idx, dt, what, label, summary):
+        """出聲（`what` 計進 stderr 那一行）＋頁面上那一步的位置標一列摺疊列。"""
+        warn[what] += 1
+        ev("user", idx, dt, {"role": "user", "content": ""}, suffix=f"-note{len(evs)}", isMeta=True,
+           _special=_ag_notify(label, summary, ""))
+
+    def alloc(base):
+        tid, k = base, 1
+        while tid in used:
+            k += 1
+            tid = f"{base}#{k}"
+        used.add(tid)
+        return tid
+
+    def call_id(raw):
+        n_seen[raw] += 1
+        tid = alloc(f"{conv_id}:{raw}")
+        first_ids.setdefault(raw, tid)
+        return tid
+
+    def tool_use(tid, name, args):
+        return {"type": "tool_use", "id": tid, "name": name or "tool",
+                "input": _json_obj_maybe(args) if args.strip() else {}}
+
+    dup_id = "工具呼叫 id 重複（結果依出現順序各配各的）"
+    no_id = "工具步驟沒有呼叫 id"
+    for n, (idx, st_col, status_col, payload) in enumerate(rows):
+        idx = idx if isinstance(idx, int) else n
+        try:
+            step = _pb_fields(bytes(payload or b""))
+            stype = _pb_int(step, 1, st_col)
+            status = _pb_int(step, 4, status_col)
+            meta = _pb_msg(step, 5)
+            dt = _ag_time(_pb_msg(meta, 1))
+        except (ValueError, TypeError):
+            warn["步驟拆不開（protobuf 形狀不對），沒有畫出來"] += 1
+            ev("user", idx, last_dt, {"role": "user", "content": ""}, isMeta=True,
+               _special=_ag_notify("⚠ 拆不開的步驟", f"第 {idx} 步（型別 {st_col}）", ""))
+            continue
+        odd = []                 # 這一步要標在頁面上的：(出聲的說明, 標籤, 摘要)，畫完這一步之後標
+        if dt is None:
+            odd.append(("步驟沒有時刻（沿用上一步的）", "⚠ 步驟沒有時刻", f"第 {idx} 步：沿用上一步的時刻"))
+            dt = last_dt
+        last_dt = dt or last_dt
+        if stype != st_col:
+            odd.append(("步驟型別欄和內容裡的型別不一致（照內容的）", "⚠ 步驟型別不一致",
+                        f"第 {idx} 步：型別欄 {st_col}、內容裡是 {stype}（照內容的畫）"))
+        if status not in AG_STATUS_KNOWN:
+            odd.append((f"認不得的步驟狀態 {status}", "⚠ 認不得的步驟狀態",
+                        f"第 {idx} 步：狀態 {status}（照內容畫，做完了沒、成功與否都不知道）"))
+        elif status in _AG_NOT_DONE and stype in (AG_STEP_USER_INPUT, AG_STEP_SYSTEM, AG_STEP_ERROR, AG_STEP_CHECKPOINT):
+            odd.append((f"步驟的狀態不是完成（{_AG_NOT_DONE[status]}）", "⚠ 步驟的狀態不是完成",
+                        f"第 {idx} 步：{_AG_NOT_DONE[status]}"))
+        try:
+            if stype == AG_STEP_USER_INPUT:
+                ui = _pb_msg(step, 19)
+                text = _pb_str(ui, 2)                            # user_response
+                if not text.strip():
+                    text = "\n".join(t for t in (_pb_str(_pb_fields(v), 1) for v in ui.get(3, [])
+                                                 if isinstance(v, bytes)) if t)   # items（實測 1＝文字）
+                if not text.strip():
+                    text = _pb_str(ui, 1)                        # query
+                n_media = len(ui.get(5, [])) + len(ui.get(9, []))   # images／media
+                content = [{"type": "text", "text": text}] if text.strip() else []
+                if n_media:
+                    # 圖片的欄位形狀沒有樣本可對，只畫佔位（「🖼️ 圖片」）——看得出這裡有過一張圖，不猜內容。
+                    # 範圍限制 SCOPE-AG-USER-MEDIA-PLACEHOLDER。
+                    warn["使用者輸入附的圖片／檔案只畫了佔位"] += n_media
+                    content += [{"type": "image", "source": {}}] * n_media
+                if content:
+                    ev("user", idx, dt, {"role": "user", "content": content})
+                else:
+                    odd.append(("使用者輸入取不出文字（承載文字的欄位可能變了），沒有畫出來", "⚠ 取不出文字的使用者輸入",
+                                f"第 {idx} 步：承載文字的欄位可能變了，這一則沒有畫出來"))
+            elif stype == AG_STEP_PLANNER:
+                pr = _pb_msg(step, 20)
+                blocks = []
+                think = _pb_str(pr, 3)
+                if think.strip():
+                    blocks.append({"type": "thinking", "thinking": think})
+                elif _pb_int(pr, 5, 0):                          # thinking_redacted
+                    blocks.append({"type": "redacted_thinking"})
+                text = _pb_str(pr, 1) or _pb_str(pr, 8)          # response；沒有才退回 modified_response
+                if text.strip():
+                    blocks.append({"type": "text", "text": text})
+                calls = []                                       # tool_calls（ChatToolCall，實測：1 id、2 名字、3 參數 JSON）
+                for v in pr.get(7, []):
+                    if not isinstance(v, bytes):
+                        raise ValueError("tool_calls")
+                    tc = _pb_fields(v)
+                    calls.append((_pb_str(tc, 1), _pb_str(tc, 2), _pb_str(tc, 3)))
+                usage = _pb_msg(meta, 9)                         # CortexStepMetadata.model_usage
+                enum = _pb_int(usage, 1, None) if usage else None
+                if enum is None:
+                    enum = _pb_int(meta, 11, None)               # generator_model
+                if usage:
+                    use = {"input_tokens": _pb_int(usage, 2), "cache_read_input_tokens": _pb_int(usage, 5),
+                           "output_tokens": _pb_int(usage, 3)}
+                # ⚠ 整步都拆開了才動配對的狀態（`alloc`、`pending`）：拆到一半丟例外的話，配對表會留著一個
+                #   沒有畫出來的呼叫，後面那一步的結果配給它、跟著消失。工具結果那一支同樣。
+                for k, (raw, name, args) in enumerate(calls):
+                    if raw:
+                        tid = call_id(raw)
+                        pending.setdefault(raw, []).append(tid)
+                        if n_seen[raw] > 1:
+                            odd.append((dup_id, "⚠ 工具呼叫 id 重複",
+                                        f"第 {idx} 步：呼叫 id {raw} 第 {n_seen[raw]} 次出現（結果依出現順序各配各的）"))
+                    else:
+                        tid = alloc(f"{conv_id}:@{idx}-{k}")
+                        pending_noid.setdefault((name, args), []).append(tid)
+                        odd.append(("模型回應裡的工具呼叫沒有 id（結果照工具名與參數配）", "⚠ 工具呼叫沒有 id",
+                                    f"第 {idx} 步：{name or 'tool'}（結果照工具名與參數配）"))
+                    blocks.append(tool_use(tid, name, args))
+                if not blocks:
+                    # 沒有文字、思考或工具呼叫：它的用量照樣算進花費，回合與逐步的計量也要算到它
+                    # （整則沒有可畫的區塊的話，分組時會被跳過）⇒ 那一步畫一列標記
+                    warn["模型回應沒有內容（沒有文字、思考或工具呼叫）"] += 1
+                    blocks.append(_ag_notify("⚠ 沒有內容的模型回應", f"第 {idx} 步", ""))
+                if status in _AG_NOT_DONE:
+                    # 狀態不是完成（停在半路、被取消、出錯…）：內容與用量照紀錄畫，回應的最後標出來——
+                    # 不標的話看起來和完成的回應一模一樣。認不得的狀態上面另外標了。
+                    blocks.append(_ag_notify("⚠ 模型回應的狀態不是完成",
+                                             f"第 {idx} 步：{_AG_NOT_DONE[status]}", ""))
+                msg = {"role": "assistant", "id": f"ag-{conv_id}-{idx}",
+                       "model": models.get(enum) or (f"antigravity-model-{enum}" if enum is not None else ""),
+                       "content": blocks}
+                last_model = msg["model"] or last_model
+                if usage:
+                    unk = sorted(set(usage) - _AG_USAGE_FIELDS)
+                    if unk:
+                        odd.append((f"用量裡有沒見過的欄位 {unk}（可能是快取寫入之類的量），沒有算進花費",
+                                    "⚠ 用量裡有沒見過的欄位",
+                                    f"第 {idx} 步：欄位 {unk} 沒有算進花費（可能是快取寫入之類的量）"))
+                    msg["usage"] = use
+                ev("assistant", idx, dt, msg)
+            elif stype == AG_STEP_GENERIC:
+                tc = _pb_msg(meta, 4)                            # CortexStepMetadata.tool_call
+                raw, name, args = _pb_str(tc, 1), _pb_str(tc, 2), _pb_str(tc, 3)
+                key = (name, args)
+                res = _pb_msg(_pb_msg(step, 140), 2)             # generic.result（GenericStepResult）
+                text = _pb_str(res, 1)
+                err = _pb_msg(step, 31)                          # Step.error（CortexErrorDetails）
+                err_text = _pb_str(err, 1) or _pb_str(err, 2) or _pb_str(err, 3)
+                n_media = len(res.get(4, []))
+                if raw and pending.get(raw):
+                    tid = pending[raw].pop(0)
+                elif not raw and pending_noid.get(key):
+                    tid = pending_noid[key].pop(0)
+                    odd.append((no_id, "⚠ 工具步驟沒有呼叫 id",
+                                f"第 {idx} 步：照工具名與參數配到模型回應裡同樣沒有 id 的那一次呼叫"))
+                else:
+                    # 模型回應裡沒有這一次呼叫（或同一個 id 的呼叫都已經配過結果）：用工具步驟自己帶的那一份補，
+                    # 結果才不會變成沒有呼叫的孤兒、也不會配給別次呼叫。
+                    if raw:
+                        tid = call_id(raw)
+                        if n_seen[raw] > 1:
+                            odd.append((dup_id, "⚠ 工具呼叫 id 重複",
+                                        f"第 {idx} 步：呼叫 id {raw} 的結果比呼叫多（用這一步自己帶的呼叫補一個）"))
+                    else:
+                        tid = alloc(f"{conv_id}:@{idx}")
+                        odd.append((no_id, "⚠ 工具步驟沒有呼叫 id",
+                                    f"第 {idx} 步：模型回應裡沒有對得上的呼叫，用這一步自己帶的那一份補"))
+                    ev("assistant", idx, dt, {"role": "assistant", "id": f"ag-{conv_id}-{idx}-call", "model": last_model,
+                                              "content": [tool_use(tid, name, args)]}, suffix="-call")
+                if n_media:
+                    # 結果附的圖片／檔案：同使用者輸入，只畫佔位（範圍限制 SCOPE-AG-USER-MEDIA-PLACEHOLDER）
+                    warn["工具結果附的圖片／檔案只畫了佔位"] += n_media
+                # 紀錄停在還沒跑完的：沒有結果（頁面畫「無結果／已中斷」）
+                if status not in AG_STATUS_UNFINISHED:
+                    if status == AG_STATUS_DONE:
+                        content, is_err = text, False
+                    elif status == AG_STATUS_CANCELED:
+                        content, is_err = text or "（沒有執行：被取消，或權限沒有核准）", True
+                    elif status == AG_STATUS_INTERRUPTED:
+                        content, is_err = text or "（被打斷）", True
+                    elif status == AG_STATUS_INVALID:
+                        content, is_err = text or err_text or "（無效的呼叫）", True
+                    elif status == AG_STATUS_ERROR:
+                        content, is_err = text or err_text or "（工具出錯，紀錄裡沒有錯誤內容）", True
+                    else:
+                        content, is_err = text or err_text or f"（狀態 {status}）", status != 5
+                    if n_media:
+                        content = ([{"type": "text", "text": content}] if content else []) \
+                            + [{"type": "image", "source": {}}] * n_media
+                    ev("user", idx, dt, {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": tid, "content": content, "is_error": is_err}]})
+            elif stype == AG_STEP_SYSTEM:
+                sm = _pb_msg(step, 114)
+                et = _pb_str(sm, 3)                              # event_type
+                am = _pb_msg(sm, 4)                              # agent_message
+                title = _pb_str(_pb_msg(sm, 2), 1)               # render_info 的標題（實測）
+                body = _pb_str(am, 4) or _pb_str(sm, 1)
+                src = _pb_msg(_pb_msg(am, 12), 1)
+                if (n == 0 and et == "agent_message" and _pb_str(_pb_msg(src, 3), 2) == "invoke_subagent"
+                        and _pb_str(src, 1) not in ("", conv_id) and body.strip()):
+                    # 子代理的第一步：父代理交代的任務。畫成這個子代理收到的第一則發言（同 Claude 的 Task 提示詞）。
+                    ev("user", idx, dt, {"role": "user", "content": body})
+                else:
+                    label = {"task_notification": "背景任務", "agent_message": "代理之間的訊息"}.get(et, "系統訊息")
+                    ev("user", idx, dt, {"role": "user", "content": body}, isMeta=True,
+                       _special=_ag_notify(label, title, body))
+            elif stype == AG_STEP_ERROR:
+                # 錯誤是系統記下的事件，不是一次模型呼叫：畫成摺疊列（標題一行、完整錯誤收在摺疊裡——
+                # `full_error` 常帶整段 stack trace），不另立一個沒有用量的 AI 發言（那會讓花費變成「+?」）。
+                det = _pb_msg(_pb_msg(step, 24), 3)              # error_message.error（CortexErrorDetails）
+                head = _pb_str(det, 1) or _pb_str(det, 2)        # user_error_message／short_error
+                full = _pb_str(det, 3)                           # full_error
+                ev("user", idx, dt, {"role": "user", "content": head or full}, isMeta=True,
+                   _special=_ag_notify("⚠ 錯誤", first_line(head or full or "（紀錄裡沒有內容）", 160),
+                                       full or head))
+            elif stype == AG_STEP_CHECKPOINT:
+                cp = _pb_msg(step, 30)                           # Step.checkpoint（CortexStepCheckpoint）
+                summ = _pb_str(cp, 5)                            # session_summary
+                # render_user_message_step_index：觸發它的那一則使用者輸入（`/compact`）。有它＝手動；
+                # 沒有它的（自動壓縮）沒有樣本可對，不標手動或自動。
+                # 範圍限制 SCOPE-AG-CHECKPOINT-USAGE：摘要那一次模型呼叫的用量記在 `metadata.retry_infos`，
+                # CLI 自己報的總數不算它，這裡也不算。
+                meta_c = {"trigger": "manual"} if 25 in cp else {}
+                ev("user", idx, dt, {"role": "user", "content": summ if summ.strip() else "（沒有摘要內容）"},
+                   isCompactSummary=True, _compact_meta=meta_c)
+            else:
+                warn[f"認不得的步驟型別 {stype}"] += 1
+                ev("user", idx, dt, {"role": "user", "content": ""}, isMeta=True,
+                   _special=_ag_notify("⚠ 認不得的步驟", f"型別 {stype}・狀態 {status}",
+                                       f"第 {idx} 步：本工具不認得這種步驟（CortexStepType {stype}），內容沒有畫出來"))
+        except ValueError:
+            warn["步驟裡的欄位形狀不對（欄位可能改了），沒有畫出來"] += 1
+            ev("user", idx, dt, {"role": "user", "content": ""}, isMeta=True,
+               _special=_ag_notify("⚠ 拆不開的步驟", f"第 {idx} 步（型別 {stype}）", ""))
+        for what, label, summary in odd:
+            note(idx, dt, what, label, summary)
+    return evs
+
+
+def load_antigravity_session(path, account="default", info=None, desc=()):
+    """一場 Antigravity 對話 → Session。`info`／`desc` 是 `antigravity_tree` 給的這一場與它的子孫子代理；
+    沒給就自己讀這一場（不併子代理）。"""
+    path = Path(path)
+    if info is None:
+        info = antigravity_conv_info(path)
+        info["title"] = ""
+    s = Session(path, "antigravity", SOURCE_ANTIGRAVITY)
+    s.account = account
+    s.session_id = antigravity_session_id(info)
+    if antigravity_is_copy(info):
+        s.sync_note = f"副本 {path.name}"
+    s.cwd, s.branch = info.get("cwd", ""), info.get("branch", "")
+    s.ai_title = info.get("title", "")
+    warn = collections.Counter()
+    ids = {info["id"]: {}}       # 對話 id → {原始呼叫 id: 內部 id}（`_ag_events` 填）
+    try:
+        s.events = _ag_events(path, info["id"], "", warn, ids[info["id"]])
+    except Exception as e:
+        if not desc:
+            raise
+        # 併進這一頁的子代理跟著這一場算壞掉（SCOPE-AG-BROKEN-PARENT-LATE）：stderr 那一行要講出來
+        raise RuntimeError(f"{type(e).__name__}: {e}（併在這一頁的 {len(desc)} 個子代理也沒有畫出來）") from e
+    for d in desc:
+        # 子代理：併進這一頁，接在觸發它的那一次呼叫底下（`_parent_tool_use`；對不到的畫在頁尾）。
+        # 那一次呼叫的內部 id 查父對話那一場的 `ids`（`desc` 是先父後子的順序，父對話一定先讀過）。
+        # `_srcf` 用子代理的對話 id：同一場的事件來自好幾個檔，錨點撞號時的排序鍵要分得出來源檔。
+        call = ids.get(d["parent"], {}).get(d["call"]) if d.get("call") else None
+        try:
+            sub = _ag_events(d["path"], d["id"], d["id"], warn, ids.setdefault(d["id"], {}))
+        except Exception as e:
+            print(f"  ! {path.name}: 子代理 {Path(d['path']).name} 讀不起來（{type(e).__name__}: {e}），"
+                  f"這一頁不含它的內容", file=sys.stderr)
+            # 頁面上也標：標在觸發它的那一次呼叫旁邊（對不到就標在最後）
+            for at in s.events:
+                if at.get("type") == "assistant" and call and any(
+                        isinstance(b, dict) and b.get("id") == call for b in (at.get("message") or {}).get("content") or []):
+                    break
+            else:
+                at = max(s.events, key=ts_key, default={})
+            s.events.append({"type": "user", "uuid": f"ag-{info['id']}-sub-{d['id']}", "_dt": at.get("_dt"),
+                             "timestamp": at.get("timestamp"), "_i": at.get("_i", 0), "sessionId": info["id"],
+                             "message": {"role": "user", "content": ""}, "isMeta": True,
+                             "_special": _ag_notify("⚠ 子代理讀不起來", Path(d["path"]).name,
+                                                    f"{type(e).__name__}: {e}——這一頁不含它的內容")})
+            continue
+        for e in sub:
+            e["isSidechain"] = True
+            e["_parent_tool_use"] = call
+            e["_agent_type"] = d.get("agent") or ""
+            e["_agent_desc"] = d.get("agent_name") or ""
+        s.events.extend(sub)
+    for what, k in sorted(warn.items()):
+        print(f"  ! {path.name}: {k} 次：{what}", file=sys.stderr)
+    dts = [e["_dt"] for e in s.events if e.get("_dt")]
+    if dts:
+        s.start, s.end = min(dts), max(dts)
+    if s.cwd:
+        s.proj_display = path_leaf_name(s.cwd, "antigravity")
+    s.title = s.ai_title or first_user_text(s.events, SOURCE_ANTIGRAVITY) or f"(無對話) {s.session_id[:8]}"
+    return s
+
+
 # /rename 會寫成 system/local_command 事件；名稱在 stdout 或指令 args 裡，取最後一次
 _RENAME_OUT_RE = re.compile(r'Session renamed to:\s*"?(.+?)"?\s*(?:</local-command-stdout>|$)')
 _RENAME_ARG_RE = re.compile(
@@ -2070,16 +2863,19 @@ def extract_rename(events):
     return name
 
 
-def first_user_text(events):
+def first_user_text(events, src=""):
+    """第一則使用者發言（當標題）。`src`：這些事件的來源（見 `user_special_blocks`）。"""
     for e in sorted(events, key=lambda x: (x.get("_dt") or AWARE_MAX, x.get("_i", 0))):
-        if e.get("type") != "user" or e.get("isSidechain") or is_noise_user(e):
+        if e.get("type") != "user" or e.get("isSidechain") or is_noise_user(e, src):
             continue
         # ⚠ 指令列與背景任務通知**畫得出來，但不可以當標題**：那不是使用者在講的事。
         # 通知尤其危險——它是系統注入的，內文是 task-id 與檔案路徑，會變成一個看不懂的標題。
-        if user_special_blocks(e):
+        if user_special_blocks(e, src):
             continue
-        txt = clean_user_text(extract_user_text(e))
-        txt = re.sub(r"<[^>]+>", "", txt)                # 去掉殘餘標籤
+        txt = extract_user_text(e)
+        if src != SOURCE_ANTIGRAVITY:                    # Antigravity 的原文沒有包裝：標籤也是使用者打的字
+            txt = clean_user_text(txt)
+            txt = re.sub(r"<[^>]+>", "", txt)            # 去掉殘餘標籤
         txt = re.sub(r"\s+", " ", txt).strip()
         if txt:
             return txt[:90]
@@ -2285,14 +3081,20 @@ def _clean_cmd_out(t):
     return "" if t == _CMD_NO_OUTPUT else t
 
 
-def user_special_blocks(ev):
+def user_special_blocks(ev, src=""):
     """該 user 事件裡「不是對話、但確實發生過」的區塊：通知列或指令列。
 
     ⚠ **通知先判**：通知整則就是通知，不可能同時是指令。
     ⚠ 指令**不要求整則清乾淨後是空的**——實測語料裡 1170 則全是「只有包裝」，
       但斜線指令帶著注入內容（`/<skill>` 那種）在結構上就會是「包裝＋真文字」，
       那時兩個區塊都要有。以「有沒有那個標籤」為準，不以「剩下還有沒有字」為準。
+    ⚠ `src` 是 Antigravity（`SOURCE_ANTIGRAVITY`）時只認載入器已經認出來的（`_special`：系統訊息、背景任務完成），
+      不從文字猜：那邊的使用者原文沒有 CLI 注入的包裝這回事，使用者自己打的 `<command-name>…` 就是使用者說的話。
+      其他來源不看 `_special`（那是 Antigravity 載入器的欄位，不是它們紀錄裡的東西）。
     """
+    if src == SOURCE_ANTIGRAVITY:
+        sp = ev.get("_special")
+        return [dict(sp)] if isinstance(sp, dict) else []
     txt = extract_user_text(ev)
     if not (txt or "").strip():
         return []
@@ -2315,17 +3117,20 @@ def user_special_blocks(ev):
     return [c] if c else []
 
 
-def is_noise_user(ev):
+def is_noise_user(ev, src=""):
     """整則只剩指令 / 系統提醒包裝（清乾淨後沒內容）→ 視為雜訊，不呈現。
 
     ⚠ **這一支的語意刻意沒變**：它現在的唯一用途是「這一則能不能當 session 標題」
     （`first_user_text`）。呈現與否改由 `group_turns` 先問 `user_special_blocks()`
     決定——把兩件事綁在同一個判準上，就無法「畫出來但不拿來當標題」。
+    ⚠ Antigravity（`src`）的使用者原文沒有包裝這回事：不剝、不因此判成雜訊（見 `user_special_blocks`）。
     """
     if ev.get("type") != "user":
         return False
     if ev.get("isMeta"):
         return True
+    if src == SOURCE_ANTIGRAVITY:
+        return False
     txt = extract_user_text(ev)
     return bool(txt.strip()) and clean_user_text(txt) == ""
 
@@ -2396,11 +3201,11 @@ def _has_unknown_content_block(s) -> bool:
     return False
 
 
-def block_is_renderable(b, role):
+def block_is_renderable(b, role, src=""):
     t = b.get("type")
     if t == "text":
         text = str(b.get("text") or "")
-        return bool(clean_user_text(text) if role == "user" else text.strip())
+        return bool(clean_user_text(text) if (role == "user" and src != SOURCE_ANTIGRAVITY) else text.strip())
     if t == "thinking":
         return bool(str(b.get("thinking") or b.get("text") or "").strip())
     if t in ("redacted_thinking", "tool_use", "image"):
@@ -2807,8 +3612,9 @@ def synth_local_command_events(events):
     return out
 
 
-def group_turns(events, per_step=True, step_by_usage=False):
-    """events 須為已排序、去重的訊息事件。
+def group_turns(events, per_step=True, step_by_usage=False, src=""):
+    """events 須為已排序、去重的訊息事件。`src`：這些事件的來源（Antigravity 的使用者原文不剝包裝，見
+    `user_special_blocks`）；Antigravity 的回合帶 `ag=True`，呈現端照它決定同一件事。
     新版把 assistant 的 thinking/text/tool_use 拆成多筆事件，這裡併回單一回合；
     純 tool_result 的 user 事件不另起回合（其輸出已附在對應的 tool_use 內）。
 
@@ -2823,7 +3629,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
         role = e.get("type")
         content = (e.get("message") or {}).get("content")
         if isinstance(content, list):
-            blocks = [b for b in content if isinstance(b, dict) and block_is_renderable(b, role)]
+            blocks = [b for b in content if isinstance(b, dict) and block_is_renderable(b, role, src)]
         elif isinstance(content, str) and content.strip():
             blocks = [{"type": "text", "text": content}]
         else:
@@ -2831,7 +3637,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
         if role == "user":
             # 指令列／通知列：**在雜訊判定之前**。這些會被 `is_noise_user()` 整則吃掉
             # （全語料 1170 則指令包裝＋872 則通知），而它們確實發生過。
-            special = user_special_blocks(e)
+            special = user_special_blocks(e, src)
             if special:
                 # ⚠ 每個特殊區塊帶自己的時刻：掛進回合內部之後，`group["dt"]` 是**整輪的**
                 # 起始時刻，區塊自己的時刻就再也回不來了（探針要靠它分辨兩種存法的同名指令）。
@@ -2936,7 +3742,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
                 # ⇒ 這是「同一條規則寫兩次就會分岔」的**部分複製**版本：前半看起來完全
                 #   正確，所以比整段抄錯更難發現。**要問的不是「條件對不對」，
                 #   是「為什麼不直接叫那支函式」。**
-                _was_noise = is_noise_user(e)
+                _was_noise = is_noise_user(e, src)
                 if (_was_noise and not rest
                         and cur is not None and cur["role"] == "assistant"):
                     cur["blocks"].extend(dict(b, inline=True) for b in special)
@@ -2961,7 +3767,7 @@ def group_turns(events, per_step=True, step_by_usage=False):
                               "compact": bool(e.get("isCompactSummary")),
                               "compact_meta": e.get("_compact_meta") or {}})
                 continue
-            if is_noise_user(e):
+            if is_noise_user(e, src):
                 continue
             # ⚠⚠ **中途插話不切輪。** 助手還在跑工具時打的字，全語料實測 **125/127（98.4%）
             # 是在同一輪之內送達的**（前後兩個 assistant 事件之間沒有 `turn_duration`）。
@@ -3080,6 +3886,9 @@ def group_turns(events, per_step=True, step_by_usage=False):
                 cur["_turn_done"] = True
     if cur:
         turns.append(cur)
+    if src == SOURCE_ANTIGRAVITY:
+        for t in turns:
+            t["ag"] = True
     return turns
 
 
@@ -3203,7 +4012,7 @@ def analyze(s, acct_switches=None):
     main = dedup(sorted([e for e in msg if not e.get("isSidechain")], key=ts_key))
     side = dedup(sorted([e for e in msg if e.get("isSidechain")], key=ts_key))
     codex = s.source_kind == SOURCE_CODEX      # 逐步切法依來源而異（見 group_turns 說明）
-    s.main_groups = group_turns(main, per_step=not codex, step_by_usage=codex)
+    s.main_groups = group_turns(main, per_step=not codex, step_by_usage=codex, src=s.source_kind)
     # 子代理依「父 Task tool_use id」分組，之後就地接在該 Task 底下（無法對應者退回頁尾）
     by_parent = {}
     for e in side:
@@ -3211,7 +4020,7 @@ def analyze(s, acct_switches=None):
     s.subagent_map = {}        # tool_use_id -> [turn groups]
     s.subagent_meta = {}       # tool_use_id -> {"type":..., "desc":...}
     for tid, evs in by_parent.items():
-        groups = group_turns(evs, per_step=not codex, step_by_usage=codex)
+        groups = group_turns(evs, per_step=not codex, step_by_usage=codex, src=s.source_kind)
         if groups:
             s.subagent_map[tid] = groups
             s.subagent_meta[tid] = {"type": evs[0].get("_agent_type", ""),
@@ -3306,8 +4115,8 @@ def analyze(s, acct_switches=None):
                 b["tms"] = call_ep_ms[b["mid"]]
     # 逐步冷啟成因：掛到「Claude 主對話」各步驟徽章（依 epoch join），供 _cold_display／turn_cold_class
     # 決定紅標（真失效）或中性灰（結構性）。只有 Claude 主對話會被標：每個 _step 都設成成因字串或 ""
-    #（＝已分析、非失效成因），故其 cause 永不為 None；Codex 與子代理不跑分析、cause 維持 None＝原本紅標。
-    if s.source_kind != SOURCE_CODEX:
+    #（＝已分析、非失效成因），故其 cause 永不為 None；Codex、Antigravity 與子代理不跑分析、cause 維持 None＝原本紅標。
+    if s.source_kind == SOURCE_CLAUDE:
         masked = {}
         causes = (classify_cache_causes(s.cache_steps, s.cache_models, s.cache_events, masked)
                   if s.cache_steps else {})
@@ -3428,7 +4237,7 @@ def analyze(s, acct_switches=None):
     s.ttl_hidden = ttl_hidden
     s.ttl_unknown_steps = ttl_unknown_steps
     s.ttl_unknown_hidden = ttl_unknown_hidden
-    first_txt = first_user_text(s.events)
+    first_txt = first_user_text(s.events, s.source_kind)
     s.kind = ("review" if REVIEW_RE.search(first_txt)
               else "exec" if s.exec_origin else "chat")
     s.codex_steps = collect_codex_steps(s)
@@ -3765,8 +4574,9 @@ def collect_cache_steps(s, acct_switches=None):
     存原始 cache_read（非預先四捨五入的命中率），冷啟判定才能精確、不會在門檻邊界因進位而誤分類。
     只取主對話：子代理有獨立的快取前綴，混進來會污染間隔判讀。
     Codex 略過：非因序列問題（usage 已按呼叫掛在步驟起點），而是本報告的 TTL 細分、計價與成因模型
-    是 Anthropic 專屬——OpenAI 自動快取無 cache_creation/TTL 資料可對應。"""
-    if s.source_kind == SOURCE_CODEX:
+    是 Anthropic 專屬——OpenAI 自動快取無 cache_creation/TTL 資料可對應。
+    Antigravity 也略過：它的紀錄沒有快取寫入量與 TTL（模型也不只 Claude），同一套成因模型對不上。"""
+    if s.source_kind != SOURCE_CLAUDE:
         return [], [], [], []
     steps, seen = [], set()
     step_mids = []                 # 與 steps 等長：每一步的 message.id（無則 None），供成因 join
@@ -4174,8 +4984,25 @@ def normalize_result(content):
 # =========================================================================
 # 工具呼叫呈現
 # =========================================================================
-def tool_summary(name, inp):
+def tool_summary(name, inp, ag=False):
+    """工具那一行的摘要：工具名＋最能說明這一次呼叫的那個參數。`ag`：Antigravity 的工具（名字與參數名照它自己的）
+    只對 Antigravity 的呼叫查——別的來源剛好有同名的工具（例：MCP 伺服器提供的 `read_file`）時照舊只畫名字。"""
     g = (lambda k: inp.get(k)) if isinstance(inp, dict) else (lambda k: None)
+    if ag:
+        table = {
+            "run_command": lambda: first_line(g("CommandLine")),
+            "view_file": lambda: g("AbsolutePath"),
+            "read_file": lambda: g("Path"),
+            "write_to_file": lambda: g("TargetFile"),
+            "write_file": lambda: g("Path"),
+            "replace_file_content": lambda: g("TargetFile"),
+            "edit_file": lambda: g("Path"),
+            "search_web": lambda: g("query"),
+            "read_url_content": lambda: g("Url"),
+            "invoke_subagent": lambda: f'{g("TypeName") or ""} {first_line(g("Role") or "")}'.strip(),
+        }
+        extra = table.get(name, lambda: "")()
+        return f"{name} · {extra}" if extra else name
     table = {
         "Bash": lambda: first_line(g("command")),
         "Edit": lambda: g("file_path"),
@@ -4488,13 +5315,13 @@ def render_ask_html(view, raw_box):
     return f'<div class="ask">{"".join(parts)}{raw_box}</div>'
 
 
-def render_tool_html(block, tmap, used_ids):
+def render_tool_html(block, tmap, used_ids, ag=False):
     name = block.get("name", "tool")
     inp = block.get("input", {})
     tid = block.get("id")
     if tid:
         used_ids.add(tid)
-    summary = tool_summary(name, inp)
+    summary = tool_summary(name, inp, ag)
 
     if name in ("Edit", "MultiEdit") and isinstance(inp, dict):
         edits, bad = inp.get("edits"), None
@@ -4612,11 +5439,13 @@ def turn_cold_class(group):
     return "cold" if (genuine or unclassified) else "coldx"
 
 
-def _breakdown_meters(inp, cw, cr):
+def _breakdown_meters(inp, cw, cr, ag=False):
     """可勾選的 token 細分徽章（預設隱藏，見 meterbar）：新輸入 / 快取寫入 / 快取讀取。
-    整段彙總與逐步分隔列共用，讓「只有一個下載量」攤成四種 token 的來源。"""
+    整段彙總與逐步分隔列共用，讓「只有一個下載量」攤成四種 token 的來源。
+    `ag`：Antigravity 的紀錄沒有快取寫入量——那一格不是 0、是不知道，不畫（同花費組成表，見 `cost_mix_rows`）。"""
+    cw_html = "" if ag else f'<span class="meter m-cw" title="快取寫入 tokens（建立快取）">寫入 {fmt_tokens(cw)}</span>'
     return (f'<span class="meter m-in" title="全新輸入 tokens（未快取）">新輸入 {fmt_tokens(inp)}</span>'
-            f'<span class="meter m-cw" title="快取寫入 tokens（建立快取）">寫入 {fmt_tokens(cw)}</span>'
+            + cw_html +
             f'<span class="meter m-cr" title="快取讀取 tokens（命中量）">讀取 {fmt_tokens(cr)}</span>')
 
 
@@ -4751,8 +5580,10 @@ def cost_mix_rows(s):
     tot = sum(mix.get(k, 0.0) for k in COST_PARTS)
     if tot <= 0:
         return []
+    # Antigravity 的紀錄沒有快取寫入量：那幾列不是 0、是不知道 ⇒ 不列（說明在表頭的 `AG_COST_NOTE`）
+    no_write = getattr(s, "source_kind", "") == SOURCE_ANTIGRAVITY
     return [(COST_PART_LABELS[k], mix.get(k, 0.0), mix.get(k, 0.0) / tot) for k in COST_PARTS
-            if k != "wx" or mix.get(k, 0.0) > 0]
+            if (k != "wx" or mix.get(k, 0.0) > 0) and not (no_write and k in ("w5", "w1h", "wx"))]
 
 
 def _cost_mix_html(s):
@@ -4908,7 +5739,7 @@ def render_turn_meters(group):
     cost = cost_label(u["cost"], u["unpriced"])
     out = (f'<span class="meter m-cache{cold}" title="{esc_attr(ctitle)}">⚡{pct}%{esc(ctag)}</span>'
            f'<span class="meter m-cost" title="估算花費">~{esc(cost)}</span>'
-           + _breakdown_meters(u["input"], u["cache_create"], u["cache_read"])
+           + _breakdown_meters(u["input"], u["cache_create"], u["cache_read"], ag=bool(group.get("ag")))
            + _ctx_meter(u["ctx_max"], _group_window(group)) +
            f'<span class="meter m-out" title="產出 tokens">↑{fmt_tokens(u["output"])}</span>')
     if group.get("dur_ms"):
@@ -5048,7 +5879,7 @@ def turn_block_anchors(group):
             out.append("")
             continue
         # ⚠ 壓縮點那種回合 `render_turn_html` 提前 return，一個 `.blk` 都不產
-        if group.get("compact") or not block_is_renderable(b, role):
+        if group.get("compact") or not block_is_renderable(b, role, SOURCE_ANTIGRAVITY if group.get("ag") else ""):
             out.append("")
             continue
         bn += 1
@@ -5084,7 +5915,7 @@ def wrap_block(inner, anchor):
             f'</span>{inner}</div>')
 
 
-def render_step_meters(idx, u, cause=None, gap=None, t=None, masked=None, anchor=""):
+def render_step_meters(idx, u, cause=None, gap=None, t=None, masked=None, anchor="", ag=False):
     """回合內單一步驟（API 呼叫）的分隔列：步驟序號＋該步的快取% / (可勾)細分 / ctx / 產出，
     另加 API 自報的失效成因（有才出現）與可勾選的「距上一步 / effort」。
     沿用 m-cache/m-in/m-cw/m-cr/m-ctx/m-out class，與整段彙總共用同一組勾選開關（cost 不在步驟層顯示）。
@@ -5131,7 +5962,7 @@ def render_step_meters(idx, u, cause=None, gap=None, t=None, masked=None, anchor
             + _miss_meter(u.get("miss"), u.get("miss_tok", 0), u.get("miss_usd"),
                           partial=(bool(u["total_in"]) and not cold_now),
                           unpriced=bool(u.get("miss_usd_partial")))
-            + _breakdown_meters(u.get("input", 0), u.get("cache_create", 0), u["cache_read"])
+            + _breakdown_meters(u.get("input", 0), u.get("cache_create", 0), u["cache_read"], ag=ag)
             + _ctx_meter(u["total_in"], u.get("win"))
             + f'<span class="meter m-out" title="此步驟產出 tokens">↑{fmt_tokens(u["output"])}</span>'
             + _extra_meters(u, gap) + "</div>")
@@ -5145,14 +5976,18 @@ def subagent_summary_label(meta):
     return f"{head} · {esc(desc)}" if desc else head
 
 
-def subagent_anchor(tid):
-    """子代理摺疊框的頁內錨點 id；孤兒（無對應 Task）統一指向頁尾總區。"""
+def subagent_anchor(tid, ag=False):
+    """子代理摺疊框的頁內錨點 id；孤兒（無對應 Task）統一指向頁尾總區。
+    `ag`（Antigravity 的那一頁）：清洗之後另接完整 id 的雜湊——內部 id 是「對話 id:呼叫 id」加 `#n`，一定會被清洗，
+    兩個不同的呼叫 id（`x.y`、`x-y`）清成同一個就撞號。
+    範圍限制 SCOPE-SUBAGENT-ANCHOR-SANITIZE：其他來源照舊只清洗（真實的 id 只有清洗留下的那幾種字）。"""
     if not tid:
         return "sub-orphans"
-    return "sub-" + re.sub(r"[^A-Za-z0-9_-]", "-", tid)
+    base = "sub-" + re.sub(r"[^A-Za-z0-9_-]", "-", tid)
+    return f"{base}-{hashlib.sha256(tid.encode('utf-8')).hexdigest()[:10]}" if ag else base
 
 
-def render_subagent_block(tid, smap, smeta, tmap, used_ids, rendered, ai="Claude"):
+def render_subagent_block(tid, smap, smeta, tmap, used_ids, rendered, ai="Claude", ag=False):
     """把某個 Task 派出的子代理對話，算繪成就地的摺疊區（可遞迴處理巢狀子代理）。"""
     if not tid or tid in rendered or tid not in smap:
         return ""
@@ -5161,7 +5996,7 @@ def render_subagent_block(tid, smap, smeta, tmap, used_ids, rendered, ai="Claude
     inner = [x for x in inner if x]
     if not inner:
         return ""
-    return (f'<details id="{subagent_anchor(tid)}" class="sidechain-wrap"><summary>↳ '
+    return (f'<details id="{subagent_anchor(tid, ag)}" class="sidechain-wrap"><summary>↳ '
             + subagent_summary_label(smeta.get(tid))
             + f' · {len(inner)} 則</summary><div class="tbody">' + "".join(inner) + "</div></details>")
 
@@ -5218,7 +6053,7 @@ def render_command_html(b):
     return f'<div class="cmdrow">{head}{body}</div>'
 
 
-def render_notify_html(b):
+def render_notify_html(b, ag=False):
     """背景任務通知：收成一列摘要，原文收進摺疊。
 
     ⚠ 摘要取 `<summary>`；Monitor 型沒有 `<status>`、內容在 `<event>`。
@@ -5237,7 +6072,9 @@ def render_notify_html(b):
     event = b.get("event") or ""
     raw = b.get("raw") or ""
     lead = summ or (event.splitlines()[0] if event.strip() else "")
-    bits = ["背景任務"]
+    # `label`：Antigravity 載入器指定的類別（系統訊息、錯誤…）；只在 Antigravity 的回合採用——別的來源的區塊
+    # 從 JSON 帶進同名欄位也不認
+    bits = [(b.get("label") if ag else None) or "背景任務"]
     if status:
         bits.append(_NOTIFY_STATUS_LABEL.get(status, status))
     head = " · ".join(bits) + (f" · {lead}" if lead else "")
@@ -5323,7 +6160,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
                 parts.append(render_step_meters(
                     b.get("idx", 0), b.get("u"), b.get("cause"), b.get("gap"), b.get("t"),
                     b.get("cause_masked"),
-                    anchor=step_anchor(kanc, step_ep)))
+                    anchor=step_anchor(kanc, step_ep), ag=bool(group.get("ag"))))
             continue
         # ⚠ 一律先算出 `html` 再統一包裝：每個分支自己 `parts.append` 的話，「這一塊算不算
         # 一個可標記區塊」會散在五個地方，序號遲早對不上。空字串＝不渲染＝不佔序號。
@@ -5331,7 +6168,7 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         extra = ""          # 只有 tool_use 用得到：子代理區塊是它的**兄弟**，不進包裝
         if t == "text":
             raw = b.get("text") or ""
-            txt = clean_user_text(raw) if role == "user" else str(raw)
+            txt = clean_user_text(raw) if (role == "user" and not group.get("ag")) else str(raw)
             if txt.strip():
                 html = md_to_html(txt)
         elif t == "thinking":
@@ -5342,20 +6179,21 @@ def render_turn_html(group, tmap, used_ids, subagent_map=None, subagent_meta=Non
         elif t == "redacted_thinking":
             html = '<div class="think-redacted">💭 思考（已隱藏）</div>'
         elif t == "tool_use":
-            html = render_tool_html(b, tmap, used_ids)
+            html = render_tool_html(b, tmap, used_ids, ag=bool(group.get("ag")))
             if subagent_map:
                 # ⚠ **不包進 `.blk`**：子代理區塊裡面是一整批完整的回合，每一輪各自帶
                 # `k…` 錨點。包進去會讓外層那個區塊 id 涵蓋幾十輪，`bkSummary()` 抓到的
                 # 就變成整批子代理對話的前 120 字。
                 extra = render_subagent_block(b.get("id"), subagent_map, subagent_meta or {},
                                               tmap, used_ids,
-                                              rendered_sub if rendered_sub is not None else set(), ai)
+                                              rendered_sub if rendered_sub is not None else set(), ai,
+                                              ag=bool(group.get("ag")))
         elif t == "image":
             html = render_image_block(b)
         elif t == "_command":
             html = render_command_html(b)
         elif t == "_notify":
-            html = render_notify_html(b)
+            html = render_notify_html(b, ag=bool(group.get("ag")))
         elif t == "_interject":
             # 插話本身的子框；「插話之後」那一段的縮排由下面的 `ij_open` 控制
             html = render_interject_html(b)
@@ -7226,7 +8064,8 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
     if smap:
         items = []
         for tid in smap:
-            anchor = subagent_anchor(tid) if tid in inline_tids else "sub-orphans"
+            anchor = (subagent_anchor(tid, s.source_kind == SOURCE_ANTIGRAVITY) if tid in inline_tids
+                      else "sub-orphans")
             label = subagent_summary_label(smeta.get(tid))
             items.append(f'<li><a href="#{anchor}" onclick="return openSub(\'{anchor}\')">↳ {label}</a></li>')
         sub_toc = (f'<details class="sub-toc" open><summary>🧩 子代理 ({s.n_subagents})</summary>'
@@ -7254,7 +8093,9 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
         cost = cost_label(s.cost, s.cost_partial)
         peak_win = getattr(s, "ctx_peak_win", None)     # 峰值那一步自己的模型視窗（見 _collect_usage）
         peak_pct = f"（{round(100 * s.ctx_peak / peak_win)}% / {fmt_tokens(peak_win)}）" if peak_win and s.ctx_peak else ""
-        usage += (f" · 💲~{cost} · ⚡快取 {s.cache_pct}%"
+        ag_note = (f'<span class="note" title="{esc_attr(AG_COST_NOTE)}">（不含快取寫入）</span>'
+                   if s.source_kind == SOURCE_ANTIGRAVITY else "")
+        usage += (f" · 💲~{cost}{ag_note} · ⚡快取 {s.cache_pct}%"
                   f" · 脈絡峰值 {fmt_tokens(s.ctx_peak)}{peak_pct} · 產出 {fmt_tokens(s.tok_out)}")
     usage += _ttl_summary_html(s)
     usage += _miss_summary_html(s)
@@ -7295,7 +8136,7 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
                       + "bookmarks.html")
     sub = (f'<div class="smeta">自動標題：{esc(s.ai_title)}</div>'
            if (s.rename and s.ai_title and s.ai_title != s.title) else "")
-    sync_chip = (f' · <span class="chip" title="{esc_attr(SYNC_COPY_TITLE)}">{esc(s.sync_note)}</span>'
+    sync_chip = (f' · <span class="chip" title="{esc_attr(copy_chip_title(s.source_kind))}">{esc(s.sync_note)}</span>'
                  if getattr(s, "sync_note", "") else "")
 
     body = f"""
@@ -7541,11 +8382,19 @@ def render_ask_md(view):
     return "\n".join(("> " + ln) if ln else ">" for ln in "\n".join(out).splitlines())
 
 
-def render_tool_md(block, tmap):
+def _md_html_text(s):
+    """放進 MD 裡那段原生 HTML（`<details><summary>…</summary>`）的原文：只換掉會「破出那個元素」的兩種東西——
+    開得出標籤或註解的 `<`（後面接英文字母、`/`、`!`、`?`；heredoc 的 `<<EOF` 第二個 `<` 就是）換成 `&lt;`；
+    斷行壓成一個空格（MD 的 HTML 區塊遇到空行就結束，後面的字會被當成 Markdown 排）。
+    其餘照原樣：`&&`、`< file`、`<<'EOF'` 在那裡本來就畫得對（開不出標籤）。"""
+    return re.sub(r"<(?=[A-Za-z!/?])", "&lt;", re.sub(r"[\r\n]+", " ", str(s)))
+
+
+def render_tool_md(block, tmap, ag=False):
     name = block.get("name", "tool")
     inp = block.get("input", {})
     tid = block.get("id")
-    summary = tool_summary(name, inp)
+    summary = _md_html_text(tool_summary(name, inp, ag))
     if name == "Bash" and isinstance(inp, dict):
         inner = _md_fence(inp.get("command", ""), "bash")
     elif name in ("Edit", "MultiEdit") and isinstance(inp, dict):
@@ -7679,7 +8528,7 @@ def render_turn_md(group, tmap, ai="Claude"):
         t = b.get("type")
         if t == "text":
             raw = b.get("text") or ""
-            txt = clean_user_text(raw) if role == "user" else str(raw)
+            txt = clean_user_text(raw) if (role == "user" and not group.get("ag")) else str(raw)
             if txt.strip():
                 parts.append(txt)
         elif t == "thinking":
@@ -7687,7 +8536,7 @@ def render_turn_md(group, tmap, ai="Claude"):
             if think:
                 parts.append(f"<details><summary>💭 思考</summary>\n\n{think}\n\n</details>")
         elif t == "tool_use":
-            parts.append(render_tool_md(b, tmap))
+            parts.append(render_tool_md(b, tmap, ag=bool(group.get("ag"))))
         elif t == "image":
             parts.append("_[圖片]_")
         elif t == "_command":
@@ -7714,7 +8563,7 @@ def render_turn_md(group, tmap, ai="Claude"):
         elif t == "_notify":
             lead = b.get("summary") or ""
             st = _NOTIFY_STATUS_LABEL.get(b.get("status") or "", b.get("status") or "")
-            parts.append("_⚙ 背景任務" + (f" · {st}" if st else "")
+            parts.append("_⚙ " + ((b.get("label") if group.get("ag") else None) or "背景任務") + (f" · {st}" if st else "")
                          + (f" · {lead}" if lead else "") + "_")
             # ⚠⚠ **原文一定要進 MD**：`--search` 的全文索引讀的是這一份。
             # v55 之前通知是普通 user 回合、整坨原文**是進 MD 的** ⇒ 只寫一行摘要
@@ -7801,7 +8650,10 @@ def render_session_md(s: Session) -> str:
         (f"- {_ttl_head(s)[0]}（只計主對話）" if _ttl_head(s)[0] else None),
         (f"- {_miss_head(s)[0]}（API 自報）" if _miss_head(s)[0] else None),
         (f"- 型態：{KIND_LABELS.get(s.kind, s.kind)}" if s.kind != "chat" else None),
-        f"- Session：`{s.session_id}` · v{s.version}"
+        (f"- 估價說明：{AG_COST_NOTE}" if s.source_kind == SOURCE_ANTIGRAVITY else None),
+        # Antigravity 的紀錄裡沒有 CLI 版本：沒有就不寫那一段（其他來源照舊寫）
+        f"- Session：`{s.session_id}`"
+        + (f" · v{s.version}" if (s.version or s.source_kind != SOURCE_ANTIGRAVITY) else "")
         + (f" · {s.sync_note}" if getattr(s, "sync_note", "") else ""),
         "", "---",
     ]
@@ -7891,6 +8743,14 @@ _AI_READ = {"Read", "NotebookRead", "view_image"}
 _AI_WRITE = {"Write", "NotebookEdit"}
 _AI_EDIT = {"Edit", "MultiEdit"}
 _AI_LOOKUP = {"Grep", "Glob", "LS", "WebFetch", "WebSearch", "ToolSearch"}
+# Antigravity 的工具（名字與參數名照它自己的）：只對 Antigravity 的呼叫查（`render_tool_ai_md` 的 `ag`）——
+# 別的來源剛好有同名的工具（例：MCP 伺服器提供的 `read_file`）時照舊走一般的那一支。
+_AG_AI_READ = {"view_file", "read_file"}
+_AG_AI_WRITE = {"write_to_file", "write_file"}
+_AG_AI_EDIT = {"replace_file_content", "edit_file"}
+_AG_AI_LOOKUP = {"search_web", "read_url_content"}
+_AG_AI_EDIT_KEYS = {"replace_file_content": ("TargetContent", "ReplacementContent"), "edit_file": ("Target", "Replacement")}
+_AG_AI_WRITE_KEYS = ("CodeContent", "Content")          # 寫檔的內容在哪個欄位（只算用到的那一個）
 _AI_AGENT = {"Task", "Agent"}
 _AI_ASK = ASK_TOOLS            # 同一份名單：認不認得是提問，三種輸出不可以各自判
 _AI_PLAN = {"TodoWrite", "update_plan", "TaskCreate", "TaskUpdate"}
@@ -8022,21 +8882,28 @@ _AI_SUMMARY_KEYS = {"Bash": {"command"}, "Edit": {"file_path"}, "MultiEdit": {"f
                     "Write": {"file_path"}, "Read": {"file_path"}, "Grep": {"pattern"}, "Glob": {"pattern"},
                     "Task": {"subagent_type", "description"}, "Agent": {"subagent_type", "description"},
                     "WebFetch": {"url"}, "WebSearch": {"query"}}
+_AG_AI_SUMMARY_KEYS = {"run_command": {"CommandLine"}, "view_file": {"AbsolutePath"}, "read_file": {"Path"},
+                       "write_to_file": {"TargetFile"}, "write_file": {"Path"}, "replace_file_content": {"TargetFile"},
+                       "edit_file": {"Path"}, "search_web": {"query"}, "read_url_content": {"Url"},
+                       "invoke_subagent": {"TypeName", "Role"}}
 
 
 _AI_SUMMARY_FIRST_LINE = {"command", "description"}     # `tool_summary()` 只畫第一行、而且截到 70 字的欄位
+_AG_AI_SUMMARY_FIRST_LINE = {"CommandLine", "Role"}
 
 
-def _ai_summary_keys(name, inp):
+def _ai_summary_keys(name, inp, ag=False):
     """`tool_summary()` 那一行**原樣**畫出了哪些輸入欄位（兩邊要同步：那張表多一種工具，這裡也要多一列）。
     `- 🔧` 那一行最後會把空白壓成一格（`render_tool_ai_md`）⇒ 值是字串、壓過不變才算畫了；
-    只畫第一行、會截斷的欄位（`_AI_SUMMARY_FIRST_LINE`）還要沒被截到。其餘交給 `_ai_rest_params` 標出來。"""
+    只畫第一行、會截斷的欄位（`_AI_SUMMARY_FIRST_LINE`）還要沒被截到。其餘交給 `_ai_rest_params` 標出來。
+    `ag`：Antigravity 的呼叫查它自己那兩張表（同 `tool_summary`）。"""
     if not isinstance(inp, dict):
         return set()
+    table, first = (_AG_AI_SUMMARY_KEYS, _AG_AI_SUMMARY_FIRST_LINE) if ag else (_AI_SUMMARY_KEYS, _AI_SUMMARY_FIRST_LINE)
     keys = set()
-    for k in _AI_SUMMARY_KEYS.get(name, ()):
+    for k in table.get(name, ()):
         v = inp.get(k)
-        if isinstance(v, str) and v == _ai_one_line(v) and (k not in _AI_SUMMARY_FIRST_LINE or first_line(v) == v):
+        if isinstance(v, str) and v == _ai_one_line(v) and (k not in first or first_line(v) == v):
             keys.add(k)
     return keys
 
@@ -8071,12 +8938,13 @@ def _ai_lines(text):
     return len(str(text).splitlines()) if text else 0
 
 
-def _ai_command(name, inp):
+def _ai_command(name, inp, ag=False):
     """指令類工具「跑了什麼」的原文；認不出來回 None。"""
     if isinstance(inp, str):
         return inp
     if isinstance(inp, dict):
-        c = inp.get("command", inp.get("cmd"))
+        # Antigravity 的 `run_command` 把指令放在 `CommandLine`（只認它：別的工具的同名欄位不一定是指令）
+        c = inp.get("CommandLine") if (ag and name == "run_command") else inp.get("command", inp.get("cmd"))
         if isinstance(c, list):
             return " ".join(str(x) for x in c)
         if isinstance(c, str):
@@ -8143,8 +9011,9 @@ def _ai_ask_text(view):
     return "\n".join(lines)
 
 
-def render_tool_ai_md(block, tmap):
-    """一次工具呼叫 ⇒ 恰好一行 `AI_MD_TOOL`，後面視工具種類接留下來的那一點。"""
+def render_tool_ai_md(block, tmap, ag=False):
+    """一次工具呼叫 ⇒ 恰好一行 `AI_MD_TOOL`，後面視工具種類接留下來的那一點。
+    `ag`：Antigravity 的呼叫——讀檔／寫檔／改檔／查詢這四類照它自己的工具名與參數名認（`_AG_AI_*`）。"""
     name = str(block.get("name") or "tool")
     inp = block.get("input", {})
     g = inp.get if isinstance(inp, dict) else (lambda k, d=None: d)
@@ -8158,22 +9027,29 @@ def render_tool_ai_md(block, tmap):
     shown, res_shown = None, False          # shown＝已經畫出來的輸入欄位；None＝整份輸入都畫了
     if not has_res:
         notes.append("沒有結果：中斷或未完成")
-    if name in _AI_READ:
-        shown = _ai_summary_keys(name, inp)
+    rd, wr, ed, lk = (_AG_AI_READ, _AG_AI_WRITE, _AG_AI_EDIT, _AG_AI_LOOKUP) if ag else \
+        (_AI_READ, _AI_WRITE, _AI_EDIT, _AI_LOOKUP)
+    if name in rd:
+        shown = _ai_summary_keys(name, inp, ag)
         if has_res and not is_err:
             notes.append(f"內容略（{_ai_lines(res):,} 行）")
             res_shown = True
-    elif name in _AI_WRITE:
-        wkey = "new_source" if (not g("content") and g("new_source")) else "content"     # 只算用到的那一個
-        shown = _ai_summary_keys(name, inp) | {wkey}
+    elif name in wr:
+        # 只算用到的那一個
+        if ag:
+            wkey = next((k for k in _AG_AI_WRITE_KEYS if g(k)), _AG_AI_WRITE_KEYS[0])
+        else:
+            wkey = "new_source" if (not g("content") and g("new_source")) else "content"
+        shown = _ai_summary_keys(name, inp, ag) | {wkey}
         notes.append(f"寫入 {_ai_lines(g(wkey) or ''):,} 行，內容略")
-    elif name in _AI_EDIT:
+    elif name in ed:
         edits = g("edits")
         if isinstance(edits, list) and edits:      # 有 edits 就畫它；頂層的新舊字串（若也有）交給 `_ai_rest_params`
-            shown = _ai_summary_keys(name, inp) | {"edits"}
+            shown = _ai_summary_keys(name, inp, ag) | {"edits"}
         else:
-            edits = [{"old_string": g("old_string", ""), "new_string": g("new_string", "")}]
-            shown = _ai_summary_keys(name, inp) | {"old_string", "new_string"}
+            ok, nk = _AG_AI_EDIT_KEYS[name] if ag else ("old_string", "new_string")
+            edits = [{"old_string": g(ok, ""), "new_string": g(nk, "")}]
+            shown = _ai_summary_keys(name, inp, ag) | {ok, nk}
         diff = []
         for i, ed in enumerate(edits):
             if isinstance(ed, dict):
@@ -8186,13 +9062,13 @@ def render_tool_ai_md(block, tmap):
         body.append(_ai_block("改動", "\n".join(diff), AI_MD_HEAD, False, "diff"))
     elif name == "Patch" and isinstance(inp, str):
         body.append(_ai_block("改動", inp, AI_MD_HEAD, False, "diff"))
-    elif name in _AI_LOOKUP:
-        shown = _ai_summary_keys(name, inp)
+    elif name in lk:
+        shown = _ai_summary_keys(name, inp, ag)
         if has_res and not is_err:
             notes.append(f"結果 {_ai_lines(res):,} 行，略")
             res_shown = True
     elif name in _AI_AGENT:
-        shown = _ai_summary_keys(name, inp)
+        shown = _ai_summary_keys(name, inp, ag)
         if has_res:
             rep, note = _ai_cap(res)
             # ⚠ 報告是原文，可能有沒關的 fence、像回合標頭的行：一律包進 fence，不可以直接攤在版面上
@@ -8223,9 +9099,10 @@ def render_tool_ai_md(block, tmap):
         if items:           # 原值、整份進 fence（項目可以跨行、可以帶 fence）
             body.append(_md_fence(_ai_guard("\n".join(items))))
     else:
-        cmd = _ai_command(name, inp)
+        cmd = _ai_command(name, inp, ag)
         if cmd is not None and isinstance(inp, dict):     # 只畫了用到的那一個（command 或 cmd）：其餘參數要交代
-            shown = _ai_summary_keys(name, inp) | {"command" if "command" in inp else "cmd"}
+            shown = _ai_summary_keys(name, inp, ag) | {"CommandLine" if (ag and name == "run_command")
+                                                       else "command" if "command" in inp else "cmd"}
         if cmd is None and inp not in (None, "", {}):
             try:
                 cmd = json.dumps(inp, ensure_ascii=False)
@@ -8233,7 +9110,7 @@ def render_tool_ai_md(block, tmap):
                 cmd = str(inp)
         # 一行就講完、而且那一行**原樣**出現在 `- 🔧` 那一行裡（比的是空白壓縮之後的那一行）的，不再重複
         one = cmd.strip() if cmd else ""
-        if cmd and not ("\n" not in one and one in _ai_one_line(tool_summary(name, inp))):
+        if cmd and not ("\n" not in one and one in _ai_one_line(tool_summary(name, inp, ag))):
             body.append(_ai_block("輸入", cmd, AI_MD_CMD, False))
         if has_res:
             if res.strip():
@@ -8251,7 +9128,7 @@ def render_tool_ai_md(block, tmap):
         one = res.strip()
         notes.append(f"結果：{one}" if (one == _ai_one_line(one) and len(one) <= 120)
                      else f"結果 {_ai_lines(res):,} 行，略")
-    head = tool_summary(name, inp)
+    head = tool_summary(name, inp, ag)
     if notes:
         head += " — " + "；".join(notes)
     # 這一行裡的摘要與標記都可能帶原文：空白（含換行）一律壓成一個空格，它才一定只有一行
@@ -8265,11 +9142,11 @@ def _ai_turn_blocks(group, tmap):
         t = b.get("type")
         if t == "text":
             raw = b.get("text") or ""
-            txt = clean_user_text(raw) if role == "user" else str(raw)
+            txt = clean_user_text(raw) if (role == "user" and not group.get("ag")) else str(raw)
             if txt.strip():
                 parts.append(_ai_demote_headings(txt))
         elif t == "tool_use":
-            parts.append(render_tool_ai_md(b, tmap))
+            parts.append(render_tool_ai_md(b, tmap, ag=bool(group.get("ag"))))
         elif t == "image":
             parts.append("[圖片]")
         elif t == "_command":
@@ -8289,7 +9166,8 @@ def _ai_turn_blocks(group, tmap):
         elif t == "_notify":
             st = _NOTIFY_STATUS_LABEL.get(b.get("status") or "", b.get("status") or "")
             lead = b.get("summary") or ""
-            parts.append(_ai_guard("⚙ 背景任務" + (f" · {_ai_exact_line(st)}" if st else "")
+            parts.append(_ai_guard("⚙ " + _ai_exact_line((b.get("label") if group.get("ag") else None) or "背景任務")
+                                   + (f" · {_ai_exact_line(st)}" if st else "")
                                    + (f" · {_ai_exact_line(lead)}" if lead else "")))
             _detail = _strip_ansi(b.get("raw") or b.get("event") or "")
             if _detail.strip():
@@ -8303,13 +9181,13 @@ def _ai_preview(group, n=40):
         t = b.get("type")
         s = ""
         if t == "text":
-            s = clean_user_text(b.get("text") or "")
+            s = str(b.get("text") or "") if group.get("ag") else clean_user_text(b.get("text") or "")
         elif t == "_interject":
             s = clean_user_text(b.get("text") or "")
         elif t == "_command":
             s = " ".join(x for x in (b.get("name"), b.get("args")) if x)
         elif t == "_notify":
-            s = "⚙ " + (b.get("summary") or "背景任務")
+            s = "⚙ " + (b.get("summary") or (b.get("label") if group.get("ag") else None) or "背景任務")
         s = " ".join(s.split())
         if s:
             return s if len(s) <= n else s[:n] + "…"
@@ -8348,7 +9226,7 @@ def render_session_ai_md(s: Session, full_path=None) -> str:
                 continue
             toc.append((len(body), when, "📋", "前情摘要（" + "，".join(_compact_bits(g)) + "）"))
             body.append(f"### 📋 前情摘要 · {when}\n\n"
-                        "這是先前對話被壓縮成的摘要（Claude Code 自己寫的）；這之後的對話接在它後面。\n\n"
+                        f"這是先前對話被壓縮成的摘要（{source_label(s.source_kind)} 自己寫的）；這之後的對話接在它後面。\n\n"
                         + _ai_demote_headings(summ))
             continue
         parts = _ai_turn_blocks(g, s.tmap)
@@ -8375,7 +9253,7 @@ def render_session_ai_md(s: Session, full_path=None) -> str:
         compacts = [i for i, e in enumerate(toc) if e[2] == "📋"]
         if compacts:
             h.append(f"> 要接續工作：從第 {nums[compacts[-1]]} 行（最後一則前情摘要）讀起即可；"
-                     "那正是 Claude Code 自己接續時讀進去的範圍。")
+                     f"那正是 {source_label(s.source_kind)} 自己接續時讀進去的範圍。")
         h += ["",
               f"- 專案：`{_ai_exact_line(s.proj_display)}`" + (f" · 工作目錄：`{_ai_exact_line(s.cwd)}`" if s.cwd else "")
               + (f" · 分支：`{_ai_exact_line(s.branch)}`" if s.branch else ""),
@@ -8764,7 +9642,7 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
         sub_badge = (f' <span class="chip sub" title="包含 {ns} 個子代理對話（其他 JSONL 內容）">🧩 ×{ns}</span>'
                      if ns else "")
         if sync:
-            sub_badge += f' <span class="chip" title="{esc_attr(SYNC_COPY_TITLE)}">{esc(sync)}</span>'
+            sub_badge += f' <span class="chip" title="{esc_attr(copy_chip_title(src))}">{esc(sync)}</span>'
         sub_badge += (f' <span class="chip compact" title="此 session 發生 {nc} 次壓縮（手動 /compact 或自動）">✂ ×{nc}</span>'
                       if nc else "")
         wn = r.get("waste_n") or 0
@@ -11288,13 +12166,27 @@ def out_id_part(s: "Session") -> str:
     - Claude：sessionId 是 UUIDv4，前 8 碼就是隨機位元 ⇒ 取前 8 碼（`claude_out_id`）。
     - Codex：id 是 UUIDv7，前 12 碼是毫秒時間戳 ⇒ 前 8 碼在約 65 秒內都一樣，同一分鐘開的幾場會
       組出同一個檔名、後寫的蓋掉先寫的。取**最後 8 碼**（`rand_b` 的低位，隨機）。
+    - Antigravity：對話 id 是 UUIDv4 ⇒ 前 8 碼；副本另帶一段（`antigravity_out_id`）。
       沒有 `session_meta.id` 時 sid 是 rollout 檔名（`rollout-<時間>-<uuid>`），最後 8 碼一樣是 uuid 的尾巴。
     ⚠ 只看 sid 本身：不可以因為別場存不存在而改變（例如撞到就加後綴），否則同一場的檔名
       會隨語料增減而變，既有的連結與書籤快取跟著失效。
     """
     if s.source_kind == SOURCE_CODEX:
         return safe_name(s.session_id[-8:], 8)
+    if s.source_kind == SOURCE_ANTIGRAVITY:
+        return antigravity_out_id(s.session_id)
     return claude_out_id(s.session_id)
+
+
+def antigravity_out_id(sid: str) -> str:
+    """Antigravity 那一場在輸出檔名裡的 id 段：對話 id 是 UUIDv4 ⇒ 前 8 碼就是隨機位元。副本（`antigravity_session_id`：
+    「對話 id@檔名主幹」）前 8 碼和本人相同 ⇒ 另帶整個 session id 的 SHA-256 前 32 碼（理由同 `claude_out_id`）。
+    `--ai-md` 認輸出檔名那一段時也用這一支。"""
+    sid = str(sid)
+    head = safe_name(sid[:8], 8)
+    if "@" not in sid:
+        return head
+    return head + "-" + hashlib.sha256(sid.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
 def claude_out_id(sid: str) -> str:
@@ -12217,6 +13109,15 @@ SYNC_COPY_TITLE = ("跨機同步工具另存的副本（主機、存的時間）
                    "內容可能和原檔一樣，也可能各自接著聊過")
 
 
+AG_COPY_TITLE = ("同一場 Antigravity 對話的另一個檔（檔名不是「對話 id.db」：同步工具的衝突副本、手動備份、改過名）："
+                 "和本人各自一列、各自一頁。內容可能和本人一樣，也可能各自接著聊過")
+
+
+def copy_chip_title(source_kind: str) -> str:
+    """副本那個標記（`sync_note`）的說明：Claude 的是跨機同步工具另存的，Antigravity 的是檔名不是對話 id 的那份。"""
+    return AG_COPY_TITLE if source_kind == SOURCE_ANTIGRAVITY else SYNC_COPY_TITLE
+
+
 def sync_copy_base(stem: str) -> str:
     """同步副本（`_SYNC_COPY_RE`）的原檔名，也就是原本那一場的 session id；不是同步副本就回原樣。"""
     m = _SYNC_COPY_RE.match(stem)
@@ -12459,6 +13360,25 @@ def collect_codex_sources(codex_source_args):
             items.append((None, Path(s).expanduser()))
     if not items:
         default = Path.home() / ".codex" / "sessions"
+        if default.is_dir():
+            items.append(("default", default))
+    items = _dedupe_by_realpath(items)
+    labeled = [(lab or _default_label(path), path) for lab, path in items]
+    return _dedupe_labels(labeled)
+
+
+def collect_antigravity_sources(ag_source_args):
+    """回傳 [(標籤, 對話目錄或單一 .db)]；未指定 --antigravity-source 時自動偵測
+    ~/.gemini/antigravity-cli/conversations。"""
+    items = []
+    for s in (ag_source_args or []):
+        if "=" in s:
+            lab, _, p = s.partition("=")
+            items.append((lab.strip() or None, Path(p).expanduser()))
+        else:
+            items.append((None, Path(s).expanduser()))
+    if not items:
+        default = Path.home() / ".gemini" / "antigravity-cli" / "conversations"
         if default.is_dir():
             items.append(("default", default))
     items = _dedupe_by_realpath(items)
@@ -12728,6 +13648,8 @@ def run_search(args):
         rows = [r for r in rows if r.get("source_kind") != SOURCE_CLAUDE]
     if args.no_codex:
         rows = [r for r in rows if r.get("source_kind") != SOURCE_CODEX]
+    if args.no_antigravity:
+        rows = [r for r in rows if r.get("source_kind") != SOURCE_ANTIGRAVITY]
     rows.sort(key=lambda r: r.get("start_ts") or 0, reverse=True)
 
     # 比對/高亮共用同一套 regex，語意保證一致；預設不分大小寫（--match-case 切換）
@@ -12824,10 +13746,14 @@ def run_search(args):
 
 
 def collect_session_files(args):
-    """這一次要處理的來源檔：`(accounts, codex_accounts, files, 去重前的筆數)`，
-    `files` 每一筆是 `(來源類型, 帳號, 專案munged名, session檔)`。建置與 `--ai-md` 共用同一條路。"""
+    """這一次要處理的來源檔：`(accounts, codex_accounts, files, 去重前的筆數, ag)`，
+    `files` 每一筆是 `(來源類型, 帳號, 專案munged名, session檔)`。建置與 `--ai-md` 共用同一條路。
+    `ag`＝Antigravity 的 `{"accounts": [(標籤, 根)], "tree": {主對話路徑: (info, 子孫子代理)}}`：
+    子代理是另一個檔，併進父對話那一頁，`files` 只列主對話（見 `antigravity_tree`）。"""
     accounts = [] if args.no_claude else collect_sources(args.claude_source, args.account)
     codex_accounts = [] if args.no_codex else collect_codex_sources(args.codex_source)
+    ag = {"accounts": [] if args.no_antigravity else collect_antigravity_sources(args.antigravity_source),
+          "tree": {}}
     files = []
     for acc_name, proj_root in accounts:
         if not proj_root.is_dir():
@@ -12841,8 +13767,16 @@ def collect_session_files(args):
             continue
         for sf in iter_codex_session_files(sessions_root):
             files.append((SOURCE_CODEX, acc_name, "codex", sf))
+    for acc_name, ag_root in ag["accounts"]:
+        if not ag_root.exists():
+            print(f"  (略過) Antigravity {acc_name} 找不到目錄：{ag_root}", file=sys.stderr)
+            continue
+        roots, tree = antigravity_tree(list(iter_antigravity_files(ag_root)), load_antigravity_summaries(ag_root))
+        for info in roots:
+            files.append((SOURCE_ANTIGRAVITY, acc_name, "antigravity", info["path"]))
+            ag["tree"][str(info["path"])] = (info, tree.get(str(info["path"]), []))
     n_raw = len(files)
-    return accounts, codex_accounts, _dedupe_claude_sessions(files), n_raw   # 跨來源同 sessionId 的複本只留一份
+    return accounts, codex_accounts, _dedupe_claude_sessions(files), n_raw, ag   # 跨來源同 sessionId 的複本只留一份
 
 
 def out_base(s):
@@ -12858,8 +13792,14 @@ _UUID_TAIL_RE = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a
 def _ai_md_sid(kind, path):
     """這一場的 session id，與載入器同一個來源：Claude＝檔名；Codex＝開頭那一筆 `session_meta` 的 `id`
     （`load_codex_session` 用它當 session id，輸出檔名的那 8 碼也從它來）——檔名可以被改，不可以拿檔名認人。
-    沒有 `session_meta` 才退回 rollout 檔名結尾的 uuid，再退回整個檔名。"""
+    沒有 `session_meta` 才退回 rollout 檔名結尾的 uuid，再退回整個檔名。
+    Antigravity＝檔裡的對話 id（`antigravity_session_id`，副本另帶檔名）；讀不起來才退回檔名。"""
     stem = path.stem
+    if kind == SOURCE_ANTIGRAVITY:
+        try:
+            return antigravity_session_id(antigravity_conv_info(path))
+        except Exception:
+            return stem
     if kind == SOURCE_CODEX:
         mid = _codex_meta(path).get("id")
         if isinstance(mid, str) and mid.strip():
@@ -12872,11 +13812,12 @@ def _ai_md_sid(kind, path):
 
 def _ai_md_id_matches(kind, sid, key):
     """`key`（已轉小寫）指的是不是這個 session id：完整、開頭，或輸出檔名裡的那一段（Codex 是結尾 8 碼，
-    Claude 的同步副本是 `claude_out_id`，見 `out_id_part`）。"""
+    Claude 的同步副本是 `claude_out_id`、Antigravity 的副本是 `antigravity_out_id`，見 `out_id_part`）。"""
     sid = str(sid)
     low = sid.lower()
     return (low == key or low.startswith(key) or (kind == SOURCE_CODEX and low.endswith(key))
-            or (kind != SOURCE_CODEX and claude_out_id(sid).lower() == key))
+            or (kind == SOURCE_CLAUDE and claude_out_id(sid).lower() == key)
+            or (kind == SOURCE_ANTIGRAVITY and antigravity_out_id(sid).lower() == key))
 
 
 def _ai_md_stem_matches(path, ids, key):
@@ -12915,6 +13856,17 @@ def codex_file_matches_project(path, project_filter, account="default"):
     return project_matches_filter(load_codex_session(path, account, {}), project_filter)
 
 
+def _source_mtime(item):
+    """`files` 那一筆最後被寫的時刻。Antigravity 是 WAL 模式：新的步驟先寫進 `-wal`，主檔的 mtime 不一定會動。"""
+    mt = item[3].stat().st_mtime
+    if item[0] == SOURCE_ANTIGRAVITY:
+        try:
+            mt = max(mt, Path(str(item[3]) + "-wal").stat().st_mtime)
+        except OSError:
+            pass
+    return mt
+
+
 def pick_ai_md_target(files, ident, now=None, eligible=None):
     """`--ai-md` 要處理的那一場：回傳 (files 裡的那一筆, [給人看的說明…])；找不到或不唯一就 `SystemExit`。
 
@@ -12932,7 +13884,7 @@ def pick_ai_md_target(files, ident, now=None, eligible=None):
         cands = []
         for item in files:
             try:
-                cands.append((item[3].stat().st_mtime, item))
+                cands.append((_source_mtime(item), item))
             except OSError:
                 continue
         cands.sort(key=lambda c: c[0], reverse=True)
@@ -12988,13 +13940,29 @@ def pick_ai_md_target(files, ident, now=None, eligible=None):
     return hits[0], []
 
 
+def antigravity_file_matches_project(info, project_filter):
+    """`--project` 對 Antigravity 的判準：與建置同一套（`project_matches_filter` 看的專案名、工作目錄、檔案路徑），
+    只是不必讀步驟——工作目錄在 `antigravity_tree` 那時已經讀好了。"""
+    if not project_filter:
+        return True
+    cwd = (info or {}).get("cwd") or ""
+    blob = f"{path_leaf_name(cwd, 'antigravity') if cwd else 'antigravity'} {cwd} {(info or {}).get('path', '')}"
+    return project_filter.lower() in blob.lower()
+
+
 def run_ai_md(args):
     """`--ai-md`：只處理一場，產給 AI 讀的精簡版（與完整版）到 `out/ai/`，stdout 只印一行絕對路徑。
     不碰 `out/sessions/`、manifest、索引——那些是增量建置的紀錄。"""
-    accounts, codex_accounts, files, _ = collect_session_files(args)
-    # `--project`：Claude 在收集來源時就照專案夾篩了；Codex 的建置是載入後才篩，這裡要在挑那一場時篩
-    eligible = ((lambda it: it[0] != SOURCE_CODEX or codex_file_matches_project(it[3], args.project, it[1]))
-                if args.project else None)
+    accounts, codex_accounts, files, _, ag = collect_session_files(args)
+
+    def _eligible(it):
+        if it[0] == SOURCE_CODEX:
+            return codex_file_matches_project(it[3], args.project, it[1])
+        if it[0] == SOURCE_ANTIGRAVITY:
+            return antigravity_file_matches_project(ag["tree"].get(str(it[3]), (None,))[0], args.project)
+        return True
+    # `--project`：Claude 在收集來源時就照專案夾篩了；Codex 與 Antigravity 的建置是載入後才篩，這裡要在挑那一場時篩
+    eligible = _eligible if args.project else None
     item, notes = pick_ai_md_target(files, args.ai_md, eligible=eligible)
     for n in notes:
         print(n, file=sys.stderr)
@@ -13006,6 +13974,9 @@ def run_ai_md(args):
         for _, root in codex_accounts:
             titles.update(load_codex_thread_names(root))
         s = load_codex_session(sf, acc, titles)
+    elif kind == SOURCE_ANTIGRAVITY:
+        _info, _desc = ag["tree"].get(str(sf), (None, ()))
+        s = load_antigravity_session(sf, acc, _info, _desc)
     else:
         s = load_session(sf, proj, acc, kind)
     analyze(s, switches)
@@ -13036,7 +14007,8 @@ def run_ai_md(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="把 Claude Code / Codex 的 JSONL session 轉成 HTML/Markdown")
+    ap = argparse.ArgumentParser(description="把 Claude Code / Codex 的 JSONL session（與 Antigravity CLI 的對話檔）"
+                                             "轉成 HTML/Markdown")
     ap.add_argument("--claude-source", action="append", default=None,
                     help="輸入的 Claude projects 目錄，可多次指定，亦可寫「標籤=路徑」；未指定時自動偵測 ~/.claude*")
     ap.add_argument("--account", default="",
@@ -13045,6 +14017,10 @@ def main():
     ap.add_argument("--no-codex", action="store_true", help="不讀取 Codex 紀錄")
     ap.add_argument("--codex-source", action="append", default=None,
                     help="Codex sessions 目錄或單一 JSONL，可多次指定，亦可寫「標籤=路徑」；未指定時自動偵測 ~/.codex/sessions")
+    ap.add_argument("--no-antigravity", action="store_true", help="不讀取 Antigravity 紀錄")
+    ap.add_argument("--antigravity-source", action="append", default=None,
+                    help="Antigravity CLI 的對話目錄（conversations）或單一 .db，可多次指定，亦可寫「標籤=路徑」；"
+                         "未指定時自動偵測 ~/.gemini/antigravity-cli/conversations")
     ap.add_argument("--out", default="out", help="輸出資料夾（預設 ./out）")
     ap.add_argument("--format", choices=["html", "md", "both"], default="both")
     ap.add_argument("--project", default="", help="只轉名稱含此字串的專案")
@@ -13056,7 +14032,7 @@ def main():
                     help="全文搜尋既有輸出的對話內容並產生結果頁到 out/search/（不重新轉換，先跑過一次轉換）。"
                          "語法：空白分隔＝同一則訊息內全部命中（AND）；獨立大寫 OR＝前後任一命中"
                          "（A B OR C ＝ A 且 (B 或 C)）；\"片語\" 或 '片語' 逐字比對（片語內空白可跨換行），"
-                         "要搜字面 OR 也用引號。可搭 --project/--account/--no-claude/--no-codex 縮範圍，"
+                         "要搜字面 OR 也用引號。可搭 --project/--account/--no-claude/--no-codex/--no-antigravity 縮範圍，"
                          "--open 直接打開結果頁")
     ap.add_argument("--match-case", action="store_true", help="--search 時區分大小寫（預設不分）")
     # ⚠⚠ 本工具唯一會動到 `out/` 以外檔案的功能，**只有明確給了這個參數才會發生**。
@@ -13092,7 +14068,11 @@ def main():
     want_html = args.format in ("html", "both")
     want_md = args.format in ("md", "both")
 
-    accounts, codex_accounts, files, n_raw = collect_session_files(args)
+    accounts, codex_accounts, files, n_raw, ag = collect_session_files(args)
+    ag_tree = ag["tree"]
+    # 本次真的掃過的來源根（對帳只在這些根底下做，見 `prune_gone_sources`）
+    scanned_roots = ([root for _, root in accounts] + [root for _, root in codex_accounts]
+                     + [root for _, root in ag["accounts"]])
 
     # 封存「只有指令、沒有對話」的 session。⚠ **只有明確給了參數才會發生**——
     # 沒給就連判定都不做，一個來源檔都不會被讀第二次。
@@ -13165,6 +14145,8 @@ def main():
               f"{acct_health.get('switch_sessions', 0)} 場有切換")
     if codex_accounts:
         print(f"Codex 來源：{', '.join(a for a, _ in codex_accounts)}")
+    if ag["accounts"]:
+        print(f"Antigravity 來源：{', '.join(a for a, _ in ag['accounts'])}")
     if not files:
         print("沒有找到任何 session 檔。")
         # ⚠⚠ **零場也要對帳。** 在這裡直接 `return` 的話，
@@ -13175,13 +14157,12 @@ def main():
         #     ⚠ `test_bookmark_deleted_source_pruned` 只做「兩場刪成一場」，
         #       沒有素材走到這一格。
         #     守它的是 `tests/test_smoke.py::test_bookmark_all_sources_deleted`。
-        scanned_roots = [root for _, root in accounts] + [root for _, root in codex_accounts]
         # ⚠ 一個來源根都沒掃到（`--no-claude --no-codex`、或來源設定錯）時**什麼都不要動**：
         #   那不是「東西被刪了」，是「這次沒有去看」。誤判的代價是清掉還在的紀錄。
         if not scanned_roots:
             return
         filtering = bool(args.project or args.claude_source or args.account or args.no_claude
-                         or args.codex_source or args.no_codex)
+                         or args.codex_source or args.no_codex or args.antigravity_source or args.no_antigravity)
         old_manifest, _ = load_manifest(out)
         new_entries = dict(old_manifest) if filtering else {}
         new_entries, n_gone = prune_gone_sources(new_entries, scanned_roots)
@@ -13226,23 +14207,27 @@ def main():
     manifest = {} if args.force else old_manifest
     # 任何「縮小範圍」的旗標下，都沿用其他範圍的舊紀錄並略過孤兒清理，避免誤刪未處理的輸出
     filtering = bool(args.project or args.claude_source or args.account or args.no_claude
-                     or args.codex_source or args.no_codex)
+                     or args.codex_source or args.no_codex or args.antigravity_source or args.no_antigravity)
     # renderer 升級後 manifest 被視為空：明確「子集」建置會讓未涵蓋範圍暫時從索引/報告消失，提醒補跑全量。
-    # 只對真正子集的旗標示警；--claude-source/--codex-source 是指定來源位置（常為正常全建），不算子集。
-    subsetting = bool(args.project or args.account or args.no_claude or args.no_codex)
+    # 只對真正子集的旗標示警；--*-source 是指定來源位置（常為正常全建），不算子集。
+    subsetting = bool(args.project or args.account or args.no_claude or args.no_codex or args.no_antigravity)
     if manifest_stale and subsetting:
         print("  ⚠ 偵測到 renderer 版本更新（manifest 需重建）：本次為縮範圍建置，未涵蓋的範圍會暫時"
               "從索引/報告消失；請另跑一次涵蓋全部來源的完整建置以補齊。", file=sys.stderr)
-    # 預設（無縮範圍旗標）時 Claude + Codex 兩邊都會掃，可安全全量對帳
+    # 預設（無縮範圍旗標）時三種來源都會掃，可安全全量對帳
     new_entries = dict(old_manifest) if filtering else {}
     # ⚠⚠ 沿用舊 manifest 不等於「舊的都還在」。本次真的掃過的來源根底下、檔案已經不在的，
     #     一律對掉——不做的話已刪除的 session 會**永久**留在書籤管理頁的反查表裡
     #     。判準與保守方向見 `prune_gone_sources` 的 docstring。
-    scanned_roots = [root for _, root in accounts] + [root for _, root in codex_accounts]
     if filtering:
         new_entries, n_gone = prune_gone_sources(new_entries, scanned_roots)
         if n_gone:
             print(f"  （來源已刪除，對掉 {n_gone} 筆舊紀錄）")
+    # Antigravity：這一次併進某一頁的子代理不是一列。它以前可能自己一列過（那時父對話還不在），而縮範圍建置
+    # 沿用舊紀錄——檔還在，上面那道對不掉 ⇒ 同一段對話在索引與統計裡算兩次。
+    for _info, _desc in ag_tree.values():
+        for _d in _desc:
+            new_entries.pop(manifest_key(SOURCE_ANTIGRAVITY, Path(_d["path"])), None)
     scanned_source_dirs = {safe_name(source_kind, 24) for source_kind, *_ in files}
 
     codex_titles = {}
@@ -13275,11 +14260,16 @@ def main():
     n_broken_kept = 0                              # 其中「沿用上一次輸出」的（見下方 except）
     for source_kind, acc_name, proj_name, sf in files:
         key = manifest_key(source_kind, sf)
-        # Claude 的 transcript 檔名就是 sessionId，切帳號資料據此對應（Codex 無此資料）
-        sig = session_signature(sf, acct_switches.get(sf.stem, ()))
+        if source_kind == SOURCE_ANTIGRAVITY:
+            # 子代理併在這一頁裡：它們的檔變了也要重建（見 `antigravity_signature`）
+            sig = antigravity_signature(*ag_tree.get(str(sf), ({"path": sf}, ())))
+        else:
+            # Claude 的 transcript 檔名就是 sessionId，切帳號資料據此對應（Codex 無此資料）
+            sig = session_signature(sf, acct_switches.get(sf.stem, ()))
         cached = manifest.get(key) or {}
         row = cached.get("row")
-        if source_kind == SOURCE_CODEX and args.project and row and not row_matches_project(row, args.project):
+        if (source_kind in (SOURCE_CODEX, SOURCE_ANTIGRAVITY) and args.project and row
+                and not row_matches_project(row, args.project)):
             continue
         new_entries.pop(key, None)
         reusable = (
@@ -13331,12 +14321,15 @@ def main():
         try:
             if source_kind == SOURCE_CODEX:
                 s = load_codex_session(sf, acc_name, codex_titles)
+            elif source_kind == SOURCE_ANTIGRAVITY:
+                _info, _desc = ag_tree.get(str(sf), (None, ()))
+                s = load_antigravity_session(sf, acc_name, _info, _desc)
             else:
                 s = load_session(sf, proj_name, acc_name, source_kind)
         except Exception as e:
             _broken("解析失敗", e)
             continue
-        if source_kind == SOURCE_CODEX and not project_matches_filter(s, args.project):
+        if source_kind in (SOURCE_CODEX, SOURCE_ANTIGRAVITY) and not project_matches_filter(s, args.project):
             continue
         if not any(e.get("type") in ("user", "assistant") for e in s.events):
             continue

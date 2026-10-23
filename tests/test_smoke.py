@@ -12,11 +12,13 @@ ai_session_viewer 的煙霧測試（不含任何真實對話）。
 回合錨點（HTML id ↔ MD {#tN} 標記）與 --search 全文搜尋結果頁。
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -10186,7 +10188,7 @@ def test_sync_conflict_copies(tmp_path=None):
 #    ⚠ 反過來：**擴大 fixture 時雜湊一定會變，那時產品輸出沒變，版本不升、只更新雜湊**。
 # 範圍限制 SCOPE-RENDER-PIN-FIXTURE：釘的是這支測試的 fixture 走得到的輸出；Codex 只有「工具結果是
 #    content item 陣列」那一條，子代理、Claude 的圖片、壓縮、排隊句、未知模型這些路徑不在 fixture 裡。
-_RENDER_PIN =(74, "80fadcd8bea155254ac31d92bcfbbab7c1e04d6ea218e703899c156b68685900")
+_RENDER_PIN =(75, "2eced3e46dfcb98ab06a48bfccfd0d4f8c00c8799fbb860436f8400b49759c81")
 
 
 def test_ask_user_question(tmp_path=None):
@@ -10436,8 +10438,9 @@ def test_renderer_version_pinned(tmp_path=None):
     """`RENDERER_VERSION` 要跟著頁面輸出走（把版本改回 60，整套照樣綠）。
 
     增量建置靠它判斷舊頁面要不要重產；呈現改了、版本沒升，修正在既有的 `out/` 上**完全不生效**，
-    而且沒有任何跡象。做法：固定兩場合成 session（Claude 一場涵蓋各種區塊、Codex 一場涵蓋工具結果陣列），
-    在固定時區（`TZ=UTC0`）與固定雜湊種子下渲染 HTML＋MD，雜湊要等於上面記的那一個。
+    而且沒有任何跡象。做法：固定幾場合成 session（Claude 一場涵蓋各種區塊、它的同步副本、Codex 一場涵蓋工具結果陣列、
+    Antigravity 一場涵蓋各種步驟），在固定時區（`TZ=UTC0`）與固定雜湊種子下渲染 HTML＋MD（Antigravity 另加精簡版），
+    雜湊要等於上面記的那一個。
     """
     tmp = new_tmp(tmp_path)
     proj = tmp / "projects" / "pin-proj"
@@ -10497,9 +10500,29 @@ def test_renderer_version_pinned(tmp_path=None):
           cw=900, cr=5000, ttl="5m"),
         a("2026-09-30T02:31:09.000Z", "pm5", [{"type": "text", "text": "仍是 5 分鐘。"}],
           cw=700, cr=5900, ttl="5m"),
+        # 程式碼區塊的語言字串帶引號（進 `class` 屬性要照屬性跳脫）；指令帶 `</`（MD 工具框的 `<summary>`）
+        a("2026-09-30T02:31:20.000Z", "pm6", [{"type": "text", "text": '```py" data-x="1\nprint(1)\n```'},
+                                              {"type": "tool_use", "id": "tu4", "name": "Bash",
+                                               "input": {"command": "cat </dev/null <<EOF"}}], cw=10, cr=6000),
+        q("2026-09-30T02:31:21.000Z", "p5", [{"type": "tool_result", "tool_use_id": "tu4", "content": ""}]),
     ]
     (proj / f"{sid}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in ev),
                                        encoding="utf-8")
+    # Antigravity 那一場：使用者原文、模型回應（思考、工具呼叫、用量）、工具結果、系統訊息、壓縮點，
+    # 加上一個重複的呼叫 id（頁面上的標記）
+    agid = "a9a90000-0000-4000-8000-0000000000f3"
+    agf = tmp / "agpin" / f"{agid}.db"
+    agf.parent.mkdir()
+    ag_write_db(agf, agid, [
+        ag_user(0, "<system-reminder>原文</system-reminder> 跑一下"),
+        ag_planner(1, text="好", think="先看", calls=[("k1", "run_command", {"CommandLine": "ls"}),
+                                                    ("k1", "view_file", {"AbsolutePath": "/x/a.py"})],
+                   usage=(100, 10, 50)),
+        ag_generic(2, "k1", "run_command", {"CommandLine": "ls"}, result="a.py"),
+        ag_generic(3, "k1", "view_file", {"AbsolutePath": "/x/a.py"}, result="print(1)"),
+        ag_system(4, "done", title="Run finished", event="task_notification"),
+        ag_checkpoint(5, "摘要", trigger_idx=0),
+        ag_planner(6, text="完成", usage=(10, 5, 0), enum=4242)])
 
     # Codex 那一場：工具結果是 content item 陣列（文字、`output_text`、data: 圖片、外連圖片、
     # 認不得的型別、多了欄位的格、空字串）
@@ -10550,6 +10573,11 @@ def test_renderer_version_pinned(tmp_path=None):
             "v.analyze(c)\n"
             "c.out_html, c.out_md, c.mem_href = 'codex/demo/pin.html', 'codex/demo/pin.md', ''\n"
             "blob += '\\n@@CODEX@@\\n' + v.render_session_html(c, '../../../index.html', '') + '\\n@@MD@@\\n' + v.render_session_md(c)\n"
+            f"g = v.load_antigravity_session(v.Path({str(agf)!r}))\n"
+            "v.analyze(g)\n"
+            "g.out_html, g.out_md, g.mem_href = 'antigravity/demo/pin.html', 'antigravity/demo/pin.md', ''\n"
+            "blob += '\\n@@AG@@\\n' + v.render_session_html(g, '../../../index.html', '') + '\\n@@MD@@\\n' + v.render_session_md(g)\n"
+            "blob += '\\n@@AGAI@@\\n' + v.render_session_ai_md(g)\n"
             f"for t in {[str(tmp), str(tmp).replace(chr(92), '/'), json.dumps(str(tmp))[1:-1]]!r}:\n"
             "    blob = blob.replace(t, '<TMP>')\n"
             "print(v.RENDERER_VERSION, hashlib.sha256(blob.encode('utf-8')).hexdigest())\n")
@@ -10566,6 +10594,916 @@ def test_renderer_version_pinned(tmp_path=None):
         f"再把 _RENDER_PIN 更新成 (新版本, {digest!r})")
 
     print("OK: renderer version pinned test passed")
+
+
+# ---------------------------------------------------------------------------
+# Antigravity：合成的對話檔（SQLite＋protobuf）。欄位號與載入器同一份（CLI 本體內嵌的描述＋實測）。
+# ---------------------------------------------------------------------------
+def _pb_key(fn, wt):
+    return _pb_vint(fn << 3 | wt)
+
+
+def _pb_vint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def pbv(fn, n):
+    """varint 欄位"""
+    return _pb_key(fn, 0) + _pb_vint(n)
+
+
+def pbs(fn, data):
+    """length-delimited 欄位（字串、bytes、或已編好的巢狀訊息）"""
+    data = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+    return _pb_key(fn, 2) + _pb_vint(len(data)) + data
+
+
+def pbm(fn, *parts):
+    """巢狀訊息欄位"""
+    return pbs(fn, b"".join(parts))
+
+
+AG_T0 = 1781254800          # 2026-06-12T09:00:00Z
+
+
+def ag_ts(fn, sec, nanos=0):
+    return pbm(fn, pbv(1, AG_T0 + sec), pbv(2, nanos))
+
+
+def ag_meta(sec, *extra):
+    return pbm(5, ag_ts(1, sec), *extra)
+
+
+def ag_user(sec, text, media=0):
+    return (AG_STEP_TYPES["user"], 3,
+            pbv(1, 14) + pbv(4, 3) + ag_meta(sec)
+            + pbm(19, pbs(2, text), pbm(3, pbs(1, text)), *[pbm(5, pbs(1, "img")) for _ in range(media)]))
+
+
+def ag_planner(sec, text="", think="", calls=(), usage=None, enum=1035):
+    """calls：[(id, 名字, 參數 dict)]；usage：(輸入, 產出, 快取讀取[, 其他欄位 bytes])"""
+    meta = []
+    if usage:
+        meta.append(pbm(9, pbv(1, enum), pbv(2, usage[0]), pbv(3, usage[1]), pbv(5, usage[2]),
+                        *(usage[3:] if len(usage) > 3 else ())))
+    body = []
+    if text:
+        body.append(pbs(1, text))
+    if think:
+        body.append(pbs(3, think))
+    for cid, name, args in calls:
+        body.append(pbm(7, pbs(1, cid), pbs(2, name), pbs(3, json.dumps(args, ensure_ascii=False))))
+    return (15, 3, pbv(1, 15) + pbv(4, 3) + ag_meta(sec, *meta) + pbm(20, *body))
+
+
+def ag_generic(sec, cid, name, args, result=None, status=3, err=None):
+    tc = pbm(4, pbs(1, cid), pbs(2, name), pbs(3, json.dumps(args, ensure_ascii=False)))
+    res = pbm(2, pbs(1, result)) if result is not None else b""
+    p = pbv(1, 132) + pbv(4, status) + ag_meta(sec, tc) + pbm(140, res)
+    if err:
+        p += pbm(31, pbs(2, err))
+    return (132, status, p)
+
+
+def ag_system(sec, body, title="System Message", event="", src=None):
+    """src：(來源對話 id, 那一次工具呼叫的 id, 工具名)——子代理第一步的「父代理傳來的任務」用"""
+    am = [pbs(4, body)]
+    if src:
+        am.append(pbm(12, pbm(1, pbs(1, src[0]), pbv(2, 1), pbm(3, pbs(1, src[1]), pbs(2, src[2])))))
+    sm = [pbs(1, "[Message] " + body), pbm(2, pbs(1, title)), pbm(4, *am)]
+    if event:
+        sm.append(pbs(3, event))
+    return (101, 3, pbv(1, 101) + pbv(4, 3) + ag_meta(sec) + pbm(114, *sm))
+
+
+def ag_error(sec, head, full):
+    return (17, 3, pbv(1, 17) + pbv(4, 3) + ag_meta(sec) + pbm(24, pbm(3, pbs(1, head), pbs(3, full))))
+
+
+def ag_checkpoint(sec, summary, trigger_idx=None):
+    cp = [pbs(5, summary)]
+    if trigger_idx is not None:
+        cp.append(pbv(25, trigger_idx))
+    return (23, 3, pbv(1, 23) + pbv(4, 3) + ag_meta(sec) + pbm(30, *cp))
+
+
+AG_STEP_TYPES = {"user": 14}
+
+
+def ag_write_db(path, conv_id, steps, parent="", agent=("", ""), cwd="file:///home/demo/AgProj", branch="main",
+                models=((1035, "claude-sonnet-4-6"),), wal_conn=False):
+    """寫一場 Antigravity 對話檔（與 CLI 同樣的表）。`steps`：[(step_type, status, payload bytes)]。
+    ⚠ **一律 WAL 模式**（CLI 的檔就是）：WAL 模式的檔用一般的唯讀開法會在旁邊建 `-shm`／`-wal`——
+      「不在來源夾留下任何檔」那條斷言只有在 WAL 檔上才會紅。關掉連線時 SQLite 會把 `-wal` 寫回主檔並刪掉它。
+    `wal_conn=True`：**不關連線**就回傳連線（呼叫端趁它開著時複製檔案，留下還沒寫回主檔的 `-wal`）。"""
+    con = sqlite3.connect(str(path))
+    con.execute("pragma journal_mode=wal")
+    if wal_conn:
+        con.execute("pragma wal_autocheckpoint=0")
+    con.executescript("""
+        create table steps (idx integer primary key, step_type integer, status integer, has_subtrajectory integer,
+            step_format integer, metadata blob, error_details blob, permissions blob, task_details blob,
+            render_info blob, step_payload blob);
+        create table gen_metadata (idx integer primary key, data blob, size integer);
+        create table executor_metadata (idx integer primary key, data blob);
+        create table trajectory_meta (trajectory_id text, cascade_id text, trajectory_type integer, source integer);
+        create table trajectory_metadata_blob (id text primary key, data blob);
+        create table parent_references (idx integer primary key, data blob);
+        create table battle_mode_infos (idx integer primary key, data blob);
+    """)
+    for i, (st, status, payload) in enumerate(steps):
+        con.execute("insert into steps (idx, step_type, status, has_subtrajectory, step_format, step_payload)"
+                    " values (?, ?, ?, 0, 0, ?)", (i, st, status, payload))
+    for i, (enum, mid) in enumerate(models):
+        con.execute("insert into gen_metadata values (?, ?, 0)", (i, pbm(1, pbv(3, enum), pbs(19, mid))))
+    con.execute("insert into trajectory_meta values (?, ?, 4, 17)", ("traj-" + conv_id[:8], conv_id))
+    tm = [pbm(1, pbs(1, cwd), pbs(4, branch)), pbs(7, cwd)]
+    if parent:
+        tm.append(pbs(5, parent))
+        tm.append(pbm(8, pbs(1, agent[0]), pbs(2, agent[1])))
+    con.execute("insert into trajectory_metadata_blob values ('main', ?)", (b"".join(tm),))
+    con.commit()
+    if wal_conn:
+        return con
+    con.close()
+    return None
+
+
+def _ag_files(d):
+    return sorted(p.name for p in Path(d).iterdir())
+
+
+def _ag_digest(d):
+    """來源夾裡每個檔的名字與內容雜湊。⚠ 只比檔名不夠：`-shm` 已經在的時候，讀者寫進去也是改了來源（檔名一個都沒多）。"""
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(Path(d).iterdir()) if p.is_file()}
+
+
+def test_antigravity(tmp_path=None):
+    """Antigravity（CLI 版）的對話檔：一場一個 SQLite、每一步一則 protobuf。
+
+    守的事：
+    ① 五種步驟各自畫對（使用者、模型回應的思考／文字／工具呼叫、工具結果與它的狀態、系統訊息、錯誤）＋壓縮點；
+    ② 用量掛在模型回應那一步、照模型單價估價（Claude 有價、未知模型 `+?`），沒有快取寫入就不列那幾格；
+    ③ 子代理是另一個檔：併進父對話那一頁、接在觸發它的那一次呼叫底下，不另立一列；父對話不在的自己一列；
+    ④ 認不得的步驟型別、拆不開的步驟、用量裡沒見過的欄位、附圖：頁面標出來＋stderr 出聲；
+    ⑤ **不在來源夾留下任何檔**（SQLite 唯讀開 WAL 檔會建 `-shm`／`-wal`）；還沒寫回主檔的 `-wal` 內容讀得到；
+    ⑥ 增量建置：沒變就沿用，子代理的檔變了父對話那一頁要重建；`--search`、`--ai-md`、`--no-antigravity`、`--project`。
+    """
+    tmp = new_tmp(tmp_path)
+    src = tmp / "ag" / "conversations"
+    src.mkdir(parents=True)
+    A, B, C = ("aaaa1111-0000-4000-8000-00000000000a", "bbbb2222-0000-4000-8000-00000000000b",
+               "cccc3333-0000-4000-8000-00000000000c")
+    unknown_usage = pbv(4, 777)                      # 用量裡沒見過的欄位 4
+    ag_write_db(src / f"{A}.db", A, [
+        ag_user(0, "請跑測試 AGQ1"),
+        ag_planner(2, think="AGTHINK 先跑測試", calls=[("call_run", "run_command",
+                                                    {"CommandLine": "python -m unittest", "toolSummary": "Run tests"})],
+                   usage=(100000, 10000, 200000)),
+        ag_generic(3, "call_run", "run_command", {"CommandLine": "python -m unittest"},
+                   result="Ran 2 tests\nOK AGRES1"),
+        ag_planner(5, text="AGRESP1 測試都過了", calls=[
+            ("call_x", "run_command", {"CommandLine": "rm -rf /"}),
+            ("call_e", "view_file", {"AbsolutePath": "/nope"}),
+            ("call_r", "run_command", {"CommandLine": "sleep 99"}),
+            ("call_sub", "invoke_subagent", {"Prompt": "summarize", "TypeName": "research"})],
+                   usage=(1000, 100, 0, unknown_usage)),
+        ag_generic(6, "call_x", "run_command", {"CommandLine": "rm -rf /"}, status=6),
+        ag_generic(7, "call_e", "view_file", {"AbsolutePath": "/nope"}, status=7, err="AGERRSHORT no such file"),
+        ag_generic(8, "call_r", "run_command", {"CommandLine": "sleep 99"}, status=2),
+        ag_generic(9, "call_sub", "invoke_subagent", {"Prompt": "summarize"}, result="Created subagent"),
+        ag_system(10, "AGNOTE Run tests finished body", title="Run tests finished", event="task_notification"),
+        ag_error(11, "AGERRHEAD model output error", "AGERRFULL stack trace line 1\nline 2"),
+        (999, 3, pbv(1, 999) + pbv(4, 3) + ag_meta(12)),
+        (14, 3, b"\xff\xff\xff\xff"),               # 拆不開的步驟
+        ag_user(14, "AGQ2 /compact", media=1),
+        ag_checkpoint(15, "AGSUMMARY 壓縮摘要內容", trigger_idx=12),
+        ag_user(16, "壓縮後的提問 AGQ3"),
+        ag_planner(17, text="AGRESP3", usage=(10, 5, 0), enum=4242),     # 認不得的模型：花費 +?
+        # 精簡版（--ai-md）的工具分類：讀檔內容略、寫檔內容略、改檔畫 diff
+        ag_planner(18, calls=[("call_v", "view_file", {"AbsolutePath": "/home/demo/AgProj/a.py"}),
+                              ("call_w", "write_to_file", {"TargetFile": "/home/demo/AgProj/b.py",
+                                                           "CodeContent": "AGWRITTEN1\nAGWRITTEN2"}),
+                              ("call_p", "replace_file_content", {"TargetFile": "/home/demo/AgProj/a.py",
+                                                                  "TargetContent": "AGOLDLINE",
+                                                                  "ReplacementContent": "AGNEWLINE"})],
+                   usage=(10, 5, 0)),
+        ag_generic(19, "call_v", "view_file", {"AbsolutePath": "/home/demo/AgProj/a.py"},
+                   result="AGFILEBODY1\nAGFILEBODY2\nAGFILEBODY3"),
+        ag_generic(19, "call_w", "write_to_file", {"TargetFile": "/home/demo/AgProj/b.py"}, result="Created"),
+        ag_generic(19, "call_p", "replace_file_content", {"TargetFile": "/home/demo/AgProj/a.py"}, result="Edited"),
+    ])
+    ag_write_db(src / f"{B}.db", B, [
+        ag_system(20, "summarize AGCHILDTASK", title="Message from Parent Agent", event="agent_message",
+                  src=(A, "call_sub", "invoke_subagent")),
+        ag_planner(21, text="AGCHILDRESP 子代理的回答", usage=(500, 50, 0)),
+    ], parent=A, agent=("research", "Code Summarizer"))
+    ag_write_db(src / f"{C}.db", C, [                 # 父對話不在：自己一列
+        ag_system(30, "orphan AGORPHANTASK", event="agent_message",
+                  src=("dddd4444-0000-4000-8000-00000000000d", "call_z", "invoke_subagent")),
+        ag_planner(31, text="AGORPHANRESP", usage=(10, 5, 0)),
+    ], parent="dddd4444-0000-4000-8000-00000000000d", agent=("research", "Lost"))
+    # 標題（CLI 自動產生的）在上一層的 conversation_summaries.db
+    scon = sqlite3.connect(str(src.parent / "conversation_summaries.db"))
+    scon.execute("pragma journal_mode=wal")
+    scon.execute("create table conversation_summaries (conversation_id text primary key, title text,"
+                 " parent_conversation_id text, agent_name text)")
+    scon.execute("insert into conversation_summaries values (?, 'AG Auto Title', '', '')", (A,))
+    scon.commit()
+    scon.close()
+    before, before_up = _ag_digest(src), _ag_digest(src.parent)
+    out = tmp / "out"
+
+    def build(*extra):
+        r = subprocess.run([sys.executable, str(SCRIPT), "--no-claude", "--no-codex",
+                            "--antigravity-source", f"demo={src}", "--out", str(out), *extra],
+                           capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        return r
+
+    r = build()
+    # ③ 子代理不另立一列：A 與孤兒 C 兩列
+    assert "共 2 個 session" in r.stdout, "子代理不另立一列：" + r.stdout
+    pages = _session_pages(out)
+    assert [p.relative_to(out / "sessions").parts[:2] for p in pages] == [("antigravity", "demo")] * 2, pages
+    pa = next((p for p in pages if p.name.endswith("__aaaa1111.html")), None)
+    assert pa is not None, f"輸出檔名的 id 段取對話 id 的前 8 碼：{[p.name for p in pages]}"
+    html = pa.read_text(encoding="utf-8")
+    md = pa.with_suffix(".md").read_text(encoding="utf-8")
+    body = _page_body(html)
+    # ① 各種步驟
+    assert "AG Auto Title" in body, "標題取 conversation_summaries.db 的自動標題"
+    assert "AGQ1" in body and "🤖 Antigravity" in body, "使用者發言與 AI 回合"
+    assert "AGTHINK" in body and "💭 思考" in body, "思考區塊"
+    assert "run_command · python -m unittest" in body and "AGRES1" in body, "工具呼叫（摘要帶指令）與它的結果配成一組"
+    assert "沒有執行：被取消，或權限沒有核准" in body, "CANCELED 的工具步驟"
+    assert "AGERRSHORT" in body, "ERROR 的工具步驟帶 Step.error 的內容"
+    assert body.count("（無結果 / 已中斷）") == 1, "紀錄停在 RUNNING 的那一次呼叫沒有結果"
+    assert "背景任務 · Run tests finished" in body and "AGNOTE" in body, "背景任務完成畫成摺疊列"
+    assert "⚠ 錯誤 · AGERRHEAD" in body and "AGERRFULL" in body, "錯誤：標題一行、完整內容收在摺疊裡"
+    assert "⚠ 認不得的步驟" in body and "型別 999" in body, "認不得的步驟要在頁面上標出來"
+    assert "⚠ 拆不開的步驟" in body, "拆不開的步驟要在頁面上標出來"
+    assert body.index("⚠ 拆不開的步驟") > body.index("AGQ1"), "拆不開的步驟留在原來的位置（頁面）"
+    assert "🖼️ 圖片" in body, "使用者輸入附的圖片畫佔位"
+    assert 'class="compact-sep"' in html and "AGSUMMARY" in body and "手動 /compact" in body, "壓縮點"
+    # ③ 子代理接在 invoke_subagent 底下（不是頁尾的孤兒區）
+    assert f'id="sub-{A}-call_sub-' in html and "子代理 research · Code Summarizer" in body,         "子代理接在 invoke_subagent 底下"
+    assert "AGCHILDTASK" in body and "AGCHILDRESP" in body, "子代理的內容在父對話那一頁"
+    assert "sub-orphans" not in body, "子代理接在 invoke_subagent 底下（不是頁尾的孤兒區）"
+    # ② 計量：Claude 單價（sonnet $3／$15）＋快取讀取 0.1×；未知模型 ⇒ +?
+    #   (100000×3 + 200000×0.3 + 10000×15 + 1000×3 + 100×15 + 500×3 + 50×15) / 1e6 = 0.51675
+    assert "💲~$0.52+?" in body, f"估價：{re.findall(r'💲~[^ <]*', body)}"
+    assert "（不含快取寫入）" in body and "估價說明：" in md, "估價說明"
+    assert "快取寫入 5m" not in md, "沒有快取寫入量就不列那幾格（不是 0，是不知道）"
+    assert "sonnet-4-6" in md and "antigravity-model-4242" in md, "模型名取 gen_metadata 的模型 id"
+    _rows = [e["row"] for e in json.loads((out / ".build-manifest.json").read_text(encoding="utf-8"))
+             ["entries"].values()]
+    assert _rows and all(not r.get("cache_steps") and not r.get("waste_n") for r in _rows),         "Antigravity 不進 Claude 的快取成因分析（沒有快取寫入量與 TTL）"
+    assert not _page_dup_ids(html), _page_dup_ids(html)
+    # ④ 出聲
+    for needle in ("認不得的步驟型別 999", "步驟拆不開", "用量裡有沒見過的欄位 [4]", "使用者輸入附的圖片"):
+        assert needle in r.stderr, f"要出聲：{needle}｜{r.stderr}"
+    assert "⚠ 用量裡有沒見過的欄位" in body and "欄位 [4]" in body, "用量裡沒見過的欄位：頁面上也要標"
+    # 孤兒子代理：自己一列，第一步（父代理傳來的任務）當成它的第一則發言、也當標題
+    pc = next(p for p in pages if p.name.endswith("__cccc3333.html"))
+    assert "orphan AGORPHANTASK" in _page_body(pc.read_text(encoding="utf-8")), "孤兒子代理自己一頁"
+    idx_md = (out / "index.md").read_text(encoding="utf-8")
+    assert "orphan AGORPHANTASK" in idx_md and "## Antigravity / AgProj" in idx_md, "孤兒子代理的標題：" + idx_md
+    # ⑤ 來源夾一個檔都沒多、也沒有一個檔被改
+    assert _ag_digest(src) == before, f"來源夾的檔多了或變了：{sorted(set(_ag_digest(src).items()) ^ set(before.items()))}"
+    assert _ag_digest(src.parent) == before_up, "conversation_summaries.db 那一層的檔多了或變了"
+
+    # ⑥ 增量建置：沒變就沿用；子代理的檔變了，父對話那一頁重建
+    r = build()
+    assert "沿用 2" in r.stdout, "沒變就沿用：" + r.stdout
+    time.sleep(0.05)
+    con = sqlite3.connect(str(src / f"{B}.db"))
+    con.execute("insert into steps (idx, step_type, status, has_subtrajectory, step_format, step_payload)"
+                " values (2, 15, 3, 0, 0, ?)", (ag_planner(22, text="AGCHILDMORE")[2],))
+    con.commit()
+    con.close()
+    before = _ag_digest(src)
+    r = build()
+    assert "新建/更新 1" in r.stdout and "沿用 1" in r.stdout, "子代理的檔變了，父對話那一頁要重建：" + r.stdout
+    assert "AGCHILDMORE" in pa.read_text(encoding="utf-8"), "子代理的檔變了，父對話那一頁要重建"
+    # --search 搜得到 Antigravity 的內容；--no-antigravity 時不搜它
+    r = subprocess.run([sys.executable, str(SCRIPT), "--out", str(out), "--search", "AGRES1"],
+                       capture_output=True, text=True, encoding="utf-8")
+    assert "命中 1 則" in r.stdout, "--search 搜得到 Antigravity：" + r.stdout
+    r = subprocess.run([sys.executable, str(SCRIPT), "--out", str(out), "--search", "AGRES1", "--no-antigravity"],
+                       capture_output=True, text=True, encoding="utf-8")
+    assert "命中 0 則" in r.stdout, "--no-antigravity 不搜它：" + r.stdout
+    # --ai-md：指定 id 的開頭（精簡版本來就不放子代理內部的來回）
+    r = subprocess.run([sys.executable, str(SCRIPT), "--no-claude", "--no-codex", "--antigravity-source",
+                        f"demo={src}", "--out", str(out), "--ai-md", "aaaa1111"],
+                       capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, r.stderr
+    ai = Path(r.stdout.strip()).read_text(encoding="utf-8")
+    assert "AGRESP1" in ai and "來源：Antigravity" in ai and "Antigravity 自己接續" in ai, ai[:2000]
+    assert "AGFILEBODY" not in ai and "view_file · /home/demo/AgProj/a.py — 內容略（3 行）" in ai,         "精簡版：讀檔內容略（Antigravity 的 view_file）"
+    assert "AGWRITTEN1" not in ai and "write_to_file · /home/demo/AgProj/b.py — 寫入 2 行，內容略" in ai,         "精簡版：寫檔內容略（Antigravity 的 write_to_file）"
+    assert "- AGOLDLINE" in ai and "+ AGNEWLINE" in ai, "精簡版：改檔畫 diff（Antigravity 的 replace_file_content）"
+    assert "run_command · python -m unittest" in ai, "精簡版：指令那一行帶著指令"
+    # 拆不開的步驟留在原來的位置（沿用上一步的時刻），不會跑到整場最前面
+    # ⚠ 只比正文：檔頭的目錄就有 AGQ1，拿整份檔比的話不管順序都過
+    ai_body = ai[ai.index("\n---\n"):]
+    assert ai_body.index("拆不開的步驟") > ai_body.index("AGQ1"), "拆不開的步驟留在原來的位置：" + ai_body[:1500]
+    # --project 篩 Antigravity：工作目錄的名字
+    r = subprocess.run([sys.executable, str(SCRIPT), "--no-claude", "--no-codex", "--antigravity-source",
+                        f"demo={src}", "--out", str(tmp / "out-p"), "--project", "nomatchzz"],
+                       capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0 and "共 0 個 session" in r.stdout, "--project 篩 Antigravity：" + r.stdout
+    assert _ag_digest(src) == before, f"來源夾的檔多了或變了：{sorted(set(_ag_digest(src).items()) ^ set(before.items()))}"
+
+    # ⑤ WAL：還沒寫回主檔的內容（`-wal`）讀得到，而且不在來源夾留下任何檔
+    for with_shm in (True, False):
+        wsrc = tmp / f"wal-{int(with_shm)}"
+        wsrc.mkdir()
+        D = f"eeee555{int(with_shm)}-0000-4000-8000-00000000000e"
+        live = tmp / f"live-{int(with_shm)}"
+        live.mkdir()
+        wcon = ag_write_db(live / f"{D}.db", D, [ag_user(40, "AGWALQ"), ag_planner(41, text="AGWALRESP")],
+                           wal_conn=True)
+        try:
+            assert (live / f"{D}.db-wal").stat().st_size > 0, "素材：連線開著時 -wal 要有內容"
+            for suf in ("", "-wal") + (("-shm",) if with_shm else ()):
+                shutil.copyfile(live / f"{D}.db{suf}", wsrc / f"{D}.db{suf}")
+        finally:
+            wcon.close()
+        wbefore = _ag_digest(wsrc)
+        wout = tmp / f"wout-{int(with_shm)}"
+        r = subprocess.run([sys.executable, str(SCRIPT), "--no-claude", "--no-codex", "--antigravity-source",
+                            f"w={wsrc}", "--out", str(wout)], capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, r.stderr
+        wpages = _session_pages(wout)
+        assert len(wpages) == 1 and "AGWALRESP" in wpages[0].read_text(encoding="utf-8"),             f"還沒寫回主檔的內容要讀得到（-shm {'在' if with_shm else '不在'}）：{r.stdout}{r.stderr}"
+        assert _ag_digest(wsrc) == wbefore, (
+            f"來源夾的檔多了或變了（-shm {'在' if with_shm else '不在'}）："
+            f"{sorted(set(_ag_digest(wsrc).items()) ^ set(wbefore.items()))}")
+    print("OK: antigravity test passed")
+
+
+def test_antigravity_tree_cycle():
+    """父子關係成環（資料壞掉）：每一場都還在，不無限遞迴；自己是自己的父對話也一樣。"""
+    sys.path.insert(0, str(ROOT))
+    import ai_session_viewer as v
+    tmp = new_tmp()
+    X, Y, Z = ("1111aaaa-0000-4000-8000-000000000001", "2222bbbb-0000-4000-8000-000000000002",
+               "3333cccc-0000-4000-8000-000000000003")
+    ag_write_db(tmp / f"{X}.db", X, [ag_user(0, "x")], parent=Y, agent=("a", "b"))
+    ag_write_db(tmp / f"{Y}.db", Y, [ag_user(1, "y")], parent=X, agent=("a", "b"))
+    ag_write_db(tmp / f"{Z}.db", Z, [ag_user(2, "z")], parent=Z, agent=("a", "b"))
+    roots, tree = v.antigravity_tree(sorted(tmp.glob("*.db")))
+    ids = sorted(i["id"] for i in roots)
+    shown = set(ids) | {d["id"] for r in roots for d in tree[str(r["path"])]}
+    assert shown == {X, Y, Z}, f"父子成環：每一場都要還在（{ids}／{shown}）"
+    print("OK: antigravity tree cycle test passed")
+
+
+def _ag_build(src, out, *extra):
+    """只讀 `src` 這一個 Antigravity 來源建一次（`--antigravity-source` 算縮範圍建置：沿用舊紀錄）。"""
+    r = subprocess.run([sys.executable, str(SCRIPT), "--no-claude", "--no-codex",
+                        "--antigravity-source", f"demo={src}", "--out", str(out), *extra],
+                       capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"非零退出\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+    return r
+
+
+def _manifest_rows(out):
+    return [e["row"] for e in json.loads((Path(out) / ".build-manifest.json").read_text(encoding="utf-8"))
+            ["entries"].values()]
+
+
+def test_antigravity_tool_pairing(tmp_path=None):
+    """工具呼叫配它自己的結果，不配別次呼叫的：
+
+    ① 同一個呼叫 id 在模型回應裡出現兩次：兩個結果各配各的（依出現順序），頁面與 stderr 都講「呼叫 id 重複」；
+    ② 沒有呼叫 id：照工具名與參數配到模型回應裡同樣沒有 id 的那一次（那個呼叫只畫一次，不另補一個）；
+       配不到的才用工具步驟自己帶的呼叫補一個；頁面上標出來；
+    ③ 父對話與子代理用了同一個呼叫 id：併進同一頁之後各配各的，兩邊的結果都在；
+    ④ 原始 id 本身長得像另編出來的內部 id：各配各的；
+    ⑤ 拆到一半的步驟（模型回應或工具結果）不動配對表：後面的結果不會配給一個沒有畫出來的呼叫、跟著消失。"""
+    tmp = new_tmp(tmp_path)
+    src = tmp / "conversations"
+    src.mkdir()
+    P, K = "1234abcd-0000-4000-8000-0000000000a1", "5678abcd-0000-4000-8000-0000000000b2"
+    ag_write_db(src / f"{P}.db", P, [
+        ag_user(0, "AGPAIRQ"),
+        ag_planner(1, calls=[("dup", "run_command", {"CommandLine": "echo ONE"}),
+                             ("dup", "run_command", {"CommandLine": "echo TWO"}),
+                             ("", "view_file", {"AbsolutePath": "/home/demo/NOID"}),
+                             ("same", "invoke_subagent", {"TypeName": "research", "Role": "r"})],
+                   usage=(10, 5, 0)),
+        ag_generic(2, "dup", "run_command", {"CommandLine": "echo ONE"}, result="AGOUT1"),
+        ag_generic(3, "dup", "run_command", {"CommandLine": "echo TWO"}, result="AGOUT2"),
+        ag_generic(4, "", "view_file", {"AbsolutePath": "/home/demo/NOID"}, result="AGNOIDRES"),
+        ag_generic(5, "", "view_file", {"AbsolutePath": "/home/demo/LONE"}, result="AGLONERES"),
+        ag_generic(9, "same", "invoke_subagent", {"TypeName": "research"}, result="AGPARENTRES"),
+        ag_planner(10, calls=[("x", "run_command", {"CommandLine": "echo XA"}),
+                              ("x", "run_command", {"CommandLine": "echo XB"}),
+                              ("x#2", "run_command", {"CommandLine": "echo XC"})], usage=(10, 5, 0)),
+        ag_generic(11, "x", "run_command", {"CommandLine": "echo XA"}, result="AGXRES1"),
+        ag_generic(12, "x", "run_command", {"CommandLine": "echo XB"}, result="AGXRES2"),
+        ag_generic(13, "x#2", "run_command", {"CommandLine": "echo XC"}, result="AGXRES3"),
+    ])
+    ag_write_db(src / f"{K}.db", K, [
+        ag_system(6, "child task AGKIDTASK", event="agent_message", src=(P, "same", "invoke_subagent")),
+        ag_planner(7, calls=[("same", "run_command", {"CommandLine": "echo KID"})], usage=(10, 5, 0)),
+        ag_generic(8, "same", "run_command", {"CommandLine": "echo KID"}, result="AGKIDRES"),
+    ], parent=P, agent=("research", "Kid"))
+    out = tmp / "out"
+    r = _ag_build(src, out)
+    pages = _session_pages(out)
+    assert len(pages) == 1, [p.name for p in pages]
+    body = _page_body(pages[0].read_text(encoding="utf-8"))
+    # --- ① 兩個結果都在、各在自己的呼叫底下（第一個呼叫的框裡是 AGOUT1，不是被第二個蓋掉）
+    assert body.count("AGOUT1") == 1 and body.count("AGOUT2") == 1, "同一個 id 的兩個結果都要在、各一次"
+    assert (body.index("echo ONE") < body.index("AGOUT1") < body.index("echo TWO")
+            < body.index("AGOUT2")), "結果依出現順序各配各的呼叫"
+    assert "⚠ 工具呼叫 id 重複" in body and "id 重複" in r.stderr, "呼叫 id 重複：頁面與 stderr 都要講"
+    # --- ② 沒有 id：配到同樣沒有 id 的那一次（那個呼叫只畫一次），配不到的補一個
+    assert body.count("view_file · /home/demo/NOID") == 1 and "AGNOIDRES" in body, \
+        "沒有 id 的照工具名與參數配，不另補一個呼叫"
+    assert "view_file · /home/demo/LONE" in body and "AGLONERES" in body, "配不到的用工具步驟自己帶的呼叫補一個"
+    assert "⚠ 工具步驟沒有呼叫 id" in body and "⚠ 工具呼叫沒有 id" in body, "沒有呼叫 id：頁面上要標"
+    # --- ③ 父對話與子代理同一個 id：兩個結果都在
+    assert "AGPARENTRES" in body and "AGKIDRES" in body, "父對話與子代理同一個呼叫 id：兩邊的結果都要在"
+    assert "AGKIDTASK" in body and "sub-orphans" not in body, "子代理照樣接在觸發它的那一次呼叫底下"
+    assert "（無結果 / 已中斷）" not in body, "每一個呼叫都配到了結果"
+    # --- ④ 原始 id 本身長得像另編出來的內部 id（`x`、`x`、`x#2`）：三個結果各在自己的呼叫底下，一個都不少
+    assert [body.count(f"AGXRES{i}") for i in (1, 2, 3)] == [1, 1, 1], \
+        f"另編的內部 id 不可以撞到原始 id：{[body.count(f'AGXRES{i}') for i in (1, 2, 3)]}"
+    assert (body.index("echo XA") < body.index("AGXRES1") < body.index("echo XB") < body.index("AGXRES2")
+            < body.index("echo XC") < body.index("AGXRES3")), "每個結果在自己的呼叫底下"
+    # --- ⑤ 拆到一半的步驟不動配對表（自己一場：和上面那幾段的頁面分開）：模型回應那一支——結果用它自己帶的呼叫補一個
+    half = tmp / "half"
+    half.mkdir()
+    H = "2468abcd-0000-4000-8000-0000000000c3"
+    ag_write_db(half / f"{H}.db", H, [
+        ag_user(0, "AGHALFQ"),
+        # 模型回應拆到一半（用量的欄位 wire type 不對）：它的呼叫沒有畫出來，也不可以留在配對表裡
+        (15, 3, pbv(1, 15) + pbv(4, 3) + ag_meta(1, pbm(9, pbv(1, 1035), _pb_key(2, 5) + b"ABCD"))
+         + pbm(20, pbm(7, pbs(1, "zz"), pbs(2, "run_command"), pbs(3, json.dumps({"CommandLine": "echo ZZ"}))))),
+        ag_generic(2, "zz", "run_command", {"CommandLine": "echo ZZ"}, result="AGZZRES"),
+        # 工具結果拆到一半（結果文字的 wire type 不對）：它不可以先把呼叫配掉，下一個同 id 的結果才配得回去
+        ag_planner(3, calls=[("yy", "run_command", {"CommandLine": "echo YY"})], usage=(10, 5, 0)),
+        (132, 3, pbv(1, 132) + pbv(4, 3)
+         + ag_meta(4, pbm(4, pbs(1, "yy"), pbs(2, "run_command"), pbs(3, json.dumps({"CommandLine": "echo YY"}))))
+         + pbm(140, pbm(2, _pb_key(1, 5) + b"WXYZ"))),
+        ag_generic(5, "yy", "run_command", {"CommandLine": "echo YY"}, result="AGYYRES"),
+    ])
+    _ag_build(half, tmp / "out-half")
+    body = _page_body(_session_pages(tmp / "out-half")[0].read_text(encoding="utf-8"))
+    assert body.count("⚠ 拆不開的步驟") == 2, "拆到一半的兩步照樣標「拆不開的步驟」"
+    zz, yy = "run_command · echo ZZ", "run_command · echo YY"
+    assert body.count("AGZZRES") == 1 and body.count(zz) == 1, \
+        f"拆到一半的模型回應不可以留下配對：結果要在、呼叫補一個（{body.count('AGZZRES')}, {body.count(zz)}）"
+    # --- ⑤b 工具結果那一支——拆不開的那一步沒有把呼叫配掉，下一個結果配回原本的呼叫（不另補一個）
+    assert body.count("AGYYRES") == 1 and body.count(yy) == 1, \
+        f"拆到一半的工具結果不可以先配掉呼叫：{body.count('AGYYRES')}, {body.count(yy)}"
+    assert body.index("echo YY") < body.index("AGYYRES")
+    assert "（無結果 / 已中斷）" not in body, "原本的呼叫配到了結果"
+    print("OK: antigravity tool pairing test passed")
+
+
+def test_antigravity_identity(tmp_path=None):
+    """一場 Antigravity 對話的身分：
+
+    ① 同一個對話 id 兩個檔（同步工具的衝突副本、手動備份）：各自一列、各自一頁（不互相蓋掉），
+       檔名不是 `<對話 id>.db` 的那份在頁首與索引標「副本 <檔名>」；
+    ② `--ai-md` 用檔裡的對話 id 認人：檔名改過也找得到（給 id 的開頭）；
+    ③ 孤兒子代理（父對話不在）自己一列；父對話出現之後併進父對話那一頁，舊的那一列要消失——
+       帶 `--antigravity-source` 的建置算縮範圍、沿用舊紀錄，舊的那一列最容易留下來；
+    ④ `conversation_summaries.db` 給的子代理型別變了（子代理的檔沒變）：父對話那一頁要重建；
+    ⑤ 父對話的檔讀不起來：讀得起來的子代理不跟著它消失（自己一列）；父對話讀到一半才壞的，stderr 講出連帶的子代理；
+    ⑥ 兩個呼叫 id 清洗之後一樣：子代理的頁內錨點不撞號。"""
+    tmp = new_tmp(tmp_path)
+    # --- ① 同一個對話 id 兩個檔（父對話與子代理各有一份副本；副本的檔名排在本人前面）
+    src = tmp / "dup"
+    src.mkdir()
+    P, KD = "9999aaaa-0000-4000-8000-0000000000c1", "9998aaaa-0000-4000-8000-0000000000c2"
+    steps = [ag_user(0, "AGDUPQ"),
+             ag_planner(1, text="AGDUPRESP", calls=[("cd", "invoke_subagent", {"TypeName": "research"})],
+                        usage=(10, 5, 0)),
+             ag_generic(4, "cd", "invoke_subagent", {"TypeName": "research"}, result="ok")]
+    ag_write_db(src / f"{P}.db", P, steps)
+    ag_write_db(src / f"{P} (1).db", P, steps + [ag_user(5, "AGFORKQ")])
+    kid = [ag_system(2, "kid AGDUPKID", event="agent_message", src=(P, "cd", "invoke_subagent")),
+           ag_planner(3, text="AGDUPKIDRESP", usage=(1, 1, 0))]
+    ag_write_db(src / f"{KD}.db", KD, kid, parent=P, agent=("research", "Kid"))
+    # 子代理的副本自己接著跑過一步（分岔）：和本人一模一樣的那幾步在同一頁會被去重，只有分岔的那一步看得出它有沒有被併進來
+    ag_write_db(src / f"{KD} (1).db", KD, kid + [ag_planner(3, text="AGKIDFORK", usage=(1, 1, 0))],
+                parent=P, agent=("research", "Kid"))
+    out = tmp / "out-dup"
+    r = _ag_build(src, out)
+    assert "共 3 個 session" in r.stdout and "輸出檔名相同" not in r.stderr, \
+        "本人（併著子代理）、本人的副本、子代理的副本各一列：" + r.stdout + r.stderr
+    pages = _session_pages(out)
+    assert len(pages) == 3, f"同一個對話 id 的兩個檔：各自一頁、不互相蓋掉：{[p.name for p in pages]}"
+    htmls = [p.read_text(encoding="utf-8") for p in pages]
+    bodies = [_page_body(h) for h in htmls]
+    assert sum("AGFORKQ" in b for b in bodies) == 1 and sum("AGDUPRESP" in b for b in bodies) == 2, "兩頁各畫各的檔"
+    assert sum(f"副本 {P} (1).db" in b for b in bodies) == 1, "檔名不是對話 id 的那份標副本（頁首）"
+    assert all("同一場 Antigravity 對話的另一個檔" in h for h, b in zip(htmls, bodies) if "副本 " in b), \
+        "副本標記的說明講的是 Antigravity 的副本（不是 Claude 的跨機同步工具）"
+    orig = next(b for b in bodies if "AGDUPRESP" in b and "副本 " not in b)
+    assert orig.count("AGDUPKIDRESP") == 1, "子代理接到本人（不是排序在前的副本），而且只接一份"
+    assert "AGKIDFORK" not in orig, "子代理的副本不併進父對話（它自己一列）"
+    assert sum("AGKIDFORK" in b for b in bodies) == 1, "子代理的副本自己那一頁畫它自己的內容"
+    assert sum(f"副本 {KD} (1).db" in b for b in bodies) == 1, "子代理的副本自己一列"
+    assert f"副本 {P} (1).db" in (out / "index.html").read_text(encoding="utf-8"), "索引也標副本"
+    # --- ② --ai-md：改過名的檔
+    ren = tmp / "ren"
+    ren.mkdir()
+    R = "abcd1234-0000-4000-8000-0000000000d1"
+    ag_write_db(ren / "renamed.db", R, [ag_user(0, "AGRENQ"), ag_planner(1, text="AGRENRESP", usage=(1, 1, 0))])
+    r = subprocess.run([sys.executable, str(SCRIPT), "--no-claude", "--no-codex", "--antigravity-source",
+                        f"demo={ren}", "--out", str(tmp / "out-ren"), "--ai-md", "abcd1234"],
+                       capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"--ai-md 用檔裡的對話 id 認人（檔名改過）：{r.stderr}"
+    assert "AGRENRESP" in Path(r.stdout.strip()).read_text(encoding="utf-8")
+    # --- ③ 孤兒子代理 → 父對話出現之後併進去
+    orph = tmp / "orph"
+    orph.mkdir()
+    PA, KI = "7777aaaa-0000-4000-8000-0000000000e1", "8888bbbb-0000-4000-8000-0000000000e2"
+    ag_write_db(orph / f"{KI}.db", KI, [
+        ag_system(2, "kid task AGLATEKID", event="agent_message", src=(PA, "c1", "invoke_subagent")),
+        ag_planner(3, text="AGLATEKIDRESP", usage=(100, 10, 0))], parent=PA, agent=("research", "Late"))
+    oout = tmp / "out-orph"
+    r = _ag_build(orph, oout)
+    assert "共 1 個 session" in r.stdout and len(_manifest_rows(oout)) == 1, r.stdout
+    ag_write_db(orph / f"{PA}.db", PA, [
+        ag_user(0, "AGLATEPARENTQ"),
+        ag_planner(1, calls=[("c1", "invoke_subagent", {"TypeName": "research"})], usage=(10, 5, 0)),
+        ag_generic(4, "c1", "invoke_subagent", {"TypeName": "research"}, result="ok")])
+    r = _ag_build(orph, oout)
+    rows = _manifest_rows(oout)
+    assert len(rows) == 1, f"子代理併進父對話之後，它自己那一列要消失：{[x.get('title') for x in rows]}"
+    assert sum(x.get("tok_out", 0) for x in rows) == 15, \
+        f"產出只算一次（父 5＋子 10）：{[x.get('tok_out') for x in rows]}"
+    idx_md = (oout / "index.md").read_text(encoding="utf-8")
+    assert "AGLATEPARENTQ" in idx_md and "AGLATEKID" not in idx_md, idx_md
+    # --- ④ conversation_summaries.db 給的子代理型別
+    sm = tmp / "sm" / "conversations"
+    sm.mkdir(parents=True)
+    SP, SK = "3333dddd-0000-4000-8000-0000000000f1", "4444eeee-0000-4000-8000-0000000000f2"
+    ag_write_db(sm / f"{SP}.db", SP, [
+        ag_user(0, "AGSMQ"),
+        ag_planner(1, calls=[("cs", "invoke_subagent", {"TypeName": "x"})], usage=(1, 1, 0)),
+        ag_generic(4, "cs", "invoke_subagent", {"TypeName": "x"}, result="ok")])
+    ag_write_db(sm / f"{SK}.db", SK, [
+        ag_system(2, "t AGSMKID", event="agent_message", src=(SP, "cs", "invoke_subagent")),
+        ag_planner(3, text="AGSMKIDRESP", usage=(1, 1, 0))], parent=SP, agent=("", ""))
+    scon = sqlite3.connect(str(sm.parent / "conversation_summaries.db"))
+    scon.execute("create table conversation_summaries (conversation_id text primary key, title text,"
+                 " parent_conversation_id text, agent_name text)")
+    scon.execute("insert into conversation_summaries values (?, '', ?, 'AGENT_ONE')", (SK, SP))
+    scon.commit()
+    scon.close()
+    sout = tmp / "out-sm"
+    _ag_build(sm, sout)
+    page = _session_pages(sout)[0]
+    assert "子代理 AGENT_ONE" in _page_body(page.read_text(encoding="utf-8")), "子代理型別取 conversation_summaries.db"
+    scon = sqlite3.connect(str(sm.parent / "conversation_summaries.db"))
+    scon.execute("update conversation_summaries set agent_name = 'AGENT_TWO'")
+    scon.commit()
+    scon.close()
+    r = _ag_build(sm, sout)
+    assert "子代理 AGENT_TWO" in _page_body(page.read_text(encoding="utf-8")), \
+        "conversation_summaries.db 給的子代理型別變了，父對話那一頁要重建：" + r.stdout
+    # --- ⑤ 父對話的檔讀不起來：子代理不接到它（不然跟著一起讀不起來），自己一列
+    bp = tmp / "badparent"
+    bp.mkdir()
+    BPA, BKI = "1212aaaa-0000-4000-8000-000000000301", "3434bbbb-0000-4000-8000-000000000302"
+    (bp / f"{BPA}.db").write_bytes(b"not a database at all " * 64)
+    ag_write_db(bp / f"{BKI}.db", BKI, [
+        ag_system(2, "kid task AGBPKID", event="agent_message", src=(BPA, "c1", "invoke_subagent")),
+        ag_planner(3, text="AGBPKIDRESP", usage=(1, 1, 0))], parent=BPA, agent=("research", "Kid"))
+    r = _ag_build(bp, tmp / "out-bp")
+    pages = _session_pages(tmp / "out-bp")
+    assert len(pages) == 1 and "AGBPKIDRESP" in _page_body(pages[0].read_text(encoding="utf-8")), \
+        f"父對話讀不起來，子代理照樣自己一頁：{r.stdout}{r.stderr}"
+    assert "壞掉跳過 1" in r.stdout and f"{BPA}.db" in r.stderr, "讀不起來的父對話照樣講出來"
+    # --- ⑤b 父對話的身分讀得起來、步驟表才壞：子代理跟著它算壞掉（範圍限制），stderr 那一行要講出來
+    lp = tmp / "lateparent"
+    lp.mkdir()
+    LPA, LKI = "5656aaaa-0000-4000-8000-000000000303", "7878bbbb-0000-4000-8000-000000000304"
+    ag_write_db(lp / f"{LPA}.db", LPA, [
+        ag_user(0, "AGLPQ"), ag_planner(1, calls=[("c1", "invoke_subagent", {"TypeName": "x"})], usage=(1, 1, 0))])
+    con = sqlite3.connect(str(lp / f"{LPA}.db"))
+    con.execute("alter table steps drop column status")
+    con.commit()
+    con.close()
+    ag_write_db(lp / f"{LKI}.db", LKI, [
+        ag_system(2, "kid task AGLPKID", event="agent_message", src=(LPA, "c1", "invoke_subagent")),
+        ag_planner(3, text="AGLPKIDRESP", usage=(1, 1, 0))], parent=LPA, agent=("research", "Kid"))
+    r = _ag_build(lp, tmp / "out-lp")
+    assert "1 個子代理也沒有畫出來" in r.stderr, f"父對話讀到一半壞掉：stderr 要講出連帶的子代理：{r.stderr}"
+    # --- ⑥ 兩個呼叫 id 清洗之後一樣（`x.y`、`x-y`）：兩個子代理的頁內錨點不撞號，目錄的連結各指到自己那一個
+    an = tmp / "anchors"
+    an.mkdir()
+    AP, AK1, AK2 = ("9090aaaa-0000-4000-8000-000000000305", "9191bbbb-0000-4000-8000-000000000306",
+                    "9292cccc-0000-4000-8000-000000000307")
+    ag_write_db(an / f"{AP}.db", AP, [
+        ag_user(0, "AGANQ"),
+        ag_planner(1, calls=[("x.y", "invoke_subagent", {"TypeName": "a"}),
+                             ("x-y", "invoke_subagent", {"TypeName": "b"})], usage=(1, 1, 0)),
+        ag_generic(6, "x.y", "invoke_subagent", {"TypeName": "a"}, result="ok"),
+        ag_generic(7, "x-y", "invoke_subagent", {"TypeName": "b"}, result="ok")])
+    for kid_id, call, word, t0 in ((AK1, "x.y", "AGANKID1", 2), (AK2, "x-y", "AGANKID2", 4)):
+        ag_write_db(an / f"{kid_id}.db", kid_id, [
+            ag_system(t0, f"task {word}", event="agent_message", src=(AP, call, "invoke_subagent")),
+            ag_planner(t0 + 1, text=word + "RESP", usage=(1, 1, 0))], parent=AP, agent=("research", word))
+    _ag_build(an, tmp / "out-an")
+    html = _session_pages(tmp / "out-an")[0].read_text(encoding="utf-8")
+    sub_ids = re.findall(r'<details id="(sub-[^"]+)"', html)
+    assert len(sub_ids) == 2 and len(set(sub_ids)) == 2, f"兩個子代理的錨點不撞號：{sub_ids}"
+    links = re.findall(r"openSub\('(sub-[^']+)'\)", html)
+    assert sorted(links) == sorted(sub_ids), f"目錄的連結各指到自己那一個子代理：{links} vs {sub_ids}"
+    for sid_, word in zip(sub_ids, ("AGANKID1", "AGANKID2")):
+        block = html[html.index(f'<details id="{sid_}"'):]
+        assert word + "RESP" in block[:block.index("</details>")], f"{sid_} 那一框是它自己的子代理"
+    print("OK: antigravity identity test passed")
+
+
+def test_antigravity_page_marks(tmp_path=None):
+    """紀錄裡不對勁的地方頁面上看得到（不只 stderr）；使用者原文照原樣；不畫紀錄裡沒有的量。
+
+    ① 認不得的步驟狀態、步驟型別欄與內容不一致、沒有時刻、取不出文字的使用者輸入、子代理讀不起來：頁面上各標一列；
+    ② 工具結果附的圖片／檔案畫佔位（「🖼️ 圖片」），不是只在 stderr；
+    ③ 使用者原文裡的 `<system-reminder>…</system-reminder>`、`<command-name>…</command-name>` 是他打的字：
+       頁面、MD、精簡版都照原樣（不剝、不畫成指令列），也照原樣當標題；
+    ④ 字串欄位放的是 fixed32（wire type 對不上）：算拆不開，不當成正常的發言；
+    ⑤ 回合與逐步的 token 細分不畫「寫入」（紀錄裡沒有快取寫入量：那一格不是 0，是不知道）；
+    ⑥ 完整版 MD 工具框的 `<summary>`：原文（檔案路徑）破不出那個元素；
+    ⑦ 沒有文字、思考或工具呼叫的模型回應：標出來、用量照算；
+    ⑧ 模型回應的狀態不是完成（還沒跑完、被取消、出錯、被打斷）：那一則的最後標出來，不畫得和完成的一樣；
+       別種步驟（使用者輸入、系統訊息、錯誤、壓縮點）的狀態不是完成：那一步之後標一列、也出聲。"""
+    tmp = new_tmp(tmp_path)
+    src = tmp / "conversations"
+    src.mkdir()
+    M, BAD = "5555aaaa-0000-4000-8000-000000000101", "6666bbbb-0000-4000-8000-000000000102"
+    lit = "<system-reminder>AGLITERAL</system-reminder> 與 <command-name>/AGFOO</command-name>"
+    hostile = "</summary><img src=x onerror=alert(1)><summary>"
+    ag_write_db(src / f"{M}.db", M, [
+        ag_user(0, lit),
+        ag_planner(1, text="AGRESP0", calls=[("cimg", "view_file", {"AbsolutePath": "/home/demo/pic.png"}),
+                                             ("chost", "view_file", {"AbsolutePath": hostile}),
+                                             ("cnl", "view_file", {"AbsolutePath": "/x" + chr(10) * 2 + "## AGBROKE"}),
+                                             ("cbad", "invoke_subagent", {"TypeName": "research"})],
+                   usage=(1000, 100, 2000)),
+        (132, 3, pbv(1, 132) + pbv(4, 3)
+         + ag_meta(2, pbm(4, pbs(1, "cimg"), pbs(2, "view_file"), pbs(3, json.dumps({"AbsolutePath": "/home/demo/pic.png"}))))
+         + pbm(140, pbm(2, pbs(1, "AGIMGRES"), pbm(4, pbs(1, "png"))))),
+        ag_generic(3, "chost", "view_file", {"AbsolutePath": hostile}, result="AGHOSTRES"),
+        ag_generic(3, "cnl", "view_file", {"AbsolutePath": "/x" + chr(10) * 2 + "## AGBROKE"}, result="AGNLRES"),
+        ag_generic(4, "cbad", "invoke_subagent", {"TypeName": "research"}, result="ok"),
+        (15, 99, pbv(1, 15) + pbv(4, 99) + ag_meta(5) + pbm(20, pbs(1, "AGSTATUS99"))),     # 認不得的狀態
+        (15, 3, ag_user(6, "AGMISMATCH")[2]),                                                 # 型別欄 15、內容是 14
+        (15, 3, pbv(1, 15) + pbv(4, 3) + pbm(5) + pbm(20, pbs(1, "AGNOTIME"))),               # 沒有時刻
+        (14, 3, pbv(1, 14) + pbv(4, 3) + ag_meta(8) + pbm(19, pbv(6, 1))),                    # 取不出文字
+        (14, 3, pbv(1, 14) + pbv(4, 3) + ag_meta(9) + pbm(19, _pb_key(2, 5) + b"Q7Z9")),     # 字串欄位放 fixed32
+        ag_planner(10, text="AGRESP1", usage=(10, 5, 0)),
+        ag_user(11, "<system-reminder>AGONLYWRAP</system-reminder>"),                         # 整則只有那個標籤
+        ag_planner(12, text="AGRESP2", usage=(10, 5, 0)),
+        (15, 3, pbv(1, 15) + pbv(4, 3)                                                          # 沒有內容、有用量
+         + ag_meta(13, pbm(9, pbv(1, 1035), pbv(2, 100), pbv(3, 7), pbv(5, 50))) + pbm(20)),
+        ag_planner(14, text="AGAFTEREMPTY", usage=(10, 3, 0)),
+        # ⑧ 模型回應的狀態不是完成：還沒跑完（RUNNING）、被取消、出錯、被打斷
+        *[(15, st, pbv(1, 15) + pbv(4, st) + ag_meta(15 + i) + pbm(20, pbs(1, f"AGST{st}")))
+          for i, st in enumerate((2, 6, 7, 12))],
+        # ⑧ 別種步驟（這裡是使用者輸入）的狀態不是完成
+        (14, 6, pbv(1, 14) + pbv(4, 6) + ag_meta(19) + pbm(19, pbs(2, "AGUSERCANCEL"))),
+    ])
+    # 讀不起來的子代理：認得出父子（第一步與後設資料都在），步驟表少一欄
+    ag_write_db(src / f"{BAD}.db", BAD, [
+        ag_system(3, "bad kid", event="agent_message", src=(M, "cbad", "invoke_subagent"))],
+        parent=M, agent=("research", "Broken"))
+    con = sqlite3.connect(str(src / f"{BAD}.db"))
+    con.execute("alter table steps drop column status")
+    con.commit()
+    con.close()
+    out = tmp / "out"
+    r = _ag_build(src, out)
+    page = _session_pages(out)[0]
+    html = page.read_text(encoding="utf-8")
+    body, md = _page_body(html), page.with_suffix(".md").read_text(encoding="utf-8")
+    # --- ①
+    for label in ("⚠ 認不得的步驟狀態", "⚠ 步驟型別不一致", "⚠ 步驟沒有時刻", "⚠ 取不出文字的使用者輸入", "⚠ 子代理讀不起來"):
+        assert label in body and label in md, f"頁面（與 MD）要標：{label}"
+    for needle in ("認不得的步驟狀態 99", "型別不一致", "沒有時刻", "取不出文字", "子代理"):
+        assert needle in r.stderr, f"要出聲：{needle}｜{r.stderr}"
+    assert body.index("AGSTATUS99") < body.index("⚠ 認不得的步驟狀態"), "標在那一步的位置（畫完那一步之後）"
+    # --- ②
+    assert "🖼️ 圖片" in body and "工具結果附的圖片" in r.stderr, "工具結果附的圖片：頁面上畫佔位"
+    # --- ③（⚠ 這一則也是標題：頁首、MD 與精簡版的檔頭都有這段字，斷言只看回合的內文）
+    lit_html = "&lt;system-reminder&gt;AGLITERAL&lt;/system-reminder&gt; 與 &lt;command-name&gt;/AGFOO&lt;/command-name&gt;"
+    assert f"<p>{lit_html}</p>" in body, "使用者原文照原樣（頁面）：不剝、不畫成指令列"
+    assert f"\n\n{lit}\n" in md, "使用者原文照原樣（MD）"
+    assert "<p>&lt;system-reminder&gt;AGONLYWRAP&lt;/system-reminder&gt;</p>" in body, \
+        "整則只有那個標籤的發言也照原樣畫（不當雜訊丟掉）"
+    rows = _manifest_rows(out)
+    assert rows and rows[0]["title"].startswith("<system-reminder>AGLITERAL"), f"標題照原樣：{rows[0]['title']}"
+    r2 = subprocess.run([sys.executable, str(SCRIPT), "--no-claude", "--no-codex", "--antigravity-source",
+                         f"demo={src}", "--out", str(out), "--ai-md", "5555aaaa"],
+                        capture_output=True, text=True, encoding="utf-8")
+    assert r2.returncode == 0, r2.stderr
+    ai = Path(r2.stdout.strip()).read_text(encoding="utf-8")
+    assert lit in ai[ai.index("\n---\n"):], "使用者原文照原樣（精簡版）"
+    # --- ④
+    assert "Q7Z9" not in body and "Q7Z9" not in md, "wire type 對不上的字串欄位不當成發言"
+    assert "⚠ 拆不開的步驟" in body
+    # --- ⑤
+    assert 'class="meter m-cw"' not in html, "Antigravity 的頁面不畫「寫入」徽章（紀錄裡沒有這個量）"
+    # --- ⑥
+    # （工具框裡的輸入原文是在 fence 裡，照原樣是對的；要擋的是 `<summary>` 那一行）
+    exp = "<details><summary>🔧 view_file · &lt;/summary>&lt;img src=x onerror=alert(1)>&lt;summary></summary>"
+    assert exp in md.splitlines(), \
+        f"MD 工具框的 <summary> 破不出去：{[ln for ln in md.splitlines() if ln.startswith('<details><summary>🔧')]}"
+    assert "AGHOSTRES" in md
+    assert "<details><summary>🔧 view_file · /x ## AGBROKE</summary>" in md.splitlines(), \
+        "<summary> 裡的斷行壓成空格（空行會讓後面的字跑出那個元素）"
+    # --- ⑦ 沒有文字、思考或工具呼叫的模型回應：頁面上那一步標出來；它的用量照算，整場的產出等於各回合產出的和
+    assert "⚠ 沒有內容的模型回應" in body and "⚠ 沒有內容的模型回應" in md, "沒有內容的模型回應：頁面上要標"
+    assert "模型回應沒有內容" in r.stderr, "沒有內容的模型回應：要出聲"
+    sys.path.insert(0, str(ROOT))
+    import ai_session_viewer as v
+    sess = v.load_antigravity_session(src / f"{M}.db")
+    v.analyze(sess)
+    turn_out = sum(g["u"]["output"] for g in sess.main_groups if g.get("u"))
+    assert sess.tok_out == turn_out, f"整場的產出（{sess.tok_out}）要等於各回合的和（{turn_out}）"
+    # --- ⑧ 狀態不是完成的模型回應：那一則的最後標出來（HTML、MD、精簡版）；完成的不標
+    mark = "⚠ 模型回應的狀態不是完成"
+    assert body.count(mark) == 4 and md.count(mark) == 4, f"四則狀態不是完成的各標一次：{body.count(mark)}, {md.count(mark)}"
+    for st, why in ((2, "還沒跑完"), (6, "被取消"), (7, "出錯"), (12, "被打斷")):
+        at = body.index(f"AGST{st}")
+        assert at < body.index(mark, at) < body.index(why, at), f"狀態 {st}：標在那一則之後、講出是哪一種"
+    assert ai.count(mark) == 4, "精簡版也標"
+    assert mark not in body[:body.index("AGST2")], "完成的模型回應不標"
+    # --- ⑧b 別種步驟（使用者輸入）的狀態不是完成：那一步之後標一列、也出聲
+    smark = "⚠ 步驟的狀態不是完成"
+    assert body.count(smark) == 1 and smark in md and body.index("AGUSERCANCEL") < body.index(smark), \
+        "別種步驟的狀態不是完成：那一步之後標出來"
+    assert "步驟的狀態不是完成（被取消" in r.stderr, "別種步驟的狀態不是完成：要出聲"
+    print("OK: antigravity page marks test passed")
+
+
+def test_antigravity_tools_scoped_to_source(tmp_path=None):
+    """Antigravity 的工具名表只對 Antigravity 的呼叫生效，其他來源照舊：
+
+    ① Claude 的紀錄裡剛好有同名的工具（MCP 伺服器常見的 `read_file`、`run_command`、`write_file`）：
+       摘要只畫工具名，精簡版照一般工具畫（輸入與輸出都留），不套 Antigravity 的參數名；
+    ② Claude 事件帶著 `_special` 欄位：不畫成通知列（那是 Antigravity 載入器的欄位，不是 Claude 紀錄裡的東西）；
+    ③ 共用的 `md_to_html`：程式碼區塊的語言字串照屬性跳脫，破不出 `class` 屬性。"""
+    sys.path.insert(0, str(ROOT))
+    import ai_session_viewer as v
+    tmp = new_tmp(tmp_path)
+    proj = tmp / "projects" / "scope-proj"
+    proj.mkdir(parents=True)
+    sid = "5c0e0000-0000-4000-8000-0000000005c0"
+
+    def q(t, uuid_, content, **kw):
+        return dict({"type": "user", "uuid": uuid_, "timestamp": t, "cwd": "/x/Scope", "sessionId": sid,
+                     "message": {"role": "user", "content": content}}, **kw)
+
+    def a(t, mid, content):
+        return {"type": "assistant", "uuid": f"a-{mid}", "timestamp": t, "sessionId": sid,
+                "message": {"role": "assistant", "model": "claude-opus-4-8", "id": mid, "content": content,
+                            "usage": {"input_tokens": 3, "output_tokens": 4}}}
+
+    ev = [q("2026-10-01T01:00:00.000Z", "u1", "CLAUDEQ", _special={"type": "_notify", "label": "X",
+                                                                   "summary": "INJECTED_NOTIFY"}),
+          a("2026-10-01T01:00:01.000Z", "m1", [
+              {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"Path": "/demo/a"}},
+              {"type": "tool_use", "id": "t2", "name": "run_command", "input": {"CommandLine": "ls -la"}},
+              {"type": "tool_use", "id": "t3", "name": "write_file", "input": {"Path": "/demo/b", "Content": "x"}}]),
+          q("2026-10-01T01:00:02.000Z", "u2", [
+              {"type": "tool_result", "tool_use_id": "t1", "content": "CLAUDEBODY1"},
+              {"type": "tool_result", "tool_use_id": "t2", "content": "CLAUDEBODY2"},
+              {"type": "tool_result", "tool_use_id": "t3", "content": "CLAUDEBODY3"}]),
+          q("2026-10-01T01:00:03.000Z", "u3", [{"type": "_notify", "label": "SPOOF", "summary": "NOTICE",
+                                               "raw": "BODY"}]),
+          q("2026-10-01T01:00:04.000Z", "u4", [{"type": "_notify", "label": "SPOOFP", "raw": "B2"}])]
+    f = proj / f"{sid}.jsonl"
+    f.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in ev), encoding="utf-8")
+    s = v.load_session(f, "scope-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s)
+    s.out_html, s.out_md, s.mem_href = "claude-code/demo/x.html", "claude-code/demo/x.md", ""
+    body = _page_body(v.render_session_html(s, "../../../index.html", ""))
+    md = v.render_session_md(s)
+    ai = v.render_session_ai_md(s)
+    # --- ①
+    for name, shown in (("read_file", "/demo/a"), ("run_command", "ls -la"), ("write_file", "/demo/b")):
+        assert f"{name} · {shown}" not in body and f"{name} · {shown}" not in md, f"Claude 的 {name}：摘要只畫工具名"
+        assert f"{name} · {shown}" not in ai, f"Claude 的 {name}：精簡版也只畫工具名"
+    for body_txt in ("CLAUDEBODY1", "CLAUDEBODY2", "CLAUDEBODY3"):
+        assert body_txt in ai, f"Claude 的同名工具在精簡版照一般工具畫（輸出要留）：{body_txt}"
+    assert "內容略" not in ai and "寫入 1 行" not in ai, "Claude 的同名工具不套 Antigravity 的讀檔／寫檔分類"
+    assert v.tool_summary("read_file", {"Path": "/demo/a"}) == "read_file"
+    assert v.tool_summary("read_file", {"Path": "/demo/a"}, ag=True) == "read_file · /demo/a"
+    # --- ②
+    assert "INJECTED_NOTIFY" not in body and "CLAUDEQ" in body, "Claude 事件的 _special 欄位不畫成通知列"
+    # --- ③
+    h = v.md_to_html('```x" onmouseover="alert(1)\nA\n```')
+    # （③ 的另一半）Claude 事件的 `_notify` 區塊帶著 `label`：標籤照舊是「背景任務」（label 是 Antigravity 載入器的欄位）
+    assert "SPOOF" not in body and "SPOOF" not in md and "SPOOF" not in ai, "Claude 事件的 _notify 區塊不認 label"
+    assert "_⚙ 背景任務 · NOTICE_" in md, "Claude 的通知列照舊是「背景任務」"
+    assert 'onmouseover="' not in h and "language-x&quot; onmouseover=&quot;alert(1)" in h, h
+    print("OK: antigravity tools scoped to source test passed")
+
+
+def test_antigravity_tree_deep_and_tmp_mode(tmp_path=None):
+    """① 父子鏈很深（資料壞掉或刻意造的）：排樹不撞 Python 的遞迴上限——那個例外發生在每一場的例外處理之外，
+       整批建置會停下來；
+    ② `_ag_connect` 複製用的暫存目錄：Windows 上不用 0o700 建（Python 3.13 起那會換成一份不繼承的權限，
+       沙箱化的行程連自己開的目錄都寫不進去）；POSIX 上要 0o700（`/tmp` 是大家共用的）；
+    ③ 別人給的檔裡 `steps` 是跑不完的檢視表：只有那一場讀不起來，整批不卡住；
+    ④ 執行預算用完就中止查詢。"""
+    sys.path.insert(0, str(ROOT))
+    import ai_session_viewer as v
+    tmp = new_tmp(tmp_path)
+    # --- ① 不讀檔：換掉讀身分的那一支，直接給一條很深的父子鏈
+    n = sys.getrecursionlimit() + 500
+    infos = {f"c{i}": {"id": f"c{i}", "path": Path(f"c{i}.db"), "parent": f"c{i - 1}" if i else "", "call": "",
+                       "agent": "", "agent_name": "", "cwd": "", "branch": ""} for i in range(n)}
+    real_info = v.antigravity_conv_info
+    v.antigravity_conv_info = lambda p: dict(infos[Path(p).stem])
+    try:
+        roots, tree = v.antigravity_tree([Path(f"c{i}.db") for i in range(n)])
+    finally:
+        v.antigravity_conv_info = real_info
+    assert len(roots) == 1 and len(tree[str(roots[0]["path"])]) == n - 1, "很深的父子鏈：每一場都在"
+    # --- ② 暫存目錄的權限
+    live, wsrc = tmp / "live", tmp / "wsrc"
+    live.mkdir()
+    wsrc.mkdir()
+    D = "0d0d0d0d-0000-4000-8000-000000000201"
+    wcon = ag_write_db(live / f"{D}.db", D, [ag_user(0, "AGMODEQ")], wal_conn=True)
+    try:
+        for suf in ("", "-wal"):
+            shutil.copyfile(live / f"{D}.db{suf}", wsrc / f"{D}.db{suf}")
+    finally:
+        wcon.close()
+    modes = []
+    real_mkdir = Path.mkdir
+
+    def spy(self, mode=0o777, parents=False, exist_ok=False):
+        modes.append(mode)
+        return real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    Path.mkdir = spy
+    try:
+        con, tdir = v._ag_connect(wsrc / f"{D}.db")
+    finally:
+        Path.mkdir = real_mkdir
+    try:
+        assert tdir is not None and con.execute("select count(*) from steps").fetchone()[0] == 1
+    finally:
+        v._ag_close(con, tdir)
+    assert modes == [0o777 if os.name == "nt" else 0o700], f"暫存目錄的權限：{[oct(m) for m in modes]}"
+    # --- ③ 別人給的檔：`steps` 是一段永遠跑不完的遞迴查詢（檢視表）——這一場讀不起來，整批照樣建完、不卡住
+    hv = tmp / "hostile"
+    hv.mkdir()
+    HV, GD = "4545aaaa-0000-4000-8000-000000000401", "4646bbbb-0000-4000-8000-000000000402"
+    ag_write_db(hv / f"{HV}.db", HV, [ag_user(0, "AGHVQ")])
+    con = sqlite3.connect(str(hv / f"{HV}.db"))
+    con.executescript("drop table steps; create view steps as with recursive n(x) as (values(1) union all"
+                      " select x + 1 from n) select x as idx, 14 as step_type, 3 as status, null as step_payload from n;")
+    con.close()
+    ag_write_db(hv / f"{GD}.db", GD, [ag_user(0, "AGGOODQ"), ag_planner(1, text="AGGOODRESP", usage=(1, 1, 0))])
+    try:
+        r = subprocess.run([sys.executable, str(SCRIPT), "--no-claude", "--no-codex", "--antigravity-source",
+                            f"demo={hv}", "--out", str(tmp / "out-hv")],
+                           capture_output=True, text=True, encoding="utf-8", timeout=120)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("一個檔的 steps 是跑不完的查詢：整批建置卡住了")
+    assert r.returncode == 0 and "壞掉跳過 1" in r.stdout, r.stdout + r.stderr
+    assert "不是資料表：steps（view）" in r.stderr, "讀不起來的原因要講出是哪一個名字不是資料表：" + r.stderr
+    assert any("AGGOODRESP" in p.read_text(encoding="utf-8") for p in _session_pages(tmp / "out-hv")), \
+        "旁邊那一場照樣建出來"
+    # --- ④ 執行預算：一個連線跑超過上限就中止當下那一句（真實的檔遠碰不到上限；這裡把上限調到 0 看它真的會擋）
+    real_budget = getattr(v, "AG_SQL_BUDGET", 0)
+    v.AG_SQL_BUDGET = 0
+    try:
+        BG = "4747aaaa-0000-4000-8000-000000000403"
+        ag_write_db(tmp / f"{BG}.db", BG, [ag_user(i, f"q{i}") for i in range(3000)])
+        try:
+            v._ag_events(tmp / f"{BG}.db", BG, "", v.collections.Counter())
+        except sqlite3.OperationalError as e:
+            assert "interrupted" in str(e), e
+        else:
+            raise AssertionError("執行預算用完了，查詢要被中止")
+    finally:
+        v.AG_SQL_BUDGET = real_budget
+    print("OK: antigravity tree deep and tmp mode test passed")
 
 
 if __name__ == "__main__":
@@ -10633,3 +11571,10 @@ if __name__ == "__main__":
     test_ask_user_question()
     test_sync_conflict_copies()
     test_renderer_version_pinned()
+    test_antigravity()
+    test_antigravity_tree_cycle()
+    test_antigravity_tool_pairing()
+    test_antigravity_identity()
+    test_antigravity_page_marks()
+    test_antigravity_tools_scoped_to_source()
+    test_antigravity_tree_deep_and_tmp_mode()

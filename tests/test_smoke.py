@@ -615,6 +615,9 @@ def test_ai_md(tmp_path=None):
                                                 + PS + "- 🔧 輸出PS假的工具行\n~~~~python\n沒關的 fence"}]),
         tool(17, "t8", "AskUserQuestion", {"questions": [{"question": "要哪一個QASK？"}]}),
         res(18, "t8", "使用者選了ANSWERMARK" + "答" * 9000 + "ANSWEREND"),
+        # 輸入的形狀認不得（多了一個鍵）：不畫成卡片、照原樣交代；使用者的回答一樣全留
+        tool(18, "t8b", "AskUserQuestion", {"questions": [{"question": "形狀認不得QODD？"}], "extra": 1}),
+        res(18, "t8b", "ODDREPLYHEAD" + "答" * 9000 + "ODDREPLYTAIL"),   # 記號不可以含上一筆的記號：舊的斷言會被這一筆滿足
         tool(19, "t9", "TodoWrite", {"todos": [
             # 項目帶 ~~~（不包起來就一路吞到檔尾）與 ```（包起來的 fence 要比它長）
             {"content": "做完TODOMARK\n~~~\n待辦的第二行\n```", "status": "in_progress", "activeForm": "正在做ACTIVEFORM"},
@@ -641,7 +644,7 @@ def test_ai_md(tmp_path=None):
         ev("user", "壓縮後的問題QAFTER。\r- 🔧 CR訊息假的工具行\n```text\n沒關的訊息 fence\n``` 不是結尾", 1810),
         ev("assistant", [{"type": "text", "text": "## 助手的標題\n收到。"}], 1812),
     ]
-    n_tools = 16
+    n_tools = 17
     (proj / f"{sid}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
 
     def run(*extra):
@@ -759,7 +762,9 @@ def test_ai_md(tmp_path=None):
     assert "- [custom  status] 保留  兩個空白EXACT" in md, "待辦的文字與狀態照原值（空白一個都不動）"
     tc = tl("TaskCreate")
     assert "subject=SUBJ  TWO" in md and "description=做某事DESC" in tc, f"TaskCreate 的欄位照原值、沒畫的要標：{tc}"
-    assert "ANSWEREND" in md, "使用者的回答全留（不截）"
+    assert "ANSWERMARK" + "答" * 9000 + "ANSWEREND" in md, "使用者的回答全留（不截）"
+    assert "QODD" in md and "ODDREPLYHEAD" + "答" * 9000 + "ODDREPLYTAIL" in md, \
+        "使用者的回答全留（不截）：輸入的形狀認不得、照原樣交代的那一種也一樣"
     assert json.dumps("main\n```\nBRANCHFENCE", ensure_ascii=False) in md.split("## 目錄")[0], (
         "檔頭的分支有斷行就寫成 JSON 字串（一行、字一個不少）")
 
@@ -11630,6 +11635,159 @@ def test_antigravity_incremental_edges(tmp_path=None):
     print("OK: antigravity incremental edges test passed")
 
 
+# ── 掃原始碼的兩格（已知會打錯的字；審查輪次的代號與規劃筆記目錄的指標）共用的讀法 ──
+_UNESC_RE = re.compile(r"\\+(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))")
+
+
+def _unesc(line):
+    """`\\uXXXX`／`\\UXXXXXXXX` 跳脫解開成字（內嵌進頁面的 JS 字串與註解，原始碼裡常寫成這種形式）。"""
+    def one(m):
+        cp = int(m.group(1) or m.group(2), 16)
+        return chr(cp) if cp <= 0x10FFFF else m.group(0)
+    return _UNESC_RE.sub(one, line)
+
+
+def _scan_lines(files, root=ROOT):
+    """逐行給 `(位置, 那一行, 跳脫解開之後的那一行)`：兩種寫法都要比，寫成哪一種都躲不掉；逐行解開，行號才對得上原始碼。
+
+    只照換行字元切（讀檔時 `\\r\\n`／`\\r` 已經換成 `\\n`）：`splitlines()` 連 U+2028 這類分隔字元也切，註解裡有一個，後面的行號就全部錯開。"""
+    return [(f"{p.relative_to(root).as_posix()}:{n}", line, _unesc(line))
+            for p in files for n, line in enumerate(p.read_text(encoding="utf-8").split("\n"), 1)]
+
+
+def _scan_probe_file(tmp, lines):
+    """對照組走真的掃描流程：把幾行寫進暫存檔再用 `_scan_lines` 讀回來（直接組 tuple 的話，掃描那一段不解碼也不會紅）。"""
+    f = tmp / "probe.py"
+    f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return _scan_lines([f], root=tmp)
+
+
+def _scan_required():
+    """一定要掃到的：產品碼與 `tests/`（突變檢驗的副本、dist、dev 三處都有）。少一個就是少掃一個，而那很安靜 ⇒ 先斷言。"""
+    files = [SCRIPT, *sorted((ROOT / "tests").glob("*.py"))]
+    assert SCRIPT.is_file() and len(files) >= 2, f"掃描範圍不完整：{[str(p) for p in files]}"
+    return files
+
+
+def _assert_scanned(lines):
+    """掃到的行來自哪些檔：產品碼與這個測試檔一定要在裡面（總行數擋不住「少掃一個檔」——剩下的檔照樣超過門檻）。"""
+    seen = {where.rsplit(":", 1)[0] for where, _, _ in lines}
+    need = {p.relative_to(ROOT).as_posix() for p in (SCRIPT, Path(__file__).resolve())}
+    assert need <= seen, f"掃描範圍少了：{sorted(need - seen)}"
+
+
+def _esc_all(s, width):
+    """每一個字都寫成跳脫形式（`width` 4 ⇒ 反斜線 u 加四碼，8 ⇒ 反斜線 U 加八碼）：對照組三種寫法各比一次，解碼器少認一種就紅。"""
+    tag = "u" if width == 4 else "U"
+    return "".join(chr(92) + tag + format(ord(c), f"0{width}x") for c in s)
+
+
+# 已知會打錯的字（形近、輸入法選錯）：一筆一個碼點，旁邊寫本來要打的字。名單只會長大，遇到新的一種就加一筆。
+# ⚠ 用碼點寫，不要寫字面：這一格也會掃到這個檔。
+_KNOWN_TYPOS = {
+    0x932E: "錨（U+9328）",
+}
+
+
+def _typo_hits(lines):
+    return [f"{where}: U+{cp:04X}（要打的是 {want}）"
+            for where, line, dec in lines for cp, want in _KNOWN_TYPOS.items()
+            if chr(cp) in line or chr(cp) in dec]
+
+
+def test_no_known_typo_chars(tmp_path=None):
+    """原始碼與公開文件裡不可以有已知會打錯的字。
+
+    錯字不會讓任何測試變紅，而這個 repo 常常拿中文字串搜尋自己的註解——打錯的那幾處會被安靜漏掉。
+    一定掃：產品碼與 `tests/`。有的話也掃：`README.md`、`CONTRIBUTING.md`、`docs/`、`scripts/`
+    （突變檢驗的副本只帶產品碼與 `tests/`；公開的 repo 沒有 `scripts/`）。"""
+    files = _scan_required()
+    files += [p for p in (ROOT / "README.md", ROOT / "CONTRIBUTING.md") if p.is_file()]
+    if (ROOT / "docs").is_dir():
+        files += sorted((ROOT / "docs").rglob("*.md"))
+    if (ROOT / "scripts").is_dir():
+        files += sorted(p for p in (ROOT / "scripts").rglob("*") if p.suffix in (".py", ".js", ".sh", ".ps1"))
+    lines = _scan_lines(files)
+    assert len(lines) > 10_000, f"掃到的行數不合理（{len(lines)}）：範圍是不是空的"
+    _assert_scanned(lines)
+    bad = _typo_hits(lines)
+    assert not bad, "⚠ 原始碼裡有已知會打錯的字：" + "；".join(bad[:8])
+    # 對照組（走真的掃描流程）：字面與兩種跳脫寫法都抓得到、對的字放過、行號照實（前面那一行夾著 U+2028 也不錯開）
+    probe = _scan_probe_file(new_tmp(tmp_path), [
+        "# 分隔字元" + chr(0x2028) + "不算換行", "x = 1  # 錨點" + chr(0x932E),
+        "y = 1  # " + _esc_all(chr(0x932E), 4), "z = 1  # " + _esc_all(chr(0x932E), 8), "w = 1  # 錨點"])
+    assert [h.split("（")[0] for h in _typo_hits(probe)] == [f"probe.py:{n}: U+932E" for n in (2, 3, 4)], _typo_hits(probe)
+    print("OK: no known typo chars test passed")
+
+
+def _history_patterns():
+    """`(哪一種, 樣式)`。⚠ 樣式用拼接組出來：這一格也會掃到這個檔，寫成字面就會掃到自己。
+
+    邊界只認 ASCII 的識別字字元（`L`／`R`）：`\b` 把中文字也當成字，緊貼在中文後面的代號會被放過。
+    規劃筆記目錄要是一整段目錄名（前面不接英數、`_`、`-`、`.`）。合法的只放過確切的 `no-`／`cache-` 接 `codex`，不是整個前綴。"""
+    fam, cdx = "fa" + "m", "co" + "dex"
+    L, R = r"(?<![A-Za-z0-9_])", r"(?![A-Za-z0-9_])"
+    legit = r"(?!(?:no|cache)-" + cdx + r"(?![A-Za-z0-9_]|-r\d))"   # 後面接輪次（`-r2`）的就不是那個合法寫法
+    return [
+        ("指向規劃筆記目錄", re.compile(r"(?<![A-Za-z0-9_.-])" + re.escape("plan" + "ning/"))),
+        ("版號＋家族的輪次代號", re.compile(L + r"v\d+-(?:" + fam + "|" + cdx + r"|l\d)")),
+        ("塊名＋家族的輪次代號", re.compile(L + legit + r"[a-z0-9]+-(?:" + fam + "|" + cdx + r")\d*(?:-r\d+)?" + R)),
+        ("塊名＋層與輪的輪次代號", re.compile(L + r"[a-z]+-(?:c\d+)?" + "l" + r"\d[a-z]\d*" + R)),
+        ("耐久錨點那一串的輪次代號", re.compile(L + "durable" + "-anchor-r" + r"\d")),
+        ("嚴重度接編號", re.compile(L + r"(?:Blocker|High|Medium|Low) ?" + "#" + r"\d")),
+    ]
+
+
+def _history_hits(lines):
+    pats, out = _history_patterns(), []
+    for where, line, dec in lines:
+        for what, pat in pats:
+            m = pat.search(line) or pat.search(dec)
+            if m:
+                out.append(f"{where}: {what}「{m.group(0)}」")
+    return out
+
+
+def test_no_review_history_in_source(tmp_path=None):
+    """產品碼與測試裡不可以有審查輪次的代號，也不可以有指向規劃筆記目錄的字。
+
+    註解只講程式本身（這一段涵蓋到哪裡、為什麼這樣寫），不講這個專案發生過什麼：那些字對讀程式的人沒有用處，
+    而且會跟著出貨。這一格把那條規則變成會紅的東西。
+    抓的格式：版號或塊名接家族名、塊名接層號與輪次、耐久錨點那一串的輪次、嚴重度接 `#` 與編號；指向規劃筆記目錄的路徑。
+    合法的要放過：輸出檔 `cache-codex.html`、旗標 `--no-codex`／`--codex-source`、CSS 的 `font-family`。"""
+    lines = _scan_lines(_scan_required())
+    assert len(lines) > 10_000, f"掃到的行數不合理（{len(lines)}）：範圍是不是空的"
+    _assert_scanned(lines)
+    bad = _history_hits(lines)
+    assert not bad, "⚠ 原始碼裡有審查輪次的代號或規劃筆記目錄的指標：" + "；".join(bad[:8])
+    # 對照組：每一種樣式各自抓得到它那一種（字面與兩種跳脫寫法各比一次；一種壞了不能由別種接住），合法的都放過
+    fam, cdx = "fa" + "m", "co" + "dex"
+    must = [("版號＋家族的輪次代號", "v36-" + fam + "6 #5"), ("塊名＋家族的輪次代號", "qimg-" + fam),
+            ("塊名＋家族的輪次代號", "lastbatch-" + cdx + "-r2"), ("塊名＋層與輪的輪次代號", "ag-" + "l3c"),
+            ("塊名＋層與輪的輪次代號", "aimd-c2" + "l3a2"), ("耐久錨點那一串的輪次代號", "durable" + "-anchor-r4"),
+            ("嚴重度接編號", "High" + "#3"), ("指向規劃筆記目錄", "見 plan" + "ning/backlog.md"),
+            ("指向規劃筆記目錄", "見 " + chr(92) + "u0070lan" + "ning/y"),
+            # 緊貼中文字也照抓；合法的前綴只放過那兩個確切寫法
+            ("版號＋家族的輪次代號", "見v36-" + fam + "6"), ("塊名＋家族的輪次代號", "qimg-" + fam + "6後"),
+            ("塊名＋層與輪的輪次代號", "見ag-" + "l3c"), ("耐久錨點那一串的輪次代號", "見durable" + "-anchor-r4"),
+            ("嚴重度接編號", "見High" + "#3"), ("指向規劃筆記目錄", "見plan" + "ning/x"),
+            ("塊名＋家族的輪次代號", "no-" + fam + "6"), ("塊名＋家族的輪次代號", "cache-" + fam + "6"),
+            ("塊名＋家族的輪次代號", "no-" + cdx + "-r2"), ("塊名＋家族的輪次代號", "cache-" + cdx + "-r2")]
+    # 本身已經是跳脫寫法的那一筆只比字面（再整串跳脫一次，解開也只回到跳脫寫法）
+    rows = [(what, k, enc) for what, s in must
+            for k, enc in ((("字面", s),) if chr(92) in s else
+                           (("字面", s), ("跳脫四碼", _esc_all(s, 4)), ("跳脫八碼", _esc_all(s, 8))))]
+    # 走真的掃描流程：第 1 行夾著 U+2028，後面每一筆的行號照樣要對
+    tmp = new_tmp(tmp_path)
+    hits = _history_hits(_scan_probe_file(tmp, ["# 分隔字元" + chr(0x2028) + "不算換行"] + [enc for _, _, enc in rows]))
+    for n, (what, k, enc) in enumerate(rows, 2):
+        assert any(h.startswith(f"probe.py:{n}: {what}「") for h in hits), (what, k, enc, n)
+    ok = ["out/cache-" + cdx + ".html", "--no-" + cdx, "--" + cdx + "-source", "font-" + fam + "ily: x",
+          "https://example.org/capacity-plan" + "ning/index.html", "my_plan" + "ning/x", "a.plan" + "ning/x"]
+    assert not _history_hits(_scan_probe_file(tmp, ok)), _history_hits(_scan_probe_file(tmp, ok))
+    print("OK: no review history in source test passed")
+
+
 if __name__ == "__main__":
     # ⚠⚠ **這一格必須第一個跑**：它驗的是
     # `new_tmp()` 本身，而下面每一支測試都靠 `new_tmp()` 開工。排在後面的話，
@@ -11703,3 +11861,5 @@ if __name__ == "__main__":
     test_antigravity_tools_scoped_to_source()
     test_antigravity_tree_deep_and_tmp_mode()
     test_antigravity_incremental_edges()
+    test_no_known_typo_chars()
+    test_no_review_history_in_source()

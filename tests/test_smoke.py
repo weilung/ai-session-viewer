@@ -10188,7 +10188,7 @@ def test_sync_conflict_copies(tmp_path=None):
 #    ⚠ 反過來：**擴大 fixture 時雜湊一定會變，那時產品輸出沒變，版本不升、只更新雜湊**。
 # 範圍限制 SCOPE-RENDER-PIN-FIXTURE：釘的是這支測試的 fixture 走得到的輸出；Codex 只有「工具結果是
 #    content item 陣列」那一條，子代理、Claude 的圖片、壓縮、排隊句、未知模型這些路徑不在 fixture 裡。
-_RENDER_PIN =(75, "2eced3e46dfcb98ab06a48bfccfd0d4f8c00c8799fbb860436f8400b49759c81")
+_RENDER_PIN =(76, "b48802750c60158abe89b5c3362a4fe05340109c0d252ee0c360cc8baf9ad8a7")
 
 
 def test_ask_user_question(tmp_path=None):
@@ -10516,10 +10516,14 @@ def test_renderer_version_pinned(tmp_path=None):
     ag_write_db(agf, agid, [
         ag_user(0, "<system-reminder>原文</system-reminder> 跑一下"),
         ag_planner(1, text="好", think="先看", calls=[("k1", "run_command", {"CommandLine": "ls"}),
-                                                    ("k1", "view_file", {"AbsolutePath": "/x/a.py"})],
+                                                    ("k1", "view_file", {"AbsolutePath": "/x/a.py"}),
+                                                    ("k2", "run_command", {"CommandLine": "pwd"}),
+                                                    ("k3", "run_command", {"CommandLine": "sleep 9"})],
                    usage=(100, 10, 50)),
         ag_generic(2, "k1", "run_command", {"CommandLine": "ls"}, result="a.py"),
         ag_generic(3, "k1", "view_file", {"AbsolutePath": "/x/a.py"}, result="print(1)"),
+        ag_generic(3, "k2", "run_command", {"CommandLine": "pwd"}, result="/x", status=5),          # CLEARED
+        ag_generic(3, "k3", "run_command", {"CommandLine": "sleep 9"}, result="半截", status=2),    # 還沒跑完、記下了一半
         ag_system(4, "done", title="Run finished", event="task_notification"),
         ag_checkpoint(5, "摘要", trigger_idx=0),
         ag_planner(6, text="完成", usage=(10, 5, 0), enum=4242)])
@@ -11084,7 +11088,9 @@ def test_antigravity_identity(tmp_path=None):
        帶 `--antigravity-source` 的建置算縮範圍、沿用舊紀錄，舊的那一列最容易留下來；
     ④ `conversation_summaries.db` 給的子代理型別變了（子代理的檔沒變）：父對話那一頁要重建；
     ⑤ 父對話的檔讀不起來：讀得起來的子代理不跟著它消失（自己一列）；父對話讀到一半才壞的，stderr 講出連帶的子代理；
-    ⑥ 兩個呼叫 id 清洗之後一樣：子代理的頁內錨點不撞號。"""
+    ⑥ 兩個呼叫 id 清洗之後一樣：子代理的頁內錨點不撞號；
+    ⑦ 孤兒子代理（對不到觸發它的那一次呼叫）自己又派了子代理：孫子代理只畫一次（接在孤兒的那一次呼叫底下），
+       錨點不重複，頁頂目錄的連結指到它實際所在的框。"""
     tmp = new_tmp(tmp_path)
     # --- ① 同一個對話 id 兩個檔（父對話與子代理各有一份副本；副本的檔名排在本人前面）
     src = tmp / "dup"
@@ -11231,6 +11237,28 @@ def test_antigravity_identity(tmp_path=None):
     for sid_, word in zip(sub_ids, ("AGANKID1", "AGANKID2")):
         block = html[html.index(f'<details id="{sid_}"'):]
         assert word + "RESP" in block[:block.index("</details>")], f"{sid_} 那一框是它自己的子代理"
+    # --- ⑦ 孤兒子代理自己派了子代理
+    oc = tmp / "orphchain"
+    oc.mkdir()
+    OP, OK_, OL = ("9393aaaa-0000-4000-8000-000000000308", "9494bbbb-0000-4000-8000-000000000309",
+                   "9595cccc-0000-4000-8000-000000000310")
+    ag_write_db(oc / f"{OP}.db", OP, [ag_user(0, "AGOCQ"), ag_planner(1, text="AGOCROOT", usage=(1, 1, 0))])
+    ag_write_db(oc / f"{OK_}.db", OK_, [
+        ag_system(2, "task AGOCKID", event="agent_message", src=(OP, "nosuchcall", "invoke_subagent")),
+        ag_planner(3, calls=[("leafcall", "invoke_subagent", {"TypeName": "leaf"})], usage=(1, 1, 0))],
+        parent=OP, agent=("research", "Kid"))
+    ag_write_db(oc / f"{OL}.db", OL, [
+        ag_system(4, "task AGOCLEAF", event="agent_message", src=(OK_, "leafcall", "invoke_subagent")),
+        ag_planner(5, text="AGOCLEAFRESP", usage=(1, 7, 0))], parent=OK_, agent=("research", "Leaf"))
+    _ag_build(oc, tmp / "out-oc")
+    html = _session_pages(tmp / "out-oc")[0].read_text(encoding="utf-8")
+    assert _page_body(html).count("AGOCLEAFRESP") == 1, "孫子代理只畫一次"
+    assert not _page_dup_ids(html), f"錨點不重複：{_page_dup_ids(html)}"
+    links = re.findall(r"openSub\('(sub-[^']+)'\)", html)
+    leaf_box = [x for x in re.findall(r'<details id="(sub-[^"]+)"', html) if x != "sub-orphans"]
+    assert len(leaf_box) == 1 and sorted(links) == sorted(["sub-orphans", leaf_box[0]]), \
+        f"目錄：孤兒指到頁尾總區，孫子代理指到它自己的框：{links} vs {leaf_box}"
+    assert "AGOCLEAFRESP" in html[html.index(f'<details id="{leaf_box[0]}"'):], "那一框是孫子代理"
     print("OK: antigravity identity test passed")
 
 
@@ -11246,7 +11274,9 @@ def test_antigravity_page_marks(tmp_path=None):
     ⑥ 完整版 MD 工具框的 `<summary>`：原文（檔案路徑）破不出那個元素；
     ⑦ 沒有文字、思考或工具呼叫的模型回應：標出來、用量照算；
     ⑧ 模型回應的狀態不是完成（還沒跑完、被取消、出錯、被打斷）：那一則的最後標出來，不畫得和完成的一樣；
-       別種步驟（使用者輸入、系統訊息、錯誤、壓縮點）的狀態不是完成：那一步之後標一列、也出聲。"""
+       別種步驟（使用者輸入、系統訊息、錯誤、壓縮點）的狀態不是完成：那一步之後標一列、也出聲；
+    ⑨ 工具結果還沒跑完、但記下了文字或附件：照畫；它與 CLEARED 的結果都在那一步之後標「狀態不是完成」；
+       stderr 說畫了幾個附件佔位，頁面上就有幾個。"""
     tmp = new_tmp(tmp_path)
     src = tmp / "conversations"
     src.mkdir()
@@ -11282,6 +11312,15 @@ def test_antigravity_page_marks(tmp_path=None):
           for i, st in enumerate((2, 6, 7, 12))],
         # ⑧ 別種步驟（這裡是使用者輸入）的狀態不是完成
         (14, 6, pbv(1, 14) + pbv(4, 6) + ag_meta(19) + pbm(19, pbs(2, "AGUSERCANCEL"))),
+        # ⑨ 工具結果的狀態：還沒跑完（RUNNING）但記下了文字與附件、CLEARED、還沒跑完而什麼都沒記下
+        ag_planner(20, calls=[("crun", "view_file", {"AbsolutePath": "/home/demo/run.png"}),
+                              ("cclr", "run_command", {"CommandLine": "echo CLR"}),
+                              ("cnone", "run_command", {"CommandLine": "echo AGNONE"})], usage=(10, 5, 0)),
+        (132, 2, pbv(1, 132) + pbv(4, 2)
+         + ag_meta(21, pbm(4, pbs(1, "crun"), pbs(2, "view_file"), pbs(3, json.dumps({"AbsolutePath": "/home/demo/run.png"}))))
+         + pbm(140, pbm(2, pbs(1, "AGPARTIALRES"), pbm(4, pbs(1, "png"))))),
+        ag_generic(22, "cclr", "run_command", {"CommandLine": "echo CLR"}, result="AGCLEAREDRES", status=5),
+        ag_generic(23, "cnone", "run_command", {"CommandLine": "echo AGNONE"}, status=2),
     ])
     # 讀不起來的子代理：認得出父子（第一步與後設資料都在），步驟表少一欄
     ag_write_db(src / f"{BAD}.db", BAD, [
@@ -11353,6 +11392,19 @@ def test_antigravity_page_marks(tmp_path=None):
     assert body.count(smark) == 1 and smark in md and body.index("AGUSERCANCEL") < body.index(smark), \
         "別種步驟的狀態不是完成：那一步之後標出來"
     assert "步驟的狀態不是完成（被取消" in r.stderr, "別種步驟的狀態不是完成：要出聲"
+    # --- ⑨ 工具結果的狀態：還沒跑完而記下了內容的照畫（文字與附件的佔位）、CLEARED 照畫，兩者都在那一步之後標出來
+    #        （畫出來的不是錯誤框，看起來和完成的一樣）；什麼都沒記下的畫「無結果」、不另標
+    tmark = "⚠ 工具結果的狀態不是完成"
+    assert body.count(tmark) == 2 and md.count(tmark) == 2, f"兩個工具結果各標一次：{body.count(tmark)}, {md.count(tmark)}"
+    for res in ("AGPARTIALRES", "AGCLEAREDRES"):
+        assert res in body and res in md, f"記下的結果文字照畫：{res}"
+        assert body.index(res) < body.index(tmark, body.index(res)), f"{res}：標在那一步之後"
+    assert "CLEARED（被清除" in body and "工具結果的狀態不是完成（CLEARED" in r.stderr, "CLEARED：頁面與 stderr 都講"
+    assert body.count("紀錄停在這一步、還沒跑完") == 2 and "工具結果的狀態不是完成（紀錄停在這一步" in r.stderr, \
+        "還沒跑完的工具結果：頁面與 stderr 都講（另一次是 ⑧ 的模型回應）"
+    assert body.count("🖼️ 圖片") == 2 and "2 次：工具結果附的圖片" in r.stderr, \
+        f"附件：頁面畫了幾個佔位，stderr 就講幾個（{body.count('🖼️ 圖片')}｜{r.stderr}）"
+    assert body.count("（無結果 / 已中斷）") == 1 and "echo AGNONE" in body, "還沒跑完、什麼都沒記下的：畫「無結果」"
     print("OK: antigravity page marks test passed")
 
 
@@ -11506,6 +11558,78 @@ def test_antigravity_tree_deep_and_tmp_mode(tmp_path=None):
     print("OK: antigravity tree deep and tmp mode test passed")
 
 
+def test_antigravity_incremental_edges(tmp_path=None):
+    """Antigravity 的來源與增量建置：
+    ① 同一個檔出現在兩個 `--antigravity-source`（資料夾，和它裡面父對話那一個檔；兩種順序）：子代理不消失——
+       只畫在一頁裡、產出只算一次；後面那個來源講出「已經在前面的來源裡」；
+    ② 孤兒子代理自己一列之後，父對話出現了、但這一次的 `--project` 把父對話篩掉：子代理那一列不可以先被拿掉
+       （兩場都還在、索引卻一列都沒有）；之後涵蓋父對話的建置照常併進去，那一列才消失；
+    ③ 對話檔旁邊多了一個空的 `-wal`（或它的時刻變了）：內容沒變，頁面沿用、不重建。"""
+    tmp = new_tmp(tmp_path)
+    # --- ① 重疊的來源
+    src = tmp / "overlap"
+    src.mkdir()
+    P, K = "a1a1aaaa-0000-4000-8000-000000000401", "b2b2bbbb-0000-4000-8000-000000000402"
+    ag_write_db(src / f"{P}.db", P, [ag_user(0, "AGOVQ"),
+                                     ag_planner(1, calls=[("c1", "invoke_subagent", {"TypeName": "x"})], usage=(1, 1, 0)),
+                                     ag_generic(4, "c1", "invoke_subagent", {"TypeName": "x"}, result="ok")])
+    ag_write_db(src / f"{K}.db", K, [
+        ag_system(2, "task AGOVKID", event="agent_message", src=(P, "c1", "invoke_subagent")),
+        ag_planner(3, text="AGOVKIDRESP", usage=(10, 8, 0))], parent=P, agent=("research", "Kid"))
+    for n, (order, sources) in enumerate((("資料夾在前", (f"dir={src}", f"one={src / (P + '.db')}")),
+                                          ("單一檔在前", (f"one={src / (P + '.db')}", f"dir={src}")))):
+        out = tmp / f"out-overlap{n}"
+        args = [a for s_ in sources for a in ("--antigravity-source", s_)]
+        r = subprocess.run([sys.executable, str(SCRIPT), "--no-claude", "--no-codex", *args, "--out", str(out)],
+                           capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, r.stderr
+        bodies = [_page_body(p.read_text(encoding="utf-8")) for p in _session_pages(out)]
+        assert sum(b.count("AGOVKIDRESP") for b in bodies) == 1, \
+            f"{order}：子代理只畫在一頁裡、不消失（{[b.count('AGOVKIDRESP') for b in bodies]}）{r.stderr}"
+        assert sum(x["tok_out"] for x in _manifest_rows(out)) == 9, \
+            f"{order}：產出只算一次（父 1＋子 8）：{[x['tok_out'] for x in _manifest_rows(out)]}"
+        assert "1 個檔已經在前面的來源裡" in r.stderr, f"{order}：後面那個來源要講出來：{r.stderr}"
+    # --- ② 縮範圍建置把父對話篩掉
+    fl = tmp / "filtered"
+    fl.mkdir()
+    FP, FK = "c3c3aaaa-0000-4000-8000-000000000403", "d4d4bbbb-0000-4000-8000-000000000404"
+    ag_write_db(fl / f"{FK}.db", FK, [
+        ag_system(2, "task AGFLKID", event="agent_message", src=(FP, "c1", "invoke_subagent")),
+        ag_planner(3, text="AGFLKIDRESP", usage=(10, 8, 0))], parent=FP, agent=("research", "Kid"),
+        cwd="file:///home/demo/KidProj")
+    fout = tmp / "out-filtered"
+    _ag_build(fl, fout)
+    assert len(_manifest_rows(fout)) == 1
+    ag_write_db(fl / f"{FP}.db", FP, [ag_user(0, "AGFLQ"),
+                                      ag_planner(1, calls=[("c1", "invoke_subagent", {"TypeName": "x"})], usage=(1, 1, 0)),
+                                      ag_generic(4, "c1", "invoke_subagent", {"TypeName": "x"}, result="ok")],
+                cwd="file:///home/demo/ParentProj")
+    r = _ag_build(fl, fout, "--project", "UnrelatedProj")
+    rows = _manifest_rows(fout)
+    assert len(rows) == 1 and rows[0]["tok_out"] == 8, \
+        f"父對話被範圍篩掉：子代理那一列要留著：{[x.get('title') for x in rows]}｜{r.stdout}"
+    assert (fout / "sessions" / rows[0]["out_html"]).exists(), "子代理那一頁也還在"
+    r = _ag_build(fl, fout)
+    rows = _manifest_rows(fout)
+    assert len(rows) == 1 and rows[0]["tok_out"] == 9, \
+        f"涵蓋父對話的建置：子代理併進去、它自己那一列消失：{[(x.get('title'), x['tok_out']) for x in rows]}"
+    # --- ③ 空的 -wal
+    ew = tmp / "emptywal"
+    ew.mkdir()
+    E = "e5e5aaaa-0000-4000-8000-000000000405"
+    ag_write_db(ew / f"{E}.db", E, [ag_user(0, "AGEWQ"), ag_planner(1, text="AGEWRESP", usage=(1, 1, 0))])
+    eout = tmp / "out-emptywal"
+    _ag_build(ew, eout)
+    wal = ew / f"{E}.db-wal"
+    wal.write_bytes(b"")
+    r = _ag_build(ew, eout)
+    assert "新建/更新 0，沿用 1" in r.stdout, f"空的 -wal 出現：頁面沿用：{r.stdout}"
+    os.utime(wal, (time.time() + 60, time.time() + 60))
+    r = _ag_build(ew, eout)
+    assert "新建/更新 0，沿用 1" in r.stdout, f"空的 -wal 時刻變了：頁面沿用：{r.stdout}"
+    print("OK: antigravity incremental edges test passed")
+
+
 if __name__ == "__main__":
     # ⚠⚠ **這一格必須第一個跑**：它驗的是
     # `new_tmp()` 本身，而下面每一支測試都靠 `new_tmp()` 開工。排在後面的話，
@@ -11578,3 +11702,4 @@ if __name__ == "__main__":
     test_antigravity_page_marks()
     test_antigravity_tools_scoped_to_source()
     test_antigravity_tree_deep_and_tmp_mode()
+    test_antigravity_incremental_edges()

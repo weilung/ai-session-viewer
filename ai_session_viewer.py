@@ -254,7 +254,10 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 # 74 → 75（2026-10-23）：① 程式碼區塊的語言字串放進 `class` 屬性時照屬性跳脫（`esc_attr`）。② 完整版 MD 工具框
 #    `<summary>` 那一行：開得出標籤或註解的 `<` 換成 `&lt;`、斷行壓成空格（`_md_html_text`）。兩者只在原文帶那幾種
 #    字元的頁面上變。③ 新來源 Antigravity（CLI 版）。
-RENDERER_VERSION = 75
+# 75 → 76（2026-10-24）：① 頁尾的孤兒子代理自己派出的子代理只畫一次（原本就地畫過、頁尾又畫一次，錨點重複），
+#    頁頂目錄指向它實際所在的框（三種來源共用；只在那種形狀的頁面上變）。② Antigravity 的工具結果：還沒跑完但記下了
+#    文字或附件的照畫，CLEARED 與它都在那一步之後標「⚠ 工具結果的狀態不是完成」。
+RENDERER_VERSION = 76
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 SOURCE_ANTIGRAVITY = "antigravity"
@@ -2078,7 +2081,8 @@ AG_STATUS_INTERRUPTED = 12
 AG_STATUS_UNFINISHED = frozenset((1, 2, 8, 9, 11))      # PENDING／RUNNING／GENERATING／WAITING／QUEUED
 AG_STATUS_KNOWN = frozenset((3, 4, 5, 6, 7, 12)) | AG_STATUS_UNFINISHED
 # 認得、但不是 DONE 的狀態 → 頁面上那一句。模型回應：那一則的最後標「⚠ 模型回應的狀態不是完成」；
-# 使用者輸入、系統訊息、錯誤、壓縮點：那一步之後標「⚠ 步驟的狀態不是完成」（也出聲）。工具結果照它自己那一套畫。
+# 使用者輸入、系統訊息、錯誤、壓縮點：那一步之後標「⚠ 步驟的狀態不是完成」（也出聲）。工具結果：被取消、出錯、
+# 被打斷、無效畫成錯誤框；還沒跑完而記下了內容的、CLEARED，畫出來看不出狀態 ⇒ 那一步之後標「⚠ 工具結果的狀態不是完成」。
 _AG_NOT_DONE = {AG_STATUS_CANCELED: "被取消（內容可能不完整）", AG_STATUS_ERROR: "出錯（內容可能不完整）",
                 AG_STATUS_INTERRUPTED: "被打斷（內容可能不完整）", AG_STATUS_INVALID: "無效",
                 5: "CLEARED（被清除；這個狀態的意思沒有樣本可對）",
@@ -2459,15 +2463,19 @@ def antigravity_tree(paths, summaries=None):
 def antigravity_signature(info, desc=()):
     """變動指紋：主檔與 `-wal`、每一個子代理檔與它的 `-wal` 的 (檔名, mtime, 大小)，加上頁面用到、卻不在這些檔裡的值——
     `conversation_summaries.db` 給的標題與子代理型別（`antigravity_tree` 補進 info 的）。那個檔每跑一次 CLI 都會變，
-    不拿它的 mtime，只拿用到的值；頁面多用一個它給的值，這裡就要多收一個。"""
+    不拿它的 mtime，只拿用到的值；頁面多用一個它給的值，這裡就要多收一個。
+    空的 `-wal` 不收：讀法和沒有它一樣（`_ag_connect`），收了的話它一出現、一換 mtime，沒變的頁面就整頁重建。"""
     parts = []
     for i in [info, *desc]:
-        for p in (Path(i["path"]), Path(str(i["path"]) + "-wal")):
+        main = Path(i["path"])
+        for p in (main, Path(str(main) + "-wal")):
             try:
                 st = p.stat()
-                parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}")
             except OSError:
-                pass
+                continue
+            if p is not main and st.st_size <= 0:
+                continue
+            parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}")
     parts.append("title:" + str(info.get("title") or ""))
     parts += [f"agent:{d.get('id', '')}:{d.get('agent') or ''}" for d in desc]
     return "|".join(parts)
@@ -2707,12 +2715,14 @@ def _ag_events(path, conv_id, srcf, warn, ids=None):
                                     f"第 {idx} 步：模型回應裡沒有對得上的呼叫，用這一步自己帶的那一份補"))
                     ev("assistant", idx, dt, {"role": "assistant", "id": f"ag-{conv_id}-{idx}-call", "model": last_model,
                                               "content": [tool_use(tid, name, args)]}, suffix="-call")
-                if n_media:
-                    # 結果附的圖片／檔案：同使用者輸入，只畫佔位（範圍限制 SCOPE-AG-USER-MEDIA-PLACEHOLDER）
-                    warn["工具結果附的圖片／檔案只畫了佔位"] += n_media
-                # 紀錄停在還沒跑完的：沒有結果（頁面畫「無結果／已中斷」）
-                if status not in AG_STATUS_UNFINISHED:
-                    if status == AG_STATUS_DONE:
+                # 紀錄停在還沒跑完的：記下了的（文字、附件）照畫；什麼都沒記下就沒有結果（頁面畫「無結果／已中斷」）
+                partial = status in AG_STATUS_UNFINISHED
+                if partial and (text or n_media) or status == 5:
+                    # 畫出來的結果看不出狀態（不是錯誤框，看起來和完成的一樣）⇒ 那一步之後標出來
+                    odd.append((f"工具結果的狀態不是完成（{_AG_NOT_DONE[status]}）", "⚠ 工具結果的狀態不是完成",
+                                f"第 {idx} 步：{_AG_NOT_DONE[status]}"))
+                if not partial or text or n_media:
+                    if status == AG_STATUS_DONE or partial:
                         content, is_err = text, False
                     elif status == AG_STATUS_CANCELED:
                         content, is_err = text or "（沒有執行：被取消，或權限沒有核准）", True
@@ -2725,6 +2735,9 @@ def _ag_events(path, conv_id, srcf, warn, ids=None):
                     else:
                         content, is_err = text or err_text or f"（狀態 {status}）", status != 5
                     if n_media:
+                        # 結果附的圖片／檔案：同使用者輸入，只畫佔位（範圍限制 SCOPE-AG-USER-MEDIA-PLACEHOLDER）。
+                        # 只在真的畫了的時候計：stderr 說「畫了佔位」，頁面上就要有那個佔位
+                        warn["工具結果附的圖片／檔案只畫了佔位"] += n_media
                         content = ([{"type": "text", "text": content}] if content else []) \
                             + [{"type": "image", "source": {}}] * n_media
                     ev("user", idx, dt, {"role": "user", "content": [
@@ -8043,15 +8056,18 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
         turns += [sep_div(ts, d) for ts in same_day]
         turns.append(h)
 
-    inline_tids = set(rendered_sub)   # 已就地接在 Task 底下的子代理
-
     # 只有無法對應到任何 Task 的（孤兒）子代理才退回頁尾
     side_html = ""
     orphan_tids = [tid for tid in smap if tid not in rendered_sub]
+    tail_tids = set()                 # 直接畫在頁尾總區的（沒有自己的摺疊框）；其餘都有自己的錨點
     if orphan_tids:
         blocks = []
         for tid in orphan_tids:
+            # 孤兒子代理自己派出的子代理，畫它的時候已經就地接在那一次呼叫底下了（這張清單是畫之前列的）
+            if tid in rendered_sub:
+                continue
             rendered_sub.add(tid)
+            tail_tids.add(tid)
             inner = [render_turn_html(g, s.tmap, used, smap, smeta, rendered_sub, ai) for g in smap[tid]]
             blocks += [x for x in inner if x]
         if blocks:
@@ -8064,8 +8080,8 @@ def render_session_html(s: Session, index_href: str, memory_href: str = "") -> s
     if smap:
         items = []
         for tid in smap:
-            anchor = (subagent_anchor(tid, s.source_kind == SOURCE_ANTIGRAVITY) if tid in inline_tids
-                      else "sub-orphans")
+            anchor = ("sub-orphans" if tid in tail_tids
+                      else subagent_anchor(tid, s.source_kind == SOURCE_ANTIGRAVITY))
             label = subagent_summary_label(smeta.get(tid))
             items.append(f'<li><a href="#{anchor}" onclick="return openSub(\'{anchor}\')">↳ {label}</a></li>')
         sub_toc = (f'<details class="sub-toc" open><summary>🧩 子代理 ({s.n_subagents})</summary>'
@@ -13749,7 +13765,10 @@ def collect_session_files(args):
     """這一次要處理的來源檔：`(accounts, codex_accounts, files, 去重前的筆數, ag)`，
     `files` 每一筆是 `(來源類型, 帳號, 專案munged名, session檔)`。建置與 `--ai-md` 共用同一條路。
     `ag`＝Antigravity 的 `{"accounts": [(標籤, 根)], "tree": {主對話路徑: (info, 子孫子代理)}}`：
-    子代理是另一個檔，併進父對話那一頁，`files` 只列主對話（見 `antigravity_tree`）。"""
+    子代理是另一個檔，併進父對話那一頁，`files` 只列主對話（見 `antigravity_tree`）。
+    ⚠ 同一個實體檔出現在兩個 Antigravity 來源（資料夾和它裡面的單一檔、兩個重疊的資料夾）時只算進第一個列到它的
+      來源：`tree` 以路徑為鍵，後一個來源排出來的樹會蓋掉前一個——子代理在前一個來源已經併進父對話（不是一列），
+      後一個來源的樹裡卻沒有它，兩邊的頁面都不含它。後面的來源少了那幾個檔，就照「父對話不在這一批」排。"""
     accounts = [] if args.no_claude else collect_sources(args.claude_source, args.account)
     codex_accounts = [] if args.no_codex else collect_codex_sources(args.codex_source)
     ag = {"accounts": [] if args.no_antigravity else collect_antigravity_sources(args.antigravity_source),
@@ -13767,11 +13786,22 @@ def collect_session_files(args):
             continue
         for sf in iter_codex_session_files(sessions_root):
             files.append((SOURCE_CODEX, acc_name, "codex", sf))
+    ag_seen = set()                   # 已經列進前面那幾個 Antigravity 來源的實體檔
     for acc_name, ag_root in ag["accounts"]:
         if not ag_root.exists():
             print(f"  (略過) Antigravity {acc_name} 找不到目錄：{ag_root}", file=sys.stderr)
             continue
-        roots, tree = antigravity_tree(list(iter_antigravity_files(ag_root)), load_antigravity_summaries(ag_root))
+        paths, n_dup = [], 0
+        for p in iter_antigravity_files(ag_root):
+            phys = os.path.normcase(os.path.realpath(p))
+            if phys in ag_seen:
+                n_dup += 1
+                continue
+            ag_seen.add(phys)
+            paths.append(p)
+        if n_dup:
+            print(f"  （Antigravity {acc_name}：{n_dup} 個檔已經在前面的來源裡，不重複列）", file=sys.stderr)
+        roots, tree = antigravity_tree(paths, load_antigravity_summaries(ag_root))
         for info in roots:
             files.append((SOURCE_ANTIGRAVITY, acc_name, "antigravity", info["path"]))
             ag["tree"][str(info["path"])] = (info, tree.get(str(info["path"]), []))
@@ -14223,11 +14253,7 @@ def main():
         new_entries, n_gone = prune_gone_sources(new_entries, scanned_roots)
         if n_gone:
             print(f"  （來源已刪除，對掉 {n_gone} 筆舊紀錄）")
-    # Antigravity：這一次併進某一頁的子代理不是一列。它以前可能自己一列過（那時父對話還不在），而縮範圍建置
-    # 沿用舊紀錄——檔還在，上面那道對不掉 ⇒ 同一段對話在索引與統計裡算兩次。
-    for _info, _desc in ag_tree.values():
-        for _d in _desc:
-            new_entries.pop(manifest_key(SOURCE_ANTIGRAVITY, Path(_d["path"])), None)
+    ag_placed = set()                 # 這一次有頁（新建或沿用）的 Antigravity 主對話（拿掉子代理舊的那一列用，見迴圈後）
     scanned_source_dirs = {safe_name(source_kind, 24) for source_kind, *_ in files}
 
     codex_titles = {}
@@ -14292,6 +14318,8 @@ def main():
         if reusable:
             new_entries[key] = {"sig": sig, "row": row, "turns": cached.get("turns")}
             n_reuse += 1
+            if source_kind == SOURCE_ANTIGRAVITY:
+                ag_placed.add(str(sf))
             continue
 
         # ⚠⚠ **壞掉的那一場只有一個處理器。** 解析失敗與分析失敗各寫一份的話，
@@ -14434,6 +14462,16 @@ def main():
                  else (cached.get("turns") if row["has_md"] else None))
         new_entries[key] = {"sig": sig, "row": row, "turns": turns}
         n_build += 1
+        if source_kind == SOURCE_ANTIGRAVITY:
+            ag_placed.add(str(sf))
+
+    # Antigravity：併進某一頁的子代理不是一列。它以前可能自己一列過（那時父對話還不在），而縮範圍建置
+    # 沿用舊紀錄——檔還在，對帳對不掉 ⇒ 同一段對話在索引與統計裡算兩次。
+    # ⚠ 只對這一次真的有一頁（新建或沿用）的父對話做：父對話被範圍篩掉、讀不起來、或渲染失敗時，
+    #   子代理以前那一列是它唯一的頁面，先拿掉的話兩場對話都還在、索引裡卻一列都沒有。
+    for _p in ag_placed:
+        for _d in ag_tree.get(_p, (None, ()))[1]:
+            new_entries.pop(manifest_key(SOURCE_ANTIGRAVITY, Path(_d["path"])), None)
 
     rows = _index_rows(new_entries, args.include_empty)
     show_account = len({r.get("account", "") for r in rows}) > 1

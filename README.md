@@ -29,7 +29,7 @@ py ai_session_viewer.py            # 全部帳號/專案 -> .\out，同時輸出
 py ai_session_viewer.py --open     # 轉換後自動打開 out\index.html
 py ai_session_viewer.py --no-codex --no-antigravity --open      # 只轉 Claude（預設會連 Codex、Antigravity 一起轉）
 ```
-或直接**雙擊 `run.cmd`**。
+或直接**雙擊 `run.cmd`**（後面可以接參數，例如捷徑的目標寫成 `run.cmd --no-cache-report`）。
 
 Debian / macOS：
 ```bash
@@ -66,7 +66,9 @@ AI 的提問（`AskUserQuestion`）例外：畫成不收合的卡片——每題
 | `--project <字串>` | 只轉名稱含此字串的專案，例如 `--project Obts` |
 | `--include-empty` | 連同**完全沒有回合**的空 session 一起輸出。⚠ 只有指令、沒有對話的 session **不算空**（指令現在會畫出來），要處理那種請看 `--archive-command-only` |
 | `--force` | 忽略快取，全部重新產生 |
+| `--no-cache-report` | 不重算快取報告（`cache-report`／`cache-hypotheses`／`cache-codex`），沿用上一次產生的檔、內容停在那一次；索引照檔在不在決定連不連。平常不看報告時可以省幾秒（見〈增量建置〉） |
 | `--open` | 完成後自動打開 `index.html` |
+| `--version` | 印出版本（`ai-session-viewer 1.1.0` 這種形式）後結束，不做任何轉換；回報問題時請附上 |
 | `--archive-command-only <目錄>` | 把**只有指令、沒有對話**的 Claude session 的 JSONL **搬到**該目錄（檔名＝`<munged cwd>__<原檔名>`），並刪掉它產生的頁。⚠ **會動到 `~/.claude/projects/`**，詳見〈整理只有指令的 session〉 |
 | `--search "詞…"` | 全文搜尋既有輸出的**對話內容**，產生可點擊跳轉的結果頁（見〈全文搜尋〉）；搭 `--open` 直接打開 |
 | `--ai-md <session>` | 只處理一場，產生**給 AI 讀的精簡版** md 到 `out/ai/`、只印出它的路徑（見〈給 AI 讀的精簡版〉）。`<session>` 寫 `last` ＝最近那一場 |
@@ -119,6 +121,8 @@ python3 ai_session_viewer.py --no-claude --out ~/codex-logs --open
 都沒變就不再重開；刪掉它（或加 `--force`）不影響輸出，只是下一次會全部重讀一遍。
 
 - 要強制全部重來：加 `--force`（兩份紀錄都不用）。
+- 快取報告每次都用**全部** session 重算（session 一多就要幾秒）；平常不看報告的話加 `--no-cache-report`，
+  報告沿用上一次產生的那一份，想看最新的再跑一次不帶它的。
 - 局部重產（`--project` / `--account` / `--claude-source`）時，不會動到也不會誤刪其他範圍的既有輸出。
 
 ## 整理只有指令的 session

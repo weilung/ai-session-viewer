@@ -1514,6 +1514,31 @@ def test_cache_report_by_kind():
     print("OK: cache report by-kind test passed")
 
 
+def test_cache_report_active_days():
+    """報告的活躍日數（重暖次數的「次／日」分母）：本機時區的日子，平日與週末分開數；同一天幾步只算一天。
+
+    素材的時刻用本機時間組出來，在哪個時區跑都一樣。脈絡太小、被分析排除的那一步不算活躍（和其他統計同一個母體）。"""
+    import importlib
+    from datetime import datetime as _dt
+    sys.path.insert(0, str(ROOT))
+    v = importlib.import_module("ai_session_viewer")
+
+    def at(*ymdhm, ctx=2000):   # [epoch, cache_read, ctx, w_total, w5, w1h, midx]
+        return [_dt(*ymdhm).timestamp(), 1900, ctx, 100, 0, 100, 0]
+
+    # 平日與週末的天數刻意不同（3 對 2）：相同的話，平日、週末兩格對調也照樣過
+    steps = [at(2026, 8, 3, 10, 0), at(2026, 8, 3, 11, 0),      # 週一兩步：一天
+             at(2026, 8, 4, 9, 0),                              # 週二
+             at(2026, 8, 5, 9, 0, ctx=10),                      # 週三，但脈絡太小 ⇒ 不算
+             at(2026, 8, 6, 9, 0),                              # 週四
+             at(2026, 8, 8, 10, 0), at(2026, 8, 9, 23, 30)]     # 週六、週日
+    d = v.build_cache_report([{"source_kind": v.SOURCE_CLAUDE, "kind": "chat", "account": "a",
+                               "cache_steps": steps, "cache_models": ["m0"], "cache_events": []}])
+    assert (d["wd_days"], d["we_days"]) == (3, 2), \
+        f"⚠ 活躍日數算錯：平日 {d['wd_days']}、週末 {d['we_days']}（應為 3、2）"
+    print("OK: cache report active days test passed")
+
+
 def test_classify_cache_causes():
     # 逐步冷啟成因分類（供徽章著色）：first/switch/model/compact/expiry/evict/intra 各命中一次，
     # 並與 build_cache_report 的 causes_total 交叉比對，確保「報告」與「逐步徽章」用同一套判定、不漂移。
@@ -1716,6 +1741,11 @@ def test_api_miss_reason(tmp_path=None):
     note = v._band_api_note(d4)
     assert "1 對" in note, f"假說頁應引用帶內排除數（1）：{note}"
     assert "2 對" not in note, f"不得把全母體排除數（2）當成帶內排除數：{note}"
+    # 帶內失效時 API 怎麼說，看的是失效的那一步（後一步）：前一步沒自報、後一步自報「前文不在快取」
+    pmnf = v.API_MISS_CODES.index("previous_message_not_found")
+    d4b = rep([st2(0, 0), st2(60, 1900), st2(1060, 0, pmnf)])   # 第二對 gap 1000s，在帶內、冷
+    assert d4b["api"]["band"] == {"previous_message_not_found": 1}, \
+        f"⚠ 帶內失效的 API 說法要取失效那一步的：{d4b['api']['band']}"
     # 同時有邊界（429）的前綴變動對，本來就會被 boundary 擋掉 → 不得記進 band_excluded
     d5 = v.build_cache_report([{"source_kind": v.SOURCE_CLAUDE, "account": "", "kind": "chat",
                                 "cache_steps": [st2(0, 0), st2(600, 0, tools_code)],
@@ -6697,6 +6727,218 @@ def test_zero_scan_keeps_cache_report_links(tmp_path=None):
         ("⚠ 零場建置把快取報告的連結拿掉了——檔案還在磁碟上，索引頁卻不連它了"
          "（`render_index_html` 的第三、四個參數被寫死成 False）")
     print("OK: zero-scan build keeps cache-report links test passed")
+
+
+def test_no_cache_report_flag(tmp_path=None):
+    """`--no-cache-report`：三份快取報告不重算、不寫也不刪；索引照磁碟上的檔決定連不連，兩種格式各看各的。
+
+    每一次建置都數兩支報告函式的呼叫次數：「沒有算」直接量，不從輸出推。
+    一格一格：①不帶旗標照舊產報告（前置）②帶旗標時兩支報告函式一次都沒叫、報告檔一個位元組、修改時間都不動，索引照樣連
+    ③Codex 那一份只看自己的檔（只有 `.html` ⇒ html 索引連、md 索引不連）④Claude 那一份是兩頁，少一頁就不連（只影響那一種格式）
+    ⑤零場那條路帶旗標時也不算、照檔判 ⑥再跑一次不帶旗標：照舊重算（缺的那一頁補回來、沒有資料的 Codex 頁清掉）。"""
+    tmp = new_tmp(tmp_path)
+    projects = _build_fixture(tmp / "src")
+    out = tmp / "out"
+
+    # 每一次建置都在子行程裡把兩支報告函式包起來數呼叫次數（「沒有算」要直接量，不能從輸出推）
+    def _build(*extra):
+        code = (
+            "import sys, json\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            f"sys.argv = ['ai_session_viewer.py', '--claude-source', {'demo=' + str(projects)!r}, '--no-codex',"
+            f" '--no-antigravity', '--out', {str(out)!r}] + {list(extra)!r}\n"
+            "import ai_session_viewer as v\n"
+            "calls = {'claude': 0, 'codex': 0}\n"
+            "_c, _x = v.build_cache_report, v.build_codex_survival\n"
+            "def _cc(*a, **k):\n    calls['claude'] += 1\n    return _c(*a, **k)\n"
+            "def _xx(*a, **k):\n    calls['codex'] += 1\n    return _x(*a, **k)\n"
+            "v.build_cache_report, v.build_codex_survival = _cc, _xx\n"
+            "v.main()\n"
+            "print('REPORT-CALLS ' + json.dumps(calls))\n")
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, f"建置非零退出 {extra}\n{r.stdout}\n{r.stderr}"
+        line = [ln for ln in r.stdout.splitlines() if ln.startswith("REPORT-CALLS ")]
+        assert len(line) == 1, f"子行程沒有回報呼叫次數\n{r.stdout}"
+        r.calls = json.loads(line[0][len("REPORT-CALLS "):])
+        return r
+
+    names = ("cache-report.html", "cache-report.md", "cache-hypotheses.html", "cache-hypotheses.md")
+
+    def _snap():
+        return {n: ((out / n).read_bytes(), (out / n).stat().st_mtime_ns) for n in names}
+
+    def _idx():
+        return (out / "index.html").read_text(encoding="utf-8"), (out / "index.md").read_text(encoding="utf-8")
+
+    # ① 前置：這份素材產得出報告，索引連著它，而且建置有講它在算報告
+    r = _build()
+    assert all((out / n).is_file() for n in names), "素材沒生效：沒產出快取報告"
+    assert r.calls["claude"] >= 1 and r.calls["codex"] == 1, f"素材沒生效：數不到報告函式的呼叫 {r.calls}"
+    assert "產生快取報告…" in r.stdout, f"不帶旗標時應印出正在算報告\n{r.stdout}"
+    html, md = _idx()
+    assert "cache-report.html" in html and "cache-report.md" in md, "素材沒生效：索引沒連報告"
+    assert "cache-codex.html" not in html, "素材沒生效：沒有 Codex 資料卻連了 Codex 頁"
+
+    # ② 帶旗標：報告不重寫（內容與修改時間都不變），索引照樣連，收尾講明是沿用的
+    before = _snap()
+    time.sleep(0.05)
+    r = _build("--no-cache-report")
+    assert _snap() == before, "⚠ 帶 --no-cache-report 時快取報告被重寫了"
+    assert r.calls == {"claude": 0, "codex": 0}, f"⚠ 帶 --no-cache-report 時還是算了報告：{r.calls}"
+    assert "產生快取報告…" not in r.stdout, f"帶旗標時不應該印出正在算報告\n{r.stdout}"
+    assert "沿用上一次" in r.stdout, f"收尾應講明報告是沿用的\n{r.stdout}"
+    html, md = _idx()
+    assert "cache-report.html" in html and "cache-hypotheses.html" in html, "⚠ 帶旗標時 html 索引不連沿用的報告了"
+    assert "cache-report.md" in md and "cache-hypotheses.md" in md, "⚠ 帶旗標時 md 索引不連沿用的報告了"
+
+    # ③ Codex 那一份只看自己的檔：只有 html 那一種
+    (out / "cache-codex.html").write_text("<html>上一次的 Codex 頁</html>", encoding="utf-8")
+    _build("--no-cache-report")
+    html, md = _idx()
+    assert "cache-codex.html" in html, "⚠ 磁碟上有上一次的 Codex 頁，帶旗標時 html 索引應該連它"
+    assert "cache-codex.md" not in md, "⚠ 沒有 cache-codex.md，md 索引不可以連（會是死連結）"
+    assert (out / "cache-codex.html").read_text(encoding="utf-8") == "<html>上一次的 Codex 頁</html>", \
+        "⚠ 帶旗標時 Codex 頁被重寫或刪掉了"
+
+    # ④ Claude 那一份兩頁都在才連：拿掉 html 的假說頁 ⇒ html 索引不連健檢頁；md 兩頁都在 ⇒ md 索引照連
+    (out / "cache-hypotheses.html").unlink()
+    _build("--no-cache-report")
+    html, md = _idx()
+    assert "cache-report.html" not in html and "cache-hypotheses.html" not in html, \
+        "⚠ 假說頁不在了，html 索引還連著（索引同時連兩頁，少一頁就會有死連結）"
+    assert "cache-report.md" in md and "cache-hypotheses.md" in md, "⚠ md 那兩頁都還在，md 索引卻不連了"
+
+    # ⑤ 零場那條路帶旗標：照檔判（md 兩頁在、html 少一頁 ⇒ html 索引不連；Codex html 在 ⇒ 連）
+    src_file = projects / "demo-proj" / f"{SID}.jsonl"
+    keep = src_file.read_bytes()
+    src_file.unlink()
+    r = _build("--no-cache-report")
+    assert "沒有找到任何 session 檔" in r.stdout, f"沒有走到零場那條路\n{r.stdout}"
+    assert r.calls == {"claude": 0, "codex": 0}, f"⚠ 零場帶旗標時還是算了報告：{r.calls}"
+    html, _ = _idx()
+    assert "cache-codex.html" in html, "⚠ 零場帶旗標時，磁碟上的 Codex 頁沒被連到"
+    assert "cache-report.html" not in html, "⚠ 零場帶旗標時，少一頁的 Claude 報告還被連著"
+    src_file.write_bytes(keep)
+
+    # ⑥ 不帶旗標：照舊重算——缺的假說頁補回來，沒有 Codex 資料 ⇒ 上一次的 Codex 頁清掉
+    r = _build()
+    assert "產生快取報告…" in r.stdout
+    assert (out / "cache-hypotheses.html").is_file(), "⚠ 不帶旗標時沒有重算報告（缺的那一頁沒補回來）"
+    assert not (out / "cache-codex.html").exists(), "⚠ 不帶旗標、又沒有 Codex 資料時，舊的 Codex 頁應該清掉"
+    html, _ = _idx()
+    assert "cache-report.html" in html and "cache-codex.html" not in html
+    print("OK: --no-cache-report flag test passed")
+
+
+def test_signature_memory_shared(tmp_path=None):
+    """`session_signature` 給了一次建置共用的字典時，結果和不給一樣；每個 memory 目錄各算各的。
+
+    素材：兩個有 memory 的專案（檔數不同）＋一個沒有 memory 的專案，交錯著算，
+    只要字典的鍵不是那個 memory 目錄，就會把別的專案的 memory 算進來。"""
+    import ai_session_viewer as v
+    tmp = new_tmp(tmp_path)
+    files = []
+    for proj, mems in (("pa", {"a.md": "甲"}), ("pb", {"b.md": "乙", "c.md": "丙丙"}), ("pc", {})):
+        d = tmp / "projects" / proj
+        (d / "memory").mkdir(parents=True) if mems else d.mkdir(parents=True)
+        for name, body in mems.items():
+            (d / "memory" / name).write_text(body, encoding="utf-8")
+        for i in range(2):
+            f = d / f"{proj}-{i}.jsonl"
+            f.write_text("{}\n" * (i + 1), encoding="utf-8")
+            files.append(f)
+    order = [files[0], files[2], files[4], files[1], files[3], files[5]]   # pa、pb、pc 交錯
+    shared = {}
+    for f in order:
+        assert v.session_signature(f, (), shared) == v.session_signature(f), \
+            f"⚠ 共用字典算出來的指紋和不共用的不一樣：{f.parent.name}/{f.name}"
+    sig_b = v.session_signature(files[2], (), shared)
+    assert "memb.md" in sig_b and "memc.md" in sig_b and "mema.md" not in sig_b, \
+        "素材沒生效：pb 的指紋裡應該只有 pb 的 memory"
+    assert not any("mem" in p for p in v.session_signature(files[4], (), shared).split("|")), \
+        "⚠ 沒有 memory 的專案，指紋裡出現了別的專案的 memory"
+
+    # 指紋字串的格式本身：照既有 manifest 存的那個樣子逐段寫出來（不經產品碼），兩種模式都要逐字等於它。
+    # 格式一變，既有 manifest 的每一筆都對不上 ⇒ 下一次建置全部重建。
+    # 順序：主檔、子代理檔（照路徑排序）、memory 檔（照檔名排序、前綴 mem）、切帳號時刻（毫秒三位）。
+    side = files[2].with_suffix("")
+    (side / "subagents").mkdir(parents=True)
+    for name, body in (("a1.jsonl", "x"), ("b2.jsonl", "yy")):
+        (side / "subagents" / name).write_text(body, encoding="utf-8")
+
+    def ms(p):
+        st = p.stat()
+        return f"{st.st_mtime_ns}:{st.st_size}"
+    mem_b = tmp / "projects" / "pb" / "memory"
+    expected = "|".join([
+        f"pb-0.jsonl:{ms(files[2])}",
+        f"a1.jsonl:{ms(side / 'subagents' / 'a1.jsonl')}", f"b2.jsonl:{ms(side / 'subagents' / 'b2.jsonl')}",
+        f"memb.md:{ms(mem_b / 'b.md')}", f"memc.md:{ms(mem_b / 'c.md')}",
+        "acct:1780000000.700,1780000600.000"])
+    marks = [1780000000.7, 1780000600]
+    assert v.session_signature(files[2], marks) == expected, \
+        f"⚠ 指紋字串的格式變了（既有 manifest 會全部對不上）：\n{v.session_signature(files[2], marks)}\n應為\n{expected}"
+    assert v.session_signature(files[2], marks, {}) == expected, "⚠ 共用字典那一種的指紋格式變了"
+    assert v.session_signature(files[4]) == f"pc-0.jsonl:{ms(files[4])}", "⚠ 沒有 memory 的專案，指紋格式變了"
+    print("OK: signature memory shared test passed")
+
+
+def test_version_flag(tmp_path=None):
+    """`--version` 印 `ai-session-viewer <版本>`、結束碼 0、stderr 沒有東西，而且什麼都不做：
+    不看家目錄（自動偵測來源）、不讀明確給的來源、不在工作目錄建任何東西。
+
+    版本字串是 `主.次.修`（公開 repo 的 tag 是 `v` 加上它）。
+    「沒有讀」直接量：子行程裡掛 audit hook，記下落在假家目錄、明確來源、工作目錄底下的
+    開檔與列目錄；對照組（同一套記錄、不帶 `--version` 跑一次真的建置）要記得到東西，記錄本身才算數。"""
+    import ai_session_viewer as v
+    assert re.fullmatch(r"\d+\.\d+\.\d+", v.__version__), f"版本字串應為 主.次.修：{v.__version__!r}"
+    tmp = new_tmp(tmp_path)
+    cwd, home = tmp / "run", tmp / "home"
+    cwd.mkdir()
+    for d in (".claude/projects/p", ".codex/sessions/2026/08/01", ".gemini/antigravity-cli/conversations"):
+        (home / d).mkdir(parents=True)
+    (home / ".claude/projects/p/00000000-0000-4000-8000-0000000000aa.jsonl").write_text("{}\n", encoding="utf-8")
+    projects = _build_fixture(tmp / "src")
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+
+    r = subprocess.run([sys.executable, str(SCRIPT), "--version"], cwd=str(cwd), env=env,
+                       capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, f"--version 應以 0 結束：{r.returncode}\n{r.stderr}"
+    assert r.stdout == f"ai-session-viewer {v.__version__}\n", f"--version 印的不對：{r.stdout!r}"
+    assert r.stderr == "", f"⚠ --version 的 stderr 應該是空的：{r.stderr!r}"
+    assert not any(cwd.iterdir()), f"⚠ --version 不應該做任何事，卻在工作目錄留下了：{list(cwd.iterdir())}"
+
+    def audited(*args):
+        code = (
+            "import os, sys, json\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            f"roots = [os.path.normcase(os.path.abspath(p)) for p in {[str(home), str(tmp / 'src'), str(cwd)]!r}]\n"
+            "hits = []\n"
+            "def hook(ev, a):\n"
+            "    if ev in ('open', 'os.listdir', 'os.scandir', 'glob.glob') and a and isinstance(a[0], (str, bytes, os.PathLike)):\n"
+            "        p = os.path.normcase(os.path.abspath(os.fsdecode(a[0])))\n"
+            "        if any(p == r or p.startswith(r + os.sep) for r in roots):\n"
+            "            hits.append(ev + ' ' + p)\n"
+            "sys.addaudithook(hook)\n"
+            f"sys.argv = ['ai_session_viewer.py'] + {list(args)!r}\n"
+            "import ai_session_viewer as v\n"
+            "try:\n    v.main()\nexcept SystemExit:\n    pass\n"
+            "print('AUDIT-HITS ' + json.dumps(hits))\n")
+        rr = subprocess.run([sys.executable, "-c", code], cwd=str(cwd), env=env,
+                            capture_output=True, text=True, encoding="utf-8")
+        line = [ln for ln in rr.stdout.splitlines() if ln.startswith("AUDIT-HITS ")]
+        assert len(line) == 1, f"子行程沒有回報存取紀錄\n{rr.stdout}\n{rr.stderr}"
+        return json.loads(line[0][len("AUDIT-HITS "):])
+
+    # 對照組：不帶 `--version`、真的建一次（輸出寫到工作目錄外），記錄要抓得到讀來源
+    control = audited("--claude-source", f"demo={projects}", "--no-codex", "--no-antigravity",
+                      "--out", str(tmp / "out-control"))
+    assert any(str(tmp / "src").lower() in h.lower() for h in control), \
+        f"素材沒生效：真的建置時存取紀錄沒抓到讀來源：{control[:5]}"
+    # 帶 `--version`（也給了明確來源）：家目錄、來源、工作目錄一個都不碰
+    hits = audited("--version", "--claude-source", f"demo={projects}")
+    assert hits == [], f"⚠ --version 不應該碰任何來源或家目錄：{hits[:5]}"
+    print("OK: --version flag test passed")
 
 
 def test_no_uppercase_unicode_escape_in_js(tmp_path=None):
@@ -11807,6 +12049,7 @@ if __name__ == "__main__":
     test_cache_report()
     test_review_detection()
     test_cache_report_by_kind()
+    test_cache_report_active_days()
     test_classify_cache_causes()
     test_cold_cause_badges()
     test_api_miss_reason()
@@ -11842,6 +12085,9 @@ if __name__ == "__main__":
     test_bookmark_all_sources_deleted()
     test_zero_scan_keeps_out_of_scope_index()
     test_zero_scan_keeps_cache_report_links()
+    test_no_cache_report_flag()
+    test_signature_memory_shared()
+    test_version_flag()
     test_no_uppercase_unicode_escape_in_js()
     test_user_turn_fidelity()
     test_codex_sentinel_false_alarms()

@@ -47,6 +47,10 @@ try:
 except Exception:
     pass
 
+# 工具的版本（`--version` 印的就是它）。出版時手動改，和公開 repo 的 git tag 對齊（tag 是 `v` 加上這個字串）。
+# 和 `RENDERER_VERSION` 是兩件事：那一個只管「既有輸出要不要重建」，每次頁面呈現一變就升。
+__version__ = "1.1.0"
+
 MAX_RESULT_CHARS = 20000           # tool 結果在 HTML 裡的最大字數（可摺疊，超過截斷）
 MAX_WRITE_CHARS = 8000             # Write/檔案內容預覽上限
 MAX_IMG_BYTES = 3 * 1024 * 1024    # 內嵌圖片上限（解碼後位元組）；超過只放佔位
@@ -10073,14 +10077,14 @@ def build_cache_report(rows, stratify=True, acct_health=None):
             tok_in += st[2]
             mode_n["1h" if st[5] > 0 else ("5m" if st[4] > 0 else "unknown")] += 1
         steps = [(i, st) for i, st in enumerate(raw) if st[2] >= REPORT_MIN_CTX]
+        row_miss = [_step_miss(st) for st in raw]   # 每一步的 API 自報成因只算一次；下面一律用 raw 裡的索引取
         # API 自報成因盤點（獨立於成因判定：連「命中率看起來正常、但 API 說有一段被重寫」的
         # 部分失效也算進來——那是逐步徽章之外唯一看得到它的地方）。
         # 母體用 raw、不用 ctx 過濾後的 steps：ctx < REPORT_MIN_CTX 的過濾是為了「由命中率推論成因」
         # 才存在的（暖機步的命中率無參考意義），但 API 自報是**事實**、不是推論，對它不適用。
         # 用 steps 會少算次數／失效前綴長度／金額，還可能把未知的新型別整個吞掉（違反不變量⑤），
         # 而 ②-b 文案又宣稱母體是「所有有自報成因的呼叫」——數字與宣稱不符。
-        for st in raw:
-            reason, mtok = _step_miss(st)
+        for st, (reason, mtok) in zip(raw, row_miss):
             if not reason:
                 continue
             bucket = "cold" if _step_cold(st) else "partial"
@@ -10110,8 +10114,8 @@ def build_cache_report(rows, stratify=True, acct_health=None):
             # 可能命中上一場留下的前綴，此時 tools/system/msgs 才是真成因；標 first 會把「習慣可避免」
             # 的成因記進「不可避免」桶，也讓 ② 與 ②-b／逐步徽章對同一步說法不一。
             # 同 classify_cache_causes：直接證據兩個 dict 都要查（兩處是刻意的雙胞胎）。
-            fc = (API_MISS_CAUSE.get(_step_miss(steps[0][1])[0])
-                  or API_OTHER_CAUSE.get(_step_miss(steps[0][1])[0]))
+            fc = (API_MISS_CAUSE.get(row_miss[steps[0][0]][0])
+                  or API_OTHER_CAUSE.get(row_miss[steps[0][0]][0]))
             if fc == "msgs" and any(k == "compact" and t <= t0 for t, k in events):
                 fc = "compact"
             fc = fc or "first"
@@ -10151,15 +10155,15 @@ def build_cache_report(rows, stratify=True, acct_health=None):
                         "compact" if "compact" in kinds else None)
             # 前綴變動（工具/系統提示/前文/換模型）是 client 造成、必然重寫，不是快取沒撐住 →
             # 與結構性邊界同樣視為競爭風險：定成因用它，且該相鄰步對不進 TTL 存活／應命中帶統計。
-            api_cause = API_MISS_CAUSE.get(_step_miss(cur)[0])
+            api_cause = API_MISS_CAUSE.get(row_miss[ic][0])
             # 同 classify：**不向前借**。但這一側**會**整對移出樣本（下面的 `srv_excluded`）——
             # 兩側在「成因」上一致、在「樣本」上只有這一側有動作，那是刻意的分工。
-            srv_cause = API_OTHER_CAUSE.get(_step_miss(cur)[0])
+            srv_cause = API_OTHER_CAUSE.get(row_miss[ic][0])
             if not api_cause:
                 # 同 classify_cache_causes：夾在中間、被 ctx 門檻濾掉的前綴變動步照樣污染這一對。
                 # 範圍限制 SCOPE-FILTERED-STEP-CAUSE 同樣適用於此（兩處是刻意的雙胞胎）。
-                api_cause = next((c for r in raw[ip + 1:ic]
-                                  if (c := API_MISS_CAUSE.get(_step_miss(r)[0]))), None)
+                api_cause = next((c for m in row_miss[ip + 1:ic]
+                                  if (c := API_MISS_CAUSE.get(m[0]))), None)
             if api_cause == "msgs" and boundary == "compact":
                 api_cause = "compact"      # 同 classify_cache_causes：壓縮邊界比通稱 msgs 更準
             cohort = last_write or "unknown"
@@ -10306,7 +10310,7 @@ def build_cache_report(rows, stratify=True, acct_health=None):
                     evict_form.append((cur[1], cur[3], cur[2], prev[2]))
                     # 帶內失效時 API 怎麼說。前綴變動類與伺服器側不可用**都**已在上面整對排除，
                     # 所以這裡收得到的只會是 previous_message_not_found、未知碼，或「沒說」。
-                    r_api = _step_miss(cur)[0]
+                    r_api = row_miss[ic][0]
                     band_api[r_api or "-"] = band_api.get(r_api or "-", 0) + 1
             # ⚠ 這一對即使被計入（切換晚於 TTL 邊界、快取在切換前就自然過期了），lineage 照樣
             # 已在上面被重置——`_resets_lineage` 的 acct 入口問的是「窗裡有沒有切帳號」，
@@ -10342,7 +10346,7 @@ def build_cache_report(rows, stratify=True, acct_health=None):
     act_wd, act_we = set(), set()                    # 活躍日數（有任何步驟的日子），供 次/日 正規化
     for t in all_ts:
         loc = datetime.fromtimestamp(t)
-        (act_we if loc.weekday() >= 5 else act_wd).add(loc.strftime("%Y-%m-%d"))
+        (act_we if loc.weekday() >= 5 else act_wd).add(loc.date())     # 只數個數：日期物件就夠，不必每一步都格式化成字串
 
     # ── 分期成因堆疊：預設按週（週一起算）；期間太長改按月 ──
     periods = []
@@ -12143,9 +12147,33 @@ def iter_codex_session_files(source: Path):
         yield sf
 
 
-def session_signature(main_path: Path, marks=()) -> str:
+def _signature_parts(paths) -> list:
+    """`session_signature` 的一段：每個檔一筆 `標記檔名:mtime_ns:size`；`paths` 的元素是路徑或 `(標記, 路徑)`，讀不到的檔略過。"""
+    parts = []
+    for p in paths:
+        tag, p = p if isinstance(p, tuple) else ("", p)
+        try:
+            st = p.stat()
+            parts.append(f"{tag}{p.name}:{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            pass
+    return parts
+
+
+def _memory_signature_parts(mem_dir: Path) -> list:
+    if not mem_dir.is_dir():
+        return []
+    return _signature_parts(("mem", p) for p in sorted(mem_dir.glob("*.md")))
+
+
+def session_signature(main_path: Path, marks=(), mem_parts=None) -> str:
     """主檔 + 外部子代理檔 + 同專案 memory/ 的 (檔名, mtime, size) 組合，作為變動指紋。
     把 memory 納入：memory 新增/變動/移除時，session 會重建（頁頂 🧠 連結與 row 的 mem_href 才會更新）。
+
+    `mem_parts` 是一次建置共用的字典（memory 目錄 → 那一段指紋）：同一個專案的每一場共用同一個 memory 目錄，
+    給了就每個目錄只讀一次，同一次建置裡同專案的每一場都用那一份。檔案沒有在建置途中變動時，結果和不給一樣。
+    範圍限制 SCOPE-SIG-MEMORY-PER-BUILD：建置途中才新增或改動的 memory 檔，這一次建置裡同專案的場次看不到；
+    存下的指紋因此和磁碟對不上，下一次建置會重建那幾場。
 
     `marks` 是這場 session 的切帳號時刻（load_account_switches 的結果）。**必須進指紋**：
     那份資料來自 repo 外的 history.jsonl，transcript 完全沒變也可能改變歸因結果（新增一個帳號、
@@ -12155,17 +12183,15 @@ def session_signature(main_path: Path, marks=()) -> str:
     side = main_path.with_suffix("")
     if side.is_dir():
         paths += sorted(side.rglob("*.jsonl"))
+    parts = _signature_parts(paths)
     mem_dir = main_path.parent / "memory"          # Claude 專案 memory（Codex 無，無副作用）
-    if mem_dir.is_dir():
-        paths += [("mem", p) for p in sorted(mem_dir.glob("*.md"))]
-    parts = []
-    for p in paths:
-        tag, p = p if isinstance(p, tuple) else ("", p)
-        try:
-            st = p.stat()
-            parts.append(f"{tag}{p.name}:{st.st_mtime_ns}:{st.st_size}")
-        except OSError:
-            pass
+    if mem_parts is None:
+        parts += _memory_signature_parts(mem_dir)
+    else:
+        key = str(mem_dir)
+        if key not in mem_parts:
+            mem_parts[key] = _memory_signature_parts(mem_dir)
+        parts += mem_parts[key]
     if marks:
         # ⚠ 精度必須與**顯示定位用的精度**一致。截成整秒的話，同一秒內的切換時刻變動
         # （例如 .700 → .300，會跨過某個回合）不會改變指紋 → 增量建置沿用舊頁，
@@ -12401,6 +12427,15 @@ def _index_rows(entries: dict, include_empty: bool) -> list:
     """
     return [e["row"] for e in entries.values()
             if e.get("row") and (include_empty or not e["row"].get("empty"))]
+
+
+def _kept_cache_reports(out: Path, ext: str) -> tuple:
+    """`--no-cache-report` 沿用上一次的報告時，索引要不要連到它們 → `(Claude 報告, Codex 報告)`。
+
+    照磁碟上的檔判，不照這一次的資料判（這一次沒有算）。Claude 那一份是兩頁（健檢＋假說檢定），
+    索引兩頁都連 ⇒ 兩頁都在才算有。`ext` 是 `.html` 或 `.md`：兩種索引各連自己那一種格式的檔。"""
+    return (all((out / f"{name}{ext}").is_file() for name in ("cache-report", "cache-hypotheses")),
+            (out / f"cache-codex{ext}").is_file())
 
 
 ARCHIVE_MANIFEST = "_archived.jsonl"
@@ -14039,6 +14074,9 @@ def run_ai_md(args):
 def main():
     ap = argparse.ArgumentParser(description="把 Claude Code / Codex 的 JSONL session（與 Antigravity CLI 的對話檔）"
                                              "轉成 HTML/Markdown")
+    # 範圍限制 SCOPE-VERSION-ARG-ORDER：照 argparse 的順序處理——`--version` 前面先出現 `-h` 或參數值錯誤時，先到的那一個生效。
+    ap.add_argument("--version", action="version", version=f"ai-session-viewer {__version__}",
+                    help="印出版本後結束")
     ap.add_argument("--claude-source", action="append", default=None,
                     help="輸入的 Claude projects 目錄，可多次指定，亦可寫「標籤=路徑」；未指定時自動偵測 ~/.claude*")
     ap.add_argument("--account", default="",
@@ -14057,6 +14095,8 @@ def main():
     ap.add_argument("--include-empty", action="store_true",
                     help="連同只有 /指令、無實際對話的空 session 一起輸出")
     ap.add_argument("--force", action="store_true", help="忽略快取，全部重新產生")
+    ap.add_argument("--no-cache-report", action="store_true",
+                    help="不重算快取報告：沿用上一次產生的 cache-report／cache-hypotheses／cache-codex（內容停在那一次）")
     ap.add_argument("--open", action="store_true", help="完成後打開 index.html")
     ap.add_argument("--search", default=None, metavar="查詢",
                     help="全文搜尋既有輸出的對話內容並產生結果頁到 out/search/（不重新轉換，先跑過一次轉換）。"
@@ -14203,6 +14243,8 @@ def main():
         _n_clash = report_output_clashes(_index_rows(new_entries, args.include_empty))
         if _n_clash:
             print(f"⚠ 輸出檔名相同 {_n_clash} 個（見上面的 ! 訊息）")
+        # 範圍限制 SCOPE-ZERO-SCAN-HTML-INDEX-ONLY：這條路只重畫 html 的索引（帶不帶 `--no-cache-report` 都一樣），
+        # `index.md` 停在上一次 md 建置寫的樣子，連它的快取報告連結在內。
         if want_html:
             # ⚠⚠ **索引頁要用對帳後的 `new_entries` 重畫，不可以寫死。**
             #     `new_entries` 在縮範圍時保留了範圍外的紀錄（正常路徑本來就會把它們
@@ -14219,12 +14261,15 @@ def main():
             #     守它的是 `tests/test_smoke.py::test_zero_scan_keeps_out_of_scope_index`
             #     （列還在）與 `::test_zero_scan_keeps_cache_report_links`（連結還在）。
             zero_rows = _index_rows(new_entries, args.include_empty)
-            zero_cache = build_cache_report(zero_rows, acct_health=acct_health)
+            if args.no_cache_report:
+                zero_links = _kept_cache_reports(out, ".html")
+            else:
+                zero_links = (build_cache_report(zero_rows, acct_health=acct_health)["has_data"],
+                              build_codex_survival(zero_rows)["has_data"])
             _write_atomic(out / "index.html",
                           render_index_html(zero_rows,
                                             len({r.get("account", "") for r in zero_rows}) > 1,
-                                            zero_cache["has_data"],
-                                            build_codex_survival(zero_rows)["has_data"]))
+                                            *zero_links))
             bx_fallback, _ = prune_gone_sources(load_manifest_paths(out), scanned_roots)
             _write_atomic(sess_dir / "bookmarks.html", render_bookmarks_html([], bx_fallback, sess_dir))
             _write_atomic(sess_dir / "settings.html", render_settings_html())
@@ -14282,6 +14327,7 @@ def main():
             if k not in cwd_new and os.path.exists(k):        # 任何 OSError 都當成不在（只少一筆快取）
                 cwd_new[k] = v
     save_cwd_cache(out, cwd_new)
+    sig_mem = {}                                    # memory 目錄 → 指紋那一段（同專案的每一場共用，見 `session_signature`）
     n_build = n_reuse = n_empty = n_broken = 0      # n_broken：壞掉被跳過的來源檔
     n_broken_kept = 0                              # 其中「沿用上一次輸出」的（見下方 except）
     for source_kind, acc_name, proj_name, sf in files:
@@ -14291,7 +14337,7 @@ def main():
             sig = antigravity_signature(*ag_tree.get(str(sf), ({"path": sf}, ())))
         else:
             # Claude 的 transcript 檔名就是 sessionId，切帳號資料據此對應（Codex 無此資料）
-            sig = session_signature(sf, acct_switches.get(sf.stem, ()))
+            sig = session_signature(sf, acct_switches.get(sf.stem, ()), sig_mem)
         cached = manifest.get(key) or {}
         row = cached.get("row")
         if (source_kind in (SOURCE_CODEX, SOURCE_ANTIGRAVITY) and args.project and row
@@ -14512,40 +14558,46 @@ def main():
                     except OSError:
                         pass
 
-    # 快取分析報告：彙整所有 Claude session 的 cache_steps（增量建置時沿用 row 內存的序列，免重讀）
-    cache_data = build_cache_report(rows, acct_health=acct_health)
-    has_report = cache_data["has_data"]
-    if has_report and want_html:
-        _write_atomic(out / "cache-report.html", render_cache_report_html(cache_data))
-        _write_atomic(out / "cache-hypotheses.html", render_cache_hypotheses_html(cache_data))
-    if has_report and want_md:
-        _write_atomic(out / "cache-report.md", render_cache_report_md(cache_data))
-        _write_atomic(out / "cache-hypotheses.md", render_cache_hypotheses_md(cache_data))
-    if not has_report:                       # 沒有可分析資料：清掉舊報告，避免索引指向過期檔
-        for stale in (out / "cache-report.html", out / "cache-report.md",
-                      out / "cache-hypotheses.html", out / "cache-hypotheses.md"):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
+    if args.no_cache_report:
+        # 不重算：三份報告都沿用磁碟上上一次的檔（不寫也不刪）；索引照檔在不在決定連不連，兩種格式各看各的
+        links_html, links_md = _kept_cache_reports(out, ".html"), _kept_cache_reports(out, ".md")
+    else:
+        # 快取分析報告：彙整所有 Claude session 的 cache_steps（增量建置時沿用 row 內存的序列，免重讀）
+        print("產生快取報告…")
+        cache_data = build_cache_report(rows, acct_health=acct_health)
+        has_report = cache_data["has_data"]
+        if has_report and want_html:
+            _write_atomic(out / "cache-report.html", render_cache_report_html(cache_data))
+            _write_atomic(out / "cache-hypotheses.html", render_cache_hypotheses_html(cache_data))
+        if has_report and want_md:
+            _write_atomic(out / "cache-report.md", render_cache_report_md(cache_data))
+            _write_atomic(out / "cache-hypotheses.md", render_cache_hypotheses_md(cache_data))
+        if not has_report:                       # 沒有可分析資料：清掉舊報告，避免索引指向過期檔
+            for stale in (out / "cache-report.html", out / "cache-report.md",
+                          out / "cache-hypotheses.html", out / "cache-hypotheses.md"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
 
-    # Codex 快取存活統計：獨立於 Claude 報告（兩家 TTL 機制不同，資料層即分離，不混統計）
-    codex_data = build_codex_survival(rows)
-    codex_data["claude_report"] = has_report
-    has_codex_report = codex_data["has_data"]
-    if has_codex_report and want_html:
-        _write_atomic(out / "cache-codex.html", render_codex_survival_html(codex_data))
-    if has_codex_report and want_md:
-        _write_atomic(out / "cache-codex.md", render_codex_survival_md(codex_data))
-    if not has_codex_report:
-        for stale in (out / "cache-codex.html", out / "cache-codex.md"):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
+        # Codex 快取存活統計：獨立於 Claude 報告（兩家 TTL 機制不同，資料層即分離，不混統計）
+        codex_data = build_codex_survival(rows)
+        codex_data["claude_report"] = has_report
+        has_codex_report = codex_data["has_data"]
+        if has_codex_report and want_html:
+            _write_atomic(out / "cache-codex.html", render_codex_survival_html(codex_data))
+        if has_codex_report and want_md:
+            _write_atomic(out / "cache-codex.md", render_codex_survival_md(codex_data))
+        if not has_codex_report:
+            for stale in (out / "cache-codex.html", out / "cache-codex.md"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        links_html = links_md = (has_report, has_codex_report)
 
     if want_html:
-        _write_atomic(out / "index.html", render_index_html(rows, show_account, has_report, has_codex_report))
+        _write_atomic(out / "index.html", render_index_html(rows, show_account, *links_html))
         # 書籤管理頁與設定頁（第 3 期）。⚠ 放 `out/sessions/` **底下**，不是 `out/` 根：
         # 和寫入者（session 頁）同一棵子樹，把「目錄層級」這個變數整個消掉。
         # ⚠ 兩份和 index.html 一樣**每次都無條件重產**，不受 manifest 的版本閘管。
@@ -14570,7 +14622,7 @@ def main():
             except OSError:
                 pass
     if want_md:
-        _write_atomic(out / "index.md", render_index_md(rows, show_account, has_report, has_codex_report))
+        _write_atomic(out / "index.md", render_index_md(rows, show_account, *links_md))
 
     # 清掉已不存在 session 的孤兒輸出檔（縮小範圍模式下不清，以免誤刪未處理的帳號/專案）
     removed = 0
@@ -14611,11 +14663,12 @@ def main():
     index_path = (out / "index.html").resolve()
     if want_html:
         print(f"  索引： {index_path}")
-        if has_report:
-            print(f"  快取分析報告： {(out / 'cache-report.html').resolve()}")
-            print(f"  快取假說檢定： {(out / 'cache-hypotheses.html').resolve()}")
-        if has_codex_report:
-            print(f"  Codex 快取存活： {(out / 'cache-codex.html').resolve()}")
+        kept = "（沿用上一次，--no-cache-report）" if args.no_cache_report else ""
+        if links_html[0]:
+            print(f"  快取分析報告{kept}： {(out / 'cache-report.html').resolve()}")
+            print(f"  快取假說檢定{kept}： {(out / 'cache-hypotheses.html').resolve()}")
+        if links_html[1]:
+            print(f"  Codex 快取存活{kept}： {(out / 'cache-codex.html').resolve()}")
     if args.open and want_html:
         try:
             webbrowser.open(index_path.as_uri())

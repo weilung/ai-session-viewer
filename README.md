@@ -106,7 +106,8 @@ python3 ai_session_viewer.py --no-claude --out ~/codex-logs --open
 > 若 `CLAUDE_CONFIG_DIR` 指到其他位置（例如 `D:\foo`），請改用 `--claude-source work=D:\foo\projects`。
 
 **同一場出現在好幾個地方時**：
-- 同一個 session 檔（檔名相同）出現在好幾個來源裡，只列比較大的那一份。
+- 同一個 session 檔（檔名相同）出現在好幾個來源裡，只列比較大的那一份。只建一部分（`--account`、`--project`…）時
+  也照這個規則比，連同這一次沒涵蓋、上一次建過的那一份一起比。
 - 跨機同步工具 [claude-session-sync](https://github.com/weilung/claude-session-sync) 不覆蓋你本機的檔，會在旁邊另存一份
   `<原檔名>.synced-<電腦名>-<時間>.jsonl`。副本是另一個檔名，就是另一場（`claude --resume` 也這樣認）：自己一列、自己一頁，
   那一列與那一頁標「同步副本 <電腦名> <時間>」。內容可能和原檔一樣，也可能各自接著聊過；兩份共同的那一段在花費與
@@ -124,6 +125,11 @@ python3 ai_session_viewer.py --no-claude --out ~/codex-logs --open
 - 快取報告每次都用**全部** session 重算（session 一多就要幾秒）；平常不看報告的話加 `--no-cache-report`，
   報告沿用上一次產生的那一份，想看最新的再跑一次不帶它的。
 - 局部重產（`--project` / `--account` / `--claude-source`）時，不會動到也不會誤刪其他範圍的既有輸出。
+- 某一場讀不起來時，跳過它、沿用上一次的頁面（加 `--force` 時也一樣），完成訊息會講出來；
+  索引上那一列標「⚠ 上次的內容」，下一次建置讀得動就消失。
+- 工具升版、頁面的畫法改了時，下一次建置會把每一場重產一遍。重產之前，上一版的頁面照樣留著、書籤照樣連得到，
+  只是**不列進索引與快取報告**：那一次讀不起來的那一場，下一次再試；只建一部分時沒涵蓋到的那幾場，跑一次
+  涵蓋全部來源的完整建置就補齊。完成訊息會講有幾場是這樣。
 
 ## 整理只有指令的 session
 

@@ -6299,9 +6299,9 @@ def test_bookmark_link_durability(tmp_path=None):
     assert (out / after[a]["u"]).exists(), f"新檔名要指到真的存在的檔：{after[a]['u']}"
 
     # --- 2. ⚠⚠ renderer 升版 ＋ 縮範圍建置，不可以把還在的檔講成「不在輸出裡」---
-    # `load_manifest` 在版本不符時回空字典（那是對的：快取的 row 內容可能過時），
+    # 版本不符時這一版的列是空的（那是對的：快取的 row 內容可能過時），
     # 於是 `rows` 只剩本次掃到的那幾場。但**檔名與標題不隨 renderer 改變**，
-    # 所以管理頁另外走 `load_manifest_paths()` 把它們補回來。
+    # 所以管理頁另外拿 `read_manifest()` 的 `known` 把它們補回來。
     mf = out / asv.MANIFEST_NAME
     d = json.loads(mf.read_text(encoding="utf-8"))
     d["renderer_version"] = -1                       # 模擬升版：manifest 一律被視為過期
@@ -6666,6 +6666,9 @@ def test_zero_scan_keeps_out_of_scope_index(tmp_path=None):
          "從索引消失了（manifest 與 BX_SESS 都還指著它）")
     # ③ 被刪掉的那一場不在（否則「整份原封不動」也會通過）
     assert "ZETA" not in idx, "來源已刪除的那一場還留在索引裡"
+    # ④ md 的索引也照對帳後的列重畫（和 html 一樣）
+    md = (out / "index.md").read_text(encoding="utf-8")
+    assert "EPSILON" in md and "ZETA" not in md, "⚠ 零場建置沒有重畫 index.md（還列著來源已刪除的那一場）"
     print("OK: zero-scan build keeps out-of-scope rows in index test passed")
 
 
@@ -6808,16 +6811,21 @@ def test_no_cache_report_flag(tmp_path=None):
         "⚠ 假說頁不在了，html 索引還連著（索引同時連兩頁，少一頁就會有死連結）"
     assert "cache-report.md" in md and "cache-hypotheses.md" in md, "⚠ md 那兩頁都還在，md 索引卻不連了"
 
-    # ⑤ 零場那條路帶旗標：照檔判（md 兩頁在、html 少一頁 ⇒ html 索引不連；Codex html 在 ⇒ 連）
+    # ⑤ 零場那條路帶旗標：照檔判（html 少一頁 ⇒ html 索引不連；Codex html 在 ⇒ 連）。md 索引也照 md 的檔判：
+    #    放一份 md 的 Codex 頁 ⇒ md 索引連健檢頁、也連 Codex 頁——上一次寫的 md 索引不連 Codex、照 html 的檔判不連健檢頁，
+    #    兩種錯法各少一條
+    (out / "cache-codex.md").write_text("上一次的 Codex 頁", encoding="utf-8")
     src_file = projects / "demo-proj" / f"{SID}.jsonl"
     keep = src_file.read_bytes()
     src_file.unlink()
     r = _build("--no-cache-report")
     assert "沒有找到任何 session 檔" in r.stdout, f"沒有走到零場那條路\n{r.stdout}"
     assert r.calls == {"claude": 0, "codex": 0}, f"⚠ 零場帶旗標時還是算了報告：{r.calls}"
-    html, _ = _idx()
+    html, md = _idx()
     assert "cache-codex.html" in html, "⚠ 零場帶旗標時，磁碟上的 Codex 頁沒被連到"
     assert "cache-report.html" not in html, "⚠ 零場帶旗標時，少一頁的 Claude 報告還被連著"
+    assert "cache-codex.md" in md and "cache-report.md" in md, \
+        "⚠ 零場帶旗標時，md 索引沒有照 md 的檔重判報告連結"
     src_file.write_bytes(keep)
 
     # ⑥ 不帶旗標：照舊重算——缺的假說頁補回來，沒有 Codex 資料 ⇒ 上一次的 Codex 頁清掉
@@ -6881,6 +6889,447 @@ def test_signature_memory_shared(tmp_path=None):
     assert v.session_signature(files[2], marks, {}) == expected, "⚠ 共用字典那一種的指紋格式變了"
     assert v.session_signature(files[4]) == f"pc-0.jsonl:{ms(files[4])}", "⚠ 沒有 memory 的專案，指紋格式變了"
     print("OK: signature memory shared test passed")
+
+
+def _mk_claude_session(path, sid, marker, day=1, extra=0, cwd="/x/Proj", cache=False):
+    """一場最小的 Claude 對話（使用者一則、助理一則）寫到 `path`；`extra`＝再多接幾對（檔案變大、內容帶 `marker` 加編號）。
+    `cache`＝助理每一則帶快取用量（第一則寫入、之後讀取）⇒ `extra` 至少 1 時這一場進得了快取報告。"""
+    def usage(i):
+        u = {"input_tokens": 10, "output_tokens": 5}
+        if cache:
+            u["cache_read_input_tokens" if i else "cache_creation_input_tokens"] = 2000
+        return u
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ts = f"2026-08-0{day}T01:00:00.000Z"
+    evs = [
+        {"type": "user", "uuid": "u0", "parentUuid": None, "timestamp": ts, "cwd": cwd,
+         "gitBranch": "main", "version": "2.1.150", "sessionId": sid,
+         "message": {"role": "user", "content": f"{marker} 第一則。"}},
+        {"type": "assistant", "uuid": "a0", "parentUuid": "u0", "timestamp": ts, "sessionId": sid,
+         "message": {"role": "assistant", "model": "claude-opus-4-7", "id": "m0",
+                     "usage": usage(0),
+                     "content": [{"type": "text", "text": f"{marker} 回覆。"}]}},
+    ]
+    for i in range(1, extra + 1):
+        t = f"2026-08-0{day}T01:0{i}:00.000Z"
+        evs += [
+            {"type": "user", "uuid": f"u{i}", "parentUuid": f"a{i - 1}", "timestamp": t, "cwd": cwd,
+             "gitBranch": "main", "version": "2.1.150", "sessionId": sid,
+             "message": {"role": "user", "content": f"{marker}{i} 接著問。"}},
+            {"type": "assistant", "uuid": f"a{i}", "parentUuid": f"u{i}", "timestamp": t, "sessionId": sid,
+             "message": {"role": "assistant", "model": "claude-opus-4-7", "id": f"m{i}",
+                         "usage": usage(i),
+                         "content": [{"type": "text", "text": f"{marker}{i} 回覆。"}]}},
+        ]
+    path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in evs), encoding="utf-8")
+
+
+def _build_in_child(out, args, env=None, boom=None):
+    """在子行程裡跑一次建置：`boom`＝讓這個 session id 的分析丟例外（其餘照常）。
+    另外數這一次建置開了幾次建置紀錄檔（`r.manifest_opens`；寫入走 `.tmp` 再換上，不算在內）。"""
+    import ai_session_viewer as v
+    mf = str(Path(out) / v.MANIFEST_NAME)
+    code = (
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        f"sys.argv = ['ai_session_viewer.py', '--out', {str(out)!r}] + {list(args)!r}\n"
+        "import ai_session_viewer as v\n"
+        f"mf = os.path.normcase(os.path.abspath({mf!r}))\n"
+        "n = [0]\n"
+        "def hook(ev, a):\n"
+        "    if ev == 'open' and a and isinstance(a[0], (str, bytes, os.PathLike)):\n"
+        "        if os.path.normcase(os.path.abspath(os.fsdecode(a[0]))) == mf:\n"
+        "            n[0] += 1\n"
+        "sys.addaudithook(hook)\n")
+    if boom:
+        code += ("_orig = v.analyze\n"
+                 "def _boom(s, acct=None):\n"
+                 f"    if getattr(s, 'session_id', '') == {boom!r}:\n"
+                 "        raise AttributeError('injected')\n"
+                 "    return _orig(s, acct)\n"
+                 "v.analyze = _boom\n")
+    code += "v.main()\nprint('MANIFEST-OPENS ' + str(n[0]))\n"
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, encoding="utf-8",
+                       env=env or dict(os.environ))
+    assert r.returncode == 0, f"建置非零退出 {args}\n{r.stdout}\n{r.stderr}"
+    line = [ln for ln in r.stdout.splitlines() if ln.startswith("MANIFEST-OPENS ")]
+    assert len(line) == 1, f"子行程沒有回報開檔次數\n{r.stdout}\n{r.stderr}"
+    r.manifest_opens = int(line[0].split()[1])
+    return r
+
+
+def _bx_sess(out):
+    """書籤管理頁烤進去的 sid → `{u, t, …}` 反查表。"""
+    mgr = (Path(out) / "sessions" / "bookmarks.html").read_text(encoding="utf-8")
+    m = re.search(r"var BX_SESS=(\{.*?\});", mgr, re.S)
+    assert m, "管理頁裡讀不到 BX_SESS"
+    return json.loads(m.group(1).replace("\\u003c", "<").replace("\\u003e", ">"))
+
+
+def _manifest(out):
+    import ai_session_viewer as v
+    return json.loads((Path(out) / v.MANIFEST_NAME).read_text(encoding="utf-8"))
+
+
+def _bump_manifest(out):
+    """模擬 renderer 升版：建置紀錄的版本改成對不上。"""
+    import ai_session_viewer as v
+    d = _manifest(out)
+    d["renderer_version"] = -1
+    (Path(out) / v.MANIFEST_NAME).write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+
+
+def _kept_marked(html, md):
+    """兩份索引裡標了「上次的內容」的列：各回一組素材標記（`…MARK`）。HTML 照 `<tr data-sid` 切列、看的是
+    畫出來的那顆標籤（`data-text` 篩選字串裡也有這幾個字，只看字的話標籤拿掉了照樣算有標）；MD 照行。"""
+    def marks(chunks, needle):
+        return {m for c in chunks if needle in c for m in re.findall(r"[A-Z]+MARK", c)}
+    return (marks((c.split("</tr>")[0] for c in html.split("<tr data-sid")[1:]), "上次的內容</span>"),
+            marks((l for l in md.splitlines() if l.startswith("- ")), "上次的內容"))
+
+
+def test_prev_rows_after_version_bump(tmp_path=None):
+    """renderer 升版之後（建置紀錄的版本不同），靠「上一次的列」的保證照樣成立；上一版的列不畫進索引、不算進報告。
+
+    ①完整建置裡壞掉的那一場：上一版的頁面留著（不被清孤兒檔刪掉、內容不動）、書籤管理頁連得到、不在兩份索引，
+      收尾講「留著上一版的頁面（不在索引）」；下一次不壞就照這一版重建、回到索引。
+    ②`--force` 時壞掉的那一場照樣沿用上一次的輸出（同一版的列，畫進索引、兩份索引標「上次的內容」；
+      下一次讀得動、走沿用那條路時拿掉）。
+    ③升版後縮範圍建置連跑兩次：範圍外那一場的書籤一直連得到、不在索引；完整建置之後全部回到索引，上一版的列清空。
+    ④每一次建置只讀一次建置紀錄。
+    完整建置（不帶來源旗標）才會清孤兒檔 ⇒ 在假家目錄的 `~/.claude/projects` 下跑。"""
+    sys.path.insert(0, str(ROOT))
+    tmp = new_tmp(tmp_path)
+    home = tmp / "home"
+    out = tmp / "out"
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+    ids = {"Alpha": "a1a10000-0000-4000-8000-00000000a1a1", "Beta": "b2b20000-0000-4000-8000-00000000b2b2",
+           "Gamma": "c3c30000-0000-4000-8000-00000000c3c3"}
+    for i, (proj, sid) in enumerate(ids.items()):
+        _mk_claude_session(home / ".claude" / "projects" / proj / f"{sid}.jsonl", sid, proj.upper() + "MARK",
+                           day=i + 1, cwd=f"/x/{proj}", extra=1, cache=True)
+
+    opens = []                                        # 每一次建置開了幾次建置紀錄檔（④ 才驗）
+
+    def build(*args, boom=None):
+        r = _build_in_child(out, args, env, boom)
+        opens.append((args, r.manifest_opens))
+        return r
+
+    def idx():
+        return (out / "index.html").read_text(encoding="utf-8"), (out / "index.md").read_text(encoding="utf-8")
+
+    def page(sid):
+        row = next(e["row"] for e in _manifest(out)["entries"].values() if e["row"]["session_id"] == sid)
+        return out / "sessions" / row["out_html"]
+
+    def report_n():
+        """快取報告涵蓋幾場（`cache-report.md` 的「涵蓋範圍：N 個 session」）：上一版的列不可以算進去。"""
+        m = re.search(r"涵蓋範圍：(\d+) 個 session", (out / "cache-report.md").read_text(encoding="utf-8"))
+        assert m, "快取報告裡讀不到涵蓋幾場"
+        return int(m.group(1))
+
+    r = build()
+    html, md = idx()
+    assert all(p.upper() + "MARK" in html and p.upper() + "MARK" in md for p in ids), "素材沒生效：三場沒有都進索引"
+    pages = {p: page(sid) for p, sid in ids.items()}
+    assert all(p.exists() for p in pages.values()), "素材沒生效：頁面沒產出"
+    assert report_n() == 3, "素材沒生效：三場都要進快取報告"
+
+    # --- ① 升版後完整建置，Alpha 壞掉 ---
+    _bump_manifest(out)
+    before = pages["Alpha"].read_bytes()
+    r = build(boom=ids["Alpha"])
+    assert pages["Alpha"].exists(), "⚠ 升版後壞掉的那一場，上一版的頁面被清孤兒檔刪掉了"
+    assert pages["Alpha"].read_bytes() == before, "上一版的頁面不該被改寫"
+    html, md = idx()
+    assert "ALPHAMARK" not in html and "ALPHAMARK" not in md, "⚠ 上一版的列不可以畫進索引"
+    assert "BETAMARK" in html and "GAMMAMARK" in html, "其餘兩場要照常在索引裡"
+    bx = _bx_sess(out)
+    assert bx.get(ids["Alpha"], {}).get("u") == "sessions/" + pages["Alpha"].relative_to(out / "sessions").as_posix(), \
+        f"⚠ 書籤管理頁要連得到上一版的那一頁，實得 {bx.get(ids['Alpha'])}"
+    d = _manifest(out)
+    assert [e["row"]["session_id"] for e in d["prev"].values()] == [ids["Alpha"]], f"上一版的列要記著 Alpha：{d['prev']}"
+    assert ids["Alpha"] not in {e["row"]["session_id"] for e in d["entries"].values()}, "上一版的列不可以混進這一版的列"
+    assert "壞掉跳過 1，其中 1 留著上一版的頁面（不在索引）" in r.stdout, f"收尾沒講留著上一版的頁面\n{r.stdout}"
+    assert report_n() == 2, f"⚠ 上一版的列算進了快取報告：涵蓋 {report_n()} 場（應該只有這一版的兩場）"
+    assert all("cache_steps" not in e["row"] for e in d["prev"].values()), "上一版的列不該留統計用的欄位"
+    r = build()
+    html, _ = idx()
+    assert "ALPHAMARK" in html and _manifest(out)["prev"] == {}, "不壞了就要照這一版重建、回到索引"
+
+    # --- ② `--force` 時壞掉的那一場照樣沿用上一次的輸出 ---
+    before = pages["Beta"].read_bytes()
+    r = build("--force", boom=ids["Beta"])
+    assert pages["Beta"].exists() and pages["Beta"].read_bytes() == before, "⚠ --force 時壞掉那一場的頁面被清掉或改寫了"
+    assert "BETAMARK" in idx()[0], "同一版的列放回去，照樣畫進索引"
+    assert "壞掉跳過 1，其中 1 沿用上一次的輸出" in r.stdout, f"--force 時壞掉的那一場沒有沿用上一次的輸出\n{r.stdout}"
+    # 索引上只有那一列標「上次的內容」（兩份索引都標）；下一次讀得動（指紋沒變、走沿用那條路）就拿掉
+    html, md = idx()
+    assert _kept_marked(html, md) == ({"BETAMARK"}, {"BETAMARK"}), \
+        f"⚠ 沿用上一次頁面的那一列，兩份索引都要標「上次的內容」、別的列不標：{_kept_marked(html, md)}"
+    beta_tr = next(c for c in html.split("<tr data-sid")[1:] if "BETAMARK" in c)
+    assert re.search(r'data-text="[^"]*上次的內容', beta_tr), "索引頁的篩選框打「上次」要找得到那一列"
+    r = build()
+    assert "沿用 3" in r.stdout, f"素材沒生效：下一次建置要走沿用那條路\n{r.stdout}"
+    assert _kept_marked(*idx()) == (set(), set()), "⚠ 下一次讀得動了，「上次的內容」還標著"
+
+    # --- ③ 升版後縮範圍建置連跑兩次 ---
+    _bump_manifest(out)
+    r1 = build("--project", "Alpha")
+    html, _ = idx()
+    assert "ALPHAMARK" in html and "BETAMARK" not in html and "GAMMAMARK" not in html, "範圍外上一版的列不畫進索引"
+    assert report_n() == 1, f"⚠ 縮範圍建置：範圍外上一版的列算進了快取報告（涵蓋 {report_n()} 場）"
+    assert set(_bx_sess(out)) == set(ids.values()), "縮範圍建置：範圍外的書籤要連得到"
+    r2 = build("--project", "Beta")
+    bx = _bx_sess(out)
+    assert set(bx) == set(ids.values()), f"⚠ 升版後第二次縮範圍建置，範圍外那一場從書籤管理頁消失了：{list(bx)}"
+    assert all((out / x["u"]).exists() for x in bx.values()), "反查表的每一筆都要指到存在的檔"
+    html, _ = idx()
+    assert "ALPHAMARK" in html and "BETAMARK" in html and "GAMMAMARK" not in html, "縮範圍建置：範圍內的列要在索引裡"
+    assert report_n() == 2, f"⚠ 第二次縮範圍建置：範圍外上一版的列算進了快取報告（涵蓋 {report_n()} 場）"
+    assert "上一版的頁面 2 場留著、不在索引" in r1.stdout and "上一版的頁面 1 場留著、不在索引" in r2.stdout, \
+        f"收尾沒講範圍外上一版的頁面\n{r1.stdout}\n{r2.stdout}"
+    # 零場那條路（掃到的專案一場都沒有）也照樣記著上一版的列：下一次縮範圍建置的書籤還連得到
+    r = build("--project", "NoSuchProject")
+    assert "沒有找到任何 session 檔" in r.stdout, f"素材沒生效：沒有走到零場那條路\n{r.stdout}"
+    build("--project", "Alpha")
+    assert ids["Gamma"] in _bx_sess(out), "⚠ 零場建置把上一版的列丟了：下一次縮範圍建置，範圍外那一場的書籤連不到"
+    r = build()
+    html, md = idx()
+    assert all(p.upper() + "MARK" in html and p.upper() + "MARK" in md for p in ids), "完整建置之後三場都要回到索引"
+    assert _manifest(out)["prev"] == {} and "上一版" not in r.stdout, "完整建置之後不該還有上一版的列"
+    assert all(p.exists() for p in pages.values())
+
+    # --- ④ 每一次建置只讀一次建置紀錄 ---
+    assert len(opens) == 10 and all(n == 1 for _, n in opens), f"⚠ 一次建置應該只讀一次建置紀錄：{opens}"
+    print("OK: prev rows after version bump test passed")
+
+
+def test_prev_rows_codex_project_scope(tmp_path=None):
+    """Codex 要讀進來才知道在不在 `--project` 範圍裡：範圍外那一場的列（上一版的、或 `--force` 時這一版的）原樣沿用。
+
+    ①升版後連跑兩次 `--project Beta`：Alpha 上一版的列一直記著、書籤連得到、不在索引。
+    ②`--force --project Beta`：Alpha 這一版的列照樣在索引上（`--force` 不用沿用表，先看列的那個檢查擋不到）。"""
+    sys.path.insert(0, str(ROOT))
+    tmp = new_tmp(tmp_path)
+    home = tmp / "home"
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+    cx = tmp / "cx" / "2026" / "06" / "10"
+    cx.mkdir(parents=True, exist_ok=True)
+    ids = {"Alpha": "019f0002-0000-7000-8000-00000a1a1a1a", "Beta": "019f0002-0001-7000-8000-00000b2b2b2b"}
+    for proj, sid in ids.items():
+        (cx / f"rollout-2026-06-10T01-00-00-{sid}.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
+            {"timestamp": "2026-06-10T01:00:00.000Z", "type": "session_meta",
+             "payload": {"id": sid, "cwd": f"/x/{proj}"}},
+            {"timestamp": "2026-06-10T01:00:00.500Z", "type": "turn_context",
+             "payload": {"cwd": f"/x/{proj}", "model": "gpt-5.5"}},
+            {"timestamp": "2026-06-10T01:00:01.000Z", "type": "event_msg",
+             "payload": {"type": "user_message", "message": f"{proj.upper()}MARK 問"}},
+            {"timestamp": "2026-06-10T01:00:02.000Z", "type": "response_item",
+             "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "好"}]}}]),
+            encoding="utf-8")
+    out = tmp / "out"
+    base = ["--codex-source", f"demo={tmp / 'cx'}", "--no-claude", "--no-antigravity"]
+
+    def build(*args):
+        return _build_in_child(out, base + list(args), env)
+
+    def html():
+        return (out / "index.html").read_text(encoding="utf-8")
+
+    build()
+    assert "ALPHAMARK" in html() and "BETAMARK" in html(), "素材沒生效：兩場都要在索引裡"
+
+    # --- ① 升版後連跑兩次 `--project Beta` ---
+    _bump_manifest(out)
+    for n in (1, 2):
+        build("--project", "Beta")
+        prev = [e["row"]["session_id"] for e in _manifest(out)["prev"].values()]
+        assert prev == [ids["Alpha"]], f"⚠ 升版後第 {n} 次 `--project Beta`：範圍外那一場上一版的列要記著：{prev}"
+        bx = _bx_sess(out)
+        assert ids["Alpha"] in bx and (out / bx[ids["Alpha"]]["u"]).exists(), \
+            f"⚠ 升版後第 {n} 次 `--project Beta`：範圍外那一場的書籤連不到了：{list(bx)}"
+        assert "ALPHAMARK" not in html() and "BETAMARK" in html(), "上一版的列不畫進索引；範圍內的照常"
+
+    # --- ② `--force --project Beta` ---
+    build()
+    assert "ALPHAMARK" in html(), "素材沒生效：不帶 --project 建一次之後 Alpha 回到索引"
+    build("--force", "--project", "Beta")
+    assert "ALPHAMARK" in html() and "BETAMARK" in html(), "⚠ `--force --project Beta` 把範圍外那一場從索引拿掉了"
+    print("OK: prev rows codex project scope test passed")
+
+
+def test_manifest_odd_shapes(tmp_path=None):
+    """建置紀錄裡面那兩層形狀不對（手改、別的工具寫壞）：那一層當空的、形狀不對的那一筆略過，建置照常跑完。"""
+    sys.path.insert(0, str(ROOT))
+    import ai_session_viewer as v
+    tmp = new_tmp(tmp_path)
+    out = tmp / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    good = {"sig": "x", "row": {"session_id": "s1", "title": "T", "out_html": "a/b.html", "out_md": "a/b.md"}}
+    ver = v.RENDERER_VERSION
+    cases = [   # (檔的內容, 要的 entries, 要的 prev 的鍵)
+        ({"renderer_version": ver, "entries": {}, "prev": ["unexpected"]}, {}, set()),
+        ({"renderer_version": ver, "entries": ["unexpected"], "prev": {}}, {}, set()),
+        ({"renderer_version": ver, "entries": {"k1": "str", "k2": {"row": "str"}, "k3": good}, "prev": 5},
+         {"k3": good}, set()),
+        ({"renderer_version": ver, "entries": {}, "prev": {"k4": {"row": "str"}, "k5": good}}, {}, {"k5"}),
+        ({"renderer_version": -1, "entries": {"k3": good}, "prev": ["unexpected"]}, {}, {"k3"}),
+    ]
+    for data, want_entries, want_prev in cases:
+        (out / v.MANIFEST_NAME).write_text(json.dumps(data), encoding="utf-8")
+        m = v.read_manifest(out)
+        assert m["entries"] == want_entries and set(m["prev"]) == want_prev, f"⚠ {data} 讀成了 {m}"
+
+    home = tmp / "home"
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+    src = tmp / "src" / "projects"
+    sid = "abab0000-0000-4000-8000-00000000abab"
+    _mk_claude_session(src / "P" / f"{sid}.jsonl", sid, "ABMARK")
+    (out / v.MANIFEST_NAME).write_text(json.dumps({"renderer_version": ver, "entries": {}, "prev": ["unexpected"]}),
+                                       encoding="utf-8")
+    _build_in_child(out, ["--claude-source", f"s={src}", "--no-codex", "--no-antigravity"], env)
+    assert "ABMARK" in (out / "index.html").read_text(encoding="utf-8"), "建置要照常跑完、畫出索引"
+    print("OK: manifest odd shapes test passed")
+
+
+def test_dedupe_across_scope(tmp_path=None):
+    """同一個 sessionId 的 Claude 檔在兩個來源各有一份（沒有 junction、切帳號續聊過的機器）：去重要和完整建置選同一份。
+
+    ①只建小的那一份所在的來源、大的在範圍外：小的不建，索引只有一列（不會兩列同一場），也不走零場那條路
+    ②範圍內那一份變大了：它建、範圍外那一份的列拿掉
+    ③兩份都在範圍內、上一次只有小的那一份有列：小的那一份上一次的列拿掉
+    ④完整建置裡留下的那一份壞掉、又沒有上一次的輸出：被收掉那一份上一次的列與頁面留著（不然整場消失、頁面還被清掉），
+      兩份索引標「上次的內容」；不壞了就換成留下的那一份，被收掉那一份的頁面清掉、不標。
+    ⑤縮範圍建置裡同樣的情形（被收掉那一份在範圍外、列本來就沿用著）：一樣要標。"""
+    sys.path.insert(0, str(ROOT))
+    tmp = new_tmp(tmp_path)
+    X, Y = tmp / "srcX" / "projects", tmp / "srcY" / "projects"
+    out = tmp / "out"
+    S, T = "d4d40000-0000-4000-8000-00000000d4d4", "e5e50000-0000-4000-8000-00000000e5e5"
+
+    def rows_of(o, sid):
+        return [e["row"] for e in _manifest(o)["entries"].values() if e["row"]["session_id"] == sid]
+
+    _mk_claude_session(X / "P" / f"{S}.jsonl", S, "SMARK", extra=2)
+    _mk_claude_session(Y / "P" / f"{S}.jsonl", S, "SMARK")
+    _build_in_child(out, ["--claude-source", f"x={X}", "--claude-source", f"y={Y}", "--no-codex", "--no-antigravity"])
+    assert [r["account"] for r in rows_of(out, S)] == ["x"], "素材沒生效：兩份都在時應該只留大的那一份（x）"
+
+    # --- ① 只建 y（小的那一份），x 在範圍外 ---
+    r = _build_in_child(out, ["--claude-source", f"y={Y}", "--no-codex", "--no-antigravity"])
+    assert "沒有找到任何 session 檔" not in r.stdout, f"掃到的那一份讓給範圍外的同名檔，不是零場\n{r.stdout}"
+    assert [r_["account"] for r_ in rows_of(out, S)] == ["x"], \
+        f"⚠ 範圍外有比較大的同名檔時，範圍內那一份不該另外一列：{rows_of(out, S)}"
+    assert not (out / "sessions" / "claude-code" / "y").exists(), "⚠ 讓給範圍外的那一份不該產頁面"
+
+    # --- ② y 變大了：它建，x 的列拿掉 ---
+    _mk_claude_session(Y / "P" / f"{S}.jsonl", S, "SMARK", extra=4)
+    _build_in_child(out, ["--claude-source", f"y={Y}", "--no-codex", "--no-antigravity"])
+    got = rows_of(out, S)
+    assert [r_["account"] for r_ in got] == ["y"], f"⚠ 範圍內那一份比較大時，範圍外那一份的列要拿掉：{got}"
+    assert "SMARK4" in (out / "sessions" / got[0]["out_html"]).read_text(encoding="utf-8")
+    _build_in_child(out, ["--claude-source", f"y={Y}", "--no-codex", "--no-antigravity"])
+    assert [r_["account"] for r_ in rows_of(out, S)] == ["y"], \
+        f"⚠ 這一次掃到的那一份，不可以被它自己上一次的列當成範圍外的同名檔收掉：{rows_of(out, S)}"
+
+    # --- ③ 兩份都在範圍內、上一次只有小的那一份（T 只在 x）---
+    _mk_claude_session(X / "P" / f"{T}.jsonl", T, "TMARK", day=2)
+    _build_in_child(out, ["--claude-source", f"x={X}", "--no-codex", "--no-antigravity"])
+    assert [r_["account"] for r_ in rows_of(out, T)] == ["x"], "素材沒生效：T 先只有 x 那一份"
+    _mk_claude_session(Y / "P" / f"{T}.jsonl", T, "TMARK", day=2, extra=3)
+    _build_in_child(out, ["--claude-source", f"x={X}", "--claude-source", f"y={Y}", "--no-codex", "--no-antigravity"])
+    assert [r_["account"] for r_ in rows_of(out, T)] == ["y"], \
+        f"⚠ 被去重收掉的那一份，上一次的列留在索引上：{rows_of(out, T)}"
+    assert (out / "index.html").read_text(encoding="utf-8").count("TMARK 第一則") == 1, "索引上 T 只能有一列"
+
+    # --- ④ 完整建置：留下的那一份壞掉、沒有上一次的輸出 ---
+    home = tmp / "home"
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+    U = "f6f60000-0000-4000-8000-00000000f6f6"
+    o4 = tmp / "out4"
+    _mk_claude_session(home / ".claude" / "projects" / "P" / f"{U}.jsonl", U, "UMARK")
+    _build_in_child(o4, [], env)
+    old = rows_of(o4, U)
+    assert len(old) == 1, "素材沒生效：U 先只有一份"
+    old_page = o4 / "sessions" / old[0]["out_html"]
+    _mk_claude_session(home / ".claude-two" / "projects" / "P" / f"{U}.jsonl", U, "UMARK", extra=3)
+    r = _build_in_child(o4, [], env, boom=U)
+    assert "壞掉跳過 1" in r.stdout, f"素材沒生效：留下的那一份沒有壞掉\n{r.stdout}"
+    assert old_page.exists(), "⚠ 留下的那一份沒有列時，被收掉那一份的頁面被清掉了"
+    assert [r_["out_html"] for r_ in rows_of(o4, U)] == [old[0]["out_html"]], \
+        f"⚠ 留下的那一份沒有列時，被收掉那一份上一次的列要留著：{rows_of(o4, U)}"
+
+    def idx(o):
+        return (o / "index.html").read_text(encoding="utf-8"), (o / "index.md").read_text(encoding="utf-8")
+    assert _kept_marked(*idx(o4)) == ({"UMARK"}, {"UMARK"}), \
+        f"⚠ 那一場這一次讀不動、畫的是被收掉那一份的舊頁面，兩份索引都要標「上次的內容」：{_kept_marked(*idx(o4))}"
+    # 留下的那一份這一次不是讀不起來、只是沒有對話：被收掉那一份照樣放回，但不標（上一次標的要拿掉）
+    two = home / ".claude-two" / "projects" / "P" / f"{U}.jsonl"
+    keep = two.read_text(encoding="utf-8")
+    two.write_text("\n".join(json.dumps({"type": "summary", "summary": "S" * 400, "leafUuid": f"x{i}"})
+                             for i in range(5)), encoding="utf-8")
+    _build_in_child(o4, [], env)
+    assert [r_["out_html"] for r_ in rows_of(o4, U)] == [old[0]["out_html"]], "素材沒生效：被收掉那一份要放回"
+    assert _kept_marked(*idx(o4)) == (set(), set()), \
+        "⚠ 留下的那一份只是沒有對話、不是讀不起來：「上次的內容」不該標（上一次標的要拿掉）"
+    two.write_text(keep, encoding="utf-8")
+    _build_in_child(o4, [], env)
+    got = rows_of(o4, U)
+    assert len(got) == 1 and got[0]["out_html"] != old[0]["out_html"], f"不壞了就換成留下的那一份：{got}"
+    assert not old_page.exists(), "被收掉那一份的頁面，完整建置要清掉"
+    assert _kept_marked(*idx(o4)) == (set(), set()), "不壞了，「上次的內容」還標著"
+
+    # --- ⑤ 縮範圍建置：留下的那一份（範圍內）壞掉、沒有上一次的輸出，範圍外被收掉那一份的列沿用著 ---
+    V = "a7a70000-0000-4000-8000-00000000a7a7"
+    o5 = tmp / "out5"
+    _mk_claude_session(X / "Q" / f"{V}.jsonl", V, "VMARK", day=3)
+    _build_in_child(o5, ["--claude-source", f"x={X}", "--no-codex", "--no-antigravity"])
+    assert [r_["account"] for r_ in rows_of(o5, V)] == ["x"], "素材沒生效：V 先只有 x 那一份"
+    _mk_claude_session(Y / "Q" / f"{V}.jsonl", V, "VMARK", day=3, extra=3)
+    r = _build_in_child(o5, ["--claude-source", f"y={Y}", "--no-codex", "--no-antigravity"], boom=V)
+    assert "壞掉跳過 1" in r.stdout, f"素材沒生效：範圍內那一份沒有壞掉\n{r.stdout}"
+    assert [r_["account"] for r_ in rows_of(o5, V)] == ["x"], f"範圍外那一份的列沿用著：{rows_of(o5, V)}"
+    marked = _kept_marked(*idx(o5))
+    assert "VMARK" in marked[0] and "VMARK" in marked[1], \
+        f"⚠ 範圍外沿用的那一列，畫的是那一場的舊頁面，兩份索引都要標：{marked}"
+    _build_in_child(o5, ["--claude-source", f"y={Y}", "--no-codex", "--no-antigravity"])
+    assert [r_["account"] for r_ in rows_of(o5, V)] == ["y"] and "VMARK" not in _kept_marked(*idx(o5))[0], \
+        f"不壞了就換成範圍內那一份、不標：{rows_of(o5, V)}"
+    print("OK: dedupe across scope test passed")
+
+
+def test_bookmarks_after_orphan_sweep(tmp_path=None):
+    """書籤管理頁在清完孤兒檔之後才寫：這一次被清掉的頁不可以留在反查表裡（死連結）。
+
+    素材：一場沒有回合的空 session（只有一則 `isMeta` 的 user），先帶 `--include-empty` 建出頁面，再不帶旗標完整建置——
+    那一場不進索引、頁面被清掉，而建置紀錄裡還有它上一次的列（來源檔還在，對帳對不掉）。"""
+    sys.path.insert(0, str(ROOT))
+    tmp = new_tmp(tmp_path)
+    home = tmp / "home"
+    out = tmp / "out"
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+    proj = home / ".claude" / "projects" / "P"
+    F, E = "a7a70000-0000-4000-8000-00000000a7a7", "b8b80000-0000-4000-8000-00000000b8b8"
+    _mk_claude_session(proj / f"{F}.jsonl", F, "FMARK")
+    (proj / f"{E}.jsonl").write_text(json.dumps(
+        {"type": "user", "uuid": "e1", "isMeta": True, "timestamp": "2026-08-02T01:00:00.000Z", "cwd": "/x/Proj",
+         "gitBranch": "main", "version": "2.1.150", "sessionId": E,
+         "message": {"role": "user", "content": "<local-command-caveat>x</local-command-caveat>"}},
+        ensure_ascii=False), encoding="utf-8")
+    _build_in_child(out, ["--include-empty"], env)
+    bx = _bx_sess(out)
+    assert E in bx and (out / bx[E]["u"]).exists(), "素材沒生效：帶 --include-empty 時空 session 沒有頁面"
+    e_page = out / bx[E]["u"]
+    r = _build_in_child(out, [], env)
+    assert "略過空 session 1" in r.stdout, f"素材沒生效：空 session 沒被略過\n{r.stdout}"
+    assert not e_page.exists(), "素材沒生效：空 session 的頁面沒被清掉"
+    bx = _bx_sess(out)
+    assert E not in bx, f"⚠ 書籤管理頁收進了這一次剛被清掉的頁（死連結）：{bx.get(E)}"
+    assert F in bx, "還在的那一場要留在反查表裡"
+    print("OK: bookmarks written after orphan sweep test passed")
 
 
 def test_version_flag(tmp_path=None):
@@ -8415,6 +8864,10 @@ def test_one_bad_session_does_not_kill_batch(tmp_path=None):
         assert any(BAD in k for k in _man2.get("entries", {})), (
             f"⚠⚠ {_msg}時沒有把上一次的 row 放回 manifest ⇒ 全量建置會刪掉上一次的頁面、"
             "而書籤那一列還在（同一個缺陷，只是換一條路進來）")
+        # 索引那一列標「上次的內容」、講出壞在哪一步（三條路共用 `_broken`，這裡驗每一條都帶得到自己的那一步）
+        _bad_line = [l for l in (_out / "index.md").read_text(encoding="utf-8").splitlines() if "BADSESSION" in l]
+        assert len(_bad_line) == 1 and f"上次的內容（這一次{_msg}）" in _bad_line[0], (
+            f"⚠ {_msg}沿用上一次的頁面，索引那一列沒有標出來：{_bad_line}")
 
     # --- ④ ⚠⚠ **舊輸出已經不在磁碟上時，不可以回填** ---------------------------
     # 反方向的同一種傷害：無條件回填會讓索引多一條**指向不存在的檔**的連結
@@ -12087,6 +12540,11 @@ if __name__ == "__main__":
     test_zero_scan_keeps_cache_report_links()
     test_no_cache_report_flag()
     test_signature_memory_shared()
+    test_prev_rows_after_version_bump()
+    test_prev_rows_codex_project_scope()
+    test_manifest_odd_shapes()
+    test_dedupe_across_scope()
+    test_bookmarks_after_orphan_sweep()
     test_version_flag()
     test_no_uppercase_unicode_escape_in_js()
     test_user_turn_fidelity()

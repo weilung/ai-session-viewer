@@ -49,7 +49,7 @@ except Exception:
 
 # 工具的版本（`--version` 印的就是它）。出版時手動改，和公開 repo 的 git tag 對齊（tag 是 `v` 加上這個字串）。
 # 和 `RENDERER_VERSION` 是兩件事：那一個只管「既有輸出要不要重建」，每次頁面呈現一變就升。
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 MAX_RESULT_CHARS = 20000           # tool 結果在 HTML 裡的最大字數（可摺疊，超過截斷）
 MAX_WRITE_CHARS = 8000             # Write/檔案內容預覽上限
@@ -9609,6 +9609,15 @@ function backAf(){
 """
 
 
+# 壞掉那一場沿用上一次的頁面時（建置的 `_broken`），兩份索引在那一列標的字。
+KEPT_BROKEN_LABEL = "⚠ 上次的內容"
+
+
+def kept_broken_note(kind) -> str:
+    """`KEPT_BROKEN_LABEL` 的說明（索引頁滑鼠停上去看到的）；`kind`＝這一次壞在哪一步（「解析失敗」等）。"""
+    return f"這一次建置讀不動這一場（{kind}），頁面是上一次建的；下一次建置讀得動就會換掉、這個標示跟著消失"
+
+
 def render_index_html(rows, show_account=False, cache_report=False, codex_report=False) -> str:
     rows = sorted(rows, key=lambda r: r.get("start_ts") or 0, reverse=True)
     projects = sorted({r["proj"] for r in rows})
@@ -9650,9 +9659,11 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
         ai = r.get("ai_title", "")
         kind = r.get("kind") or "chat"
         sync = r.get("sync_copy") or ""
+        kept = r.get("kept_broken") or ""
         blob = (source_label(src) + " " + acc + " " + r["proj"] + " "
                 + r.get("cwd", "") + " " + r.get("proj_munged", "") + " "
-                + r["title"] + " " + ai + " " + r.get("branch", "") + " " + kind + " " + sync).lower()
+                + r["title"] + " " + ai + " " + r.get("branch", "") + " " + kind + " " + sync
+                + (" " + KEPT_BROKEN_LABEL if kept else "")).lower()
         acc_td = f'<td><span class="chip acc">{esc(acc)}</span></td>' if show_account else ""
         src_td = f'<td><span class="chip src">{esc(source_label(src))}</span></td>' if show_source else ""
         ns = r.get("n_subagents") or 0
@@ -9663,6 +9674,8 @@ def render_index_html(rows, show_account=False, cache_report=False, codex_report
                      if ns else "")
         if sync:
             sub_badge += f' <span class="chip" title="{esc_attr(copy_chip_title(src))}">{esc(sync)}</span>'
+        if kept:
+            sub_badge += f' <span class="chip" title="{esc_attr(kept_broken_note(kept))}">{esc(KEPT_BROKEN_LABEL)}</span>'
         sub_badge += (f' <span class="chip compact" title="此 session 發生 {nc} 次壓縮（手動 /compact 或自動）">✂ ×{nc}</span>'
                       if nc else "")
         wn = r.get("waste_n") or 0
@@ -9860,6 +9873,7 @@ def render_index_md(rows, show_account=False, cache_report=False, codex_report=F
                      if not r.get("has_md", True) and not r.get("has_html", True)
                      else f"[{mark}{r['title']}](sessions/{md_href}){only}")
             sync = f"〔{r['sync_copy']}〕" if r.get("sync_copy") else ""
+            sync += f" · {KEPT_BROKEN_LABEL}（這一次{r['kept_broken']}）" if r.get("kept_broken") else ""
             out.append(f"- {acc}{_link}{sync} — {r.get('date_str','?')} · "
                        f"~{cost} · {r['n_user']}問/{r['n_assistant']}答 · 🔧{r['n_tools']}"
                        + (f" · 型態:{KIND_LABELS.get(kind, kind)}" if kind != "chat" else "")
@@ -12318,41 +12332,121 @@ def session_to_row(s: "Session") -> dict:
     }
 
 
-def load_manifest(out: Path) -> tuple:
-    """回傳 (entries, stale)。stale=True 代表 manifest 檔存在但版本不符（renderer 升級）→ 需全建；
-    用來在縮範圍模式時警告使用者：本次未涵蓋的範圍會暫時從索引/報告消失。"""
-    try:
-        data = json.loads((out / MANIFEST_NAME).read_text(encoding="utf-8"))
-    except Exception:
-        return {}, False
-    if data.get("renderer_version") == RENDERER_VERSION:
-        return data.get("entries", {}), False
-    return {}, True
+# 上一版的列（`prev`）只留這幾欄：認得出是哪一場、頁面在哪、書籤管理頁要顯示的。
+# 不留統計用的欄位 ⇒ 上一版算出來的數字不會被拿去畫索引或快取報告。
+_PREV_ROW_FIELDS = ("session_id", "source_kind", "account", "proj", "proj_munged", "title", "date_str",
+                    "out_html", "out_md", "has_html", "has_md")
 
 
-def load_manifest_paths(out: Path) -> dict:
-    """只取 `sid → row` 用來**算檔名與標題**，**忽略 renderer 版本**。
+def _prev_row(row) -> dict:
+    """一列只留 `_PREV_ROW_FIELDS` 的**新物件**（不和讀進來的那一列共用）。"""
+    return {k: row[k] for k in _PREV_ROW_FIELDS if k in row}
 
-    ⚠ 和 `load_manifest` 刻意分開，兩支不可以互相取代：
-    那一支在 renderer 升版時回空字典是**對的**（快取的 row 內容可能已經過時，
-    不能拿來重用輸出）；但**檔名與標題不隨 renderer 改變**，
-    而書籤管理頁需要的就只有那兩樣。
 
-    ⚠⚠ 不做這件事的後果：升版後第一次跑縮範圍建置
-    （`--project X`）時 `rows` 只剩本次掃到的那幾場，管理頁就會對著**磁碟上還好端端
-    躺著**的 session 斬釘截鐵地說「⚠ 不在這次的輸出裡」並且不給連結。
-    索引頁少幾列還看得出是「這次沒涵蓋」，管理頁那句話卻是**明確的假話**。
-    """
-    try:
-        data = json.loads((out / MANIFEST_NAME).read_text(encoding="utf-8"))
-    except Exception:
+def _prev_entries(entries) -> dict:
+    """`{key: {"row": …}}` → 同樣的鍵、每一列都經 `_prev_row`；沒有列的（或形狀不對的）略過，整層不是物件就是空的。"""
+    if not isinstance(entries, dict):
         return {}
-    return data.get("entries", {}) or {}
+    return {k: {"row": _prev_row(e["row"])} for k, e in entries.items()
+            if isinstance(e, dict) and isinstance(e.get("row"), dict)}
 
 
-def save_manifest(out: Path, entries: dict):
+def read_manifest(out: Path) -> dict:
+    """讀建置紀錄（一次建置只讀這一次）。回 `{"entries", "prev", "stale", "known"}`：
+
+    - `entries`：這一版產的列（`sig`／`row`／`turns`），可以拿來沿用輸出。
+    - `prev`：上一版（renderer 版本不同時）產的列，只有 `_PREV_ROW_FIELDS`。頁面還在磁碟上，但內容是
+      上一版的 ⇒ **不沿用、不畫進索引、不算進報告**；只拿來做三件事：壞掉那一場沒有這一版的列時留著它
+      上一版的頁面、縮範圍建置時範圍外的那幾場繼續記著、書籤管理頁的反查表。那一場下一次被掃到就照這一版重建。
+    - `stale`：檔在、版本不同（renderer 升版）⇒ `entries` 是空的、原本的列全部轉進 `prev`。
+    - `known`：書籤管理頁的備援——檔裡兩層的列（同一個鍵以 `entries` 為準），**不看版本**：
+      檔名與標題不隨 renderer 改變，管理頁要的只有那兩樣；不補的話，縮範圍建置時管理頁會對著
+      磁碟上還在的頁面說「不在這次的輸出裡」。和 `prev` 一樣是新物件，建置途中改到 `entries` 的列不會漏進來。
+    檔不在、讀不起來、形狀不對 ⇒ 全部是空的、`stale=False`；裡面某一層不是物件 ⇒ 那一層當空的，形狀不對的那一筆略過。"""
+    try:
+        data = json.loads((out / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return {"entries": {}, "prev": {}, "stale": False, "known": {}}
+    # 裡面那兩層也照形狀收：不是物件的整層當空的、一筆不是 `{…, "row": {…}}` 的略過（呼叫端都假設這個形狀）
+    entries = data.get("entries")
+    entries = ({k: e for k, e in entries.items() if isinstance(e, dict) and isinstance(e.get("row"), dict)}
+               if isinstance(entries, dict) else {})
+    cur, prev = _prev_entries(entries), _prev_entries(data.get("prev"))
+    known = dict(cur)
+    known.update((k, v) for k, v in prev.items() if k not in cur)
+    if data.get("renderer_version") == RENDERER_VERSION:
+        return {"entries": entries, "prev": {k: v for k, v in prev.items() if k not in entries},
+                "stale": False, "known": known}
+    return {"entries": {}, "prev": known, "stale": True, "known": dict(known)}
+
+
+def load_manifest(out: Path) -> tuple:
+    """回傳 (entries, stale)：`read_manifest` 的那兩格，給只要這一版的列的地方（`--search`、封存刪頁）。
+    stale=True 代表 manifest 檔存在但版本不符（renderer 升級）。"""
+    m = read_manifest(out)
+    return m["entries"], m["stale"]
+
+
+def save_manifest(out: Path, entries: dict, prev=None):
+    """`prev`＝還記著的上一版的列（見 `read_manifest`）；和 `entries` 同一個鍵的不寫（這一版的為準）。"""
+    prev = {k: v for k, v in (prev or {}).items() if k not in entries}
     _write_atomic(out / MANIFEST_NAME,
-                  json.dumps({"renderer_version": RENDERER_VERSION, "entries": entries}, ensure_ascii=False))
+                  json.dumps({"renderer_version": RENDERER_VERSION, "entries": entries, "prev": prev},
+                             ensure_ascii=False))
+
+
+def _row_on_disk(row, sess_dir: Path):
+    """上一次的列放回去用：`has_html`／`has_md` 照**磁碟上實際在、而且原本就標成同步的檔**改寫的副本；
+    兩種都不成立（或根本沒有列）回 None。
+
+    ⚠ 要先確認上一次的輸出真的還在磁碟上：無條件放回的話，舊列指的頁面若早就不見了（被清過、被手動刪過），
+      索引就會多一條指向不存在的檔的連結——和「不放回去」留下的壞連結是同一種傷害，只是方向相反。
+    ⚠ 旗標照磁碟改寫：上一次若只建了其中一種格式（`--format md`／`html`），兩份索引都照舊旗標連結的話，
+      就會有一份連到不存在的頁面。索引頁與書籤反查表都看 `has_html`／`has_md` 決定連哪一種。
+    ⚠ 兩個旗標都不成立就不放回：磁碟上就算還有一份檔，它若原本就被標成過期（別的指紋產的），
+      放回只會多一條連到不存在（或不該信）的頁面的連結。"""
+    if not row:
+        return None
+    row = dict(row)
+    row["has_html"] = bool(row.get("has_html", True) and row.get("out_html")
+                           and (sess_dir / row["out_html"]).exists())
+    row["has_md"] = bool(row.get("has_md", True) and row.get("out_md")
+                         and (sess_dir / row["out_md"]).exists())
+    return row if (row["has_html"] or row["has_md"]) else None
+
+
+def _write_indexes(out: Path, rows, want_html, want_md, links_html, links_md):
+    """索引頁（要哪種格式就寫哪種）。`links_*`＝要不要連到快取報告與 Codex 存活頁，兩種格式各自算。
+    正常路徑與零場那條路共用：兩條路各寫一份就會分岔。"""
+    show_account = len({r.get("account", "") for r in rows}) > 1
+    if want_html:
+        _write_atomic(out / "index.html", render_index_html(rows, show_account, *links_html))
+    if want_md:
+        _write_atomic(out / "index.md", render_index_md(rows, show_account, *links_md))
+
+
+def _write_bookmark_pages(sess_dir: Path, rows, want_html, fallback):
+    """書籤管理頁與設定頁。⚠ 放 `out/sessions/` **底下**，不是 `out/` 根：
+    和寫入者（session 頁）同一棵子樹，把「目錄層級」這個變數整個消掉。
+    ⚠ 兩份和 index.html 一樣**每次都無條件重產**，不受 manifest 的版本閘管。
+    ⚠ 清孤兒檔那一段只掃 `rel.parts[0] in scanned_source_dirs`（來源夾），
+      這兩個檔在 `sessions/` 的**第一層**、`parts[0]` 就是檔名本身 ⇒ 掃不到、不會被誤刪。
+      守它的是 `test_bookmark_manage_pages` 的「重建兩次仍在」那一格。
+    ⚠ 純 md 建置**不重產**這兩頁，留著就是一份**過期的 `BX_SESS`**：
+      之後某場的檔名變了（專案改名）而該次是純 md 全量建置時，孤兒清理會刪掉舊
+      `.html`、又不會產新的 ⇒ 管理頁生出一條指向**已刪檔案**的連結，
+      而不是誠實的「⚠ 對不到檔案」。比照 `cache-report.*` 那段：不重產就刪掉。"""
+    if want_html:
+        _write_atomic(sess_dir / "bookmarks.html", render_bookmarks_html(rows, fallback, sess_dir))
+        _write_atomic(sess_dir / "settings.html", render_settings_html())
+        return
+    for stale in (sess_dir / "bookmarks.html", sess_dir / "settings.html"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
 
 def _write_atomic(path: Path, text: str):
@@ -12529,6 +12623,9 @@ def _drop_session_pages(out: Path, key: str) -> tuple:
     ⚠⚠ **刪不掉一定要往上報，不可以 `except OSError: pass`。**
     頁面被鎖／唯讀／權限不足時，把錯誤整個吞掉、來源照搬的話，磁碟上會留下一個
     **索引連不到、但仍含私密對話**的孤兒頁，而輸出上完全沒有跡象。回報之後由呼叫端決定怎麼辦。
+
+    範圍限制 SCOPE-ARCHIVE-CURRENT-ROWS-ONLY：只看這一版的列；只有上一版的列的那一場（見 `read_manifest`）不在這裡刪
+    ——上一版的列指的路徑可能已經是別場的頁。那一頁由完整建置的清孤兒檔處理。
     """
     n, fails = 0, []
     entries, _ = load_manifest(out)
@@ -13142,6 +13239,62 @@ def _dedupe_claude_sessions(files):
             pos[sid] = (len(out), size)
             out.append(item)
     return out
+
+
+def _dedupe_with_outside(files, outside=()):
+    """`_dedupe_claude_sessions` 加上縮範圍建置時**範圍外沿用的列**指的 Claude 來源檔，讓這一次的去重和完整建置
+    選同一份。回 `(這一次要建的 files, dropped)`：`dropped` 每一筆是 `(收掉的那一筆, 留下的那一筆, 是不是這一次
+    掃到的檔讓給了範圍外的那一份)`。
+
+    `outside` 是 `files` 同樣的形狀；它們只參加比較，不會出現在回傳的 `files` 裡。只看和這一次掃到的檔
+    同一個 sessionId、又不是這一次掃到的同一個檔的那幾筆（範圍外彼此重複的，留給完整建置）。
+    範圍外那份讀不到大小（檔不在、磁碟沒掛上）就當成 0、讓給這一次掃到的那份——完整建置看不到它，也只會列掃到的那份。
+    範圍限制 SCOPE-DEDUP-SUBSET-TIE：同樣大小時留這一次掃到的那份（排在前面的留下，同 `_dedupe_claude_sessions`）；
+    完整建置留的是來源排在前面的那份，兩者可能不是同一份。"""
+    stems = {f[3].stem for f in files if f[0] == SOURCE_CLAUDE}
+    extra = [f for f in outside if f[0] == SOURCE_CLAUDE and f[3].stem in stems]
+    if extra:
+        cstems = {f[3].stem for f in extra}
+        scanned = {manifest_key(f[0], f[3]) for f in files if f[0] == SOURCE_CLAUDE and f[3].stem in cstems}
+        extra = [f for f in extra if manifest_key(f[0], f[3]) not in scanned]
+    kept = _dedupe_claude_sessions(list(files) + extra)
+    keep, ext = {id(f) for f in kept}, {id(f) for f in extra}
+    winner = {f[3].stem: f for f in kept if f[0] == SOURCE_CLAUDE}
+    dropped = [(f, winner[f[3].stem], id(f) not in ext and id(winner[f[3].stem]) in ext)
+               for f in list(files) + extra if f[0] == SOURCE_CLAUDE and id(f) not in keep]
+    return [f for f in kept if id(f) not in ext], dropped
+
+
+def _reconcile_dedupe_losers(dropped, new_entries, new_prev, old_entries, old_prev, sess_dir, broken_kind):
+    """同檔名去重收掉的那幾份，它們的列怎麼辦（就地改 `new_entries`／`new_prev`）。
+
+    - 留下的那一份這一次在索引上有一列（`new_entries` 有它：新建、沿用、壞掉時放回、或範圍外沿用）
+      ⇒ 被收掉那一份的列兩層都拿掉（完整建置也只會列留下的那一份）。
+    - 沒有（讀不起來又沒有上一次的列、只有上一版的列、沒有對話）⇒ 被收掉那一份上一次的列留著：
+      縮範圍建置本來就沿用著；完整建置從上一次的紀錄放回（同一層，頁面還在才放，`_row_on_disk`）。
+      留在索引上的那一列，留下的那一份這一次讀不起來（`broken_kind`：來源檔 → 壞在哪一步）時標「上次的內容」
+      （`kept_broken`，和壞掉那一場自己放回的列同一個標示：那一場這一次讀不動，畫的是舊的頁面），否則不標。
+    範圍限制 SCOPE-DEDUP-SAME-NAME-NO-CONTAINMENT：留下那一份的頁面不保證含被收掉那一份的內容。"""
+    for lo, wi, _ in dropped:
+        lk, wk = manifest_key(lo[0], lo[3]), manifest_key(wi[0], wi[3])
+        if wk in new_entries:
+            new_entries.pop(lk, None)
+            new_prev.pop(lk, None)
+            continue
+        if lk not in new_entries and lk not in new_prev:
+            row = _row_on_disk((old_entries.get(lk) or {}).get("row"), sess_dir)
+            if row:
+                new_entries[lk] = dict(old_entries[lk], row=row)
+            else:
+                row = _row_on_disk((old_prev.get(lk) or {}).get("row"), sess_dir)
+                if row:
+                    new_prev[lk] = {"row": row}
+        if lk in new_entries:
+            # 標示每次照這一次重判：上一次標過、這一次留下那一份不是讀不起來（沒有對話等）就拿掉
+            row = {k: v for k, v in new_entries[lk]["row"].items() if k != "kept_broken"}
+            if wk in broken_kind:
+                row["kept_broken"] = broken_kind[wk]
+            new_entries[lk] = dict(new_entries[lk], row=row)
 
 
 # 跨機同步工具（claude-session-sync）不覆蓋本機既有檔時另存的副本：
@@ -13796,9 +13949,10 @@ def run_search(args):
             pass
 
 
-def collect_session_files(args):
-    """這一次要處理的來源檔：`(accounts, codex_accounts, files, 去重前的筆數, ag)`，
+def collect_session_files(args, outside=()):
+    """這一次要處理的來源檔：`(accounts, codex_accounts, files, 去重前的筆數, ag, dropped)`，
     `files` 每一筆是 `(來源類型, 帳號, 專案munged名, session檔)`。建置與 `--ai-md` 共用同一條路。
+    `outside`／`dropped`：範圍外沿用的列參加同檔名去重、被收掉的那幾筆（見 `_dedupe_with_outside`）。
     `ag`＝Antigravity 的 `{"accounts": [(標籤, 根)], "tree": {主對話路徑: (info, 子孫子代理)}}`：
     子代理是另一個檔，併進父對話那一頁，`files` 只列主對話（見 `antigravity_tree`）。
     ⚠ 同一個實體檔出現在兩個 Antigravity 來源（資料夾和它裡面的單一檔、兩個重疊的資料夾）時只算進第一個列到它的
@@ -13841,7 +13995,8 @@ def collect_session_files(args):
             files.append((SOURCE_ANTIGRAVITY, acc_name, "antigravity", info["path"]))
             ag["tree"][str(info["path"])] = (info, tree.get(str(info["path"]), []))
     n_raw = len(files)
-    return accounts, codex_accounts, _dedupe_claude_sessions(files), n_raw, ag   # 跨來源同 sessionId 的複本只留一份
+    files, dropped = _dedupe_with_outside(files, outside)          # 跨來源同 sessionId 的複本只留一份
+    return accounts, codex_accounts, files, n_raw, ag, dropped
 
 
 def out_base(s):
@@ -14018,7 +14173,7 @@ def antigravity_file_matches_project(info, project_filter):
 def run_ai_md(args):
     """`--ai-md`：只處理一場，產給 AI 讀的精簡版（與完整版）到 `out/ai/`，stdout 只印一行絕對路徑。
     不碰 `out/sessions/`、manifest、索引——那些是增量建置的紀錄。"""
-    accounts, codex_accounts, files, _, ag = collect_session_files(args)
+    accounts, codex_accounts, files, _, ag, _ = collect_session_files(args)
 
     def _eligible(it):
         if it[0] == SOURCE_CODEX:
@@ -14138,7 +14293,20 @@ def main():
     want_html = args.format in ("html", "both")
     want_md = args.format in ("md", "both")
 
-    accounts, codex_accounts, files, n_raw, ag = collect_session_files(args)
+    # 任何「縮小範圍」的旗標下，都沿用其他範圍的舊紀錄並略過孤兒清理，避免誤刪未處理的輸出
+    filtering = bool(args.project or args.claude_source or args.account or args.no_claude
+                     or args.codex_source or args.no_codex or args.antigravity_source or args.no_antigravity)
+    mf = read_manifest(out)                     # 建置紀錄一次建置只讀這一次（兩層的列與書籤的備援都在裡面）
+    # 縮範圍建置：沿用的列（兩層）指的 Claude 來源檔也參加同檔名去重，留哪一份才會和完整建置一樣
+    outside = []
+    if filtering:
+        for _ents in (mf["entries"], mf["prev"]):
+            for _k, _e in _ents.items():
+                _kind, _, _src = _k.partition(":")              # key＝`<來源類型>:<解析過的路徑>`
+                _r = (_e or {}).get("row") or {}
+                if _kind == SOURCE_CLAUDE and _src:
+                    outside.append((SOURCE_CLAUDE, _r.get("account", ""), _r.get("proj_munged", ""), Path(_src)))
+    accounts, codex_accounts, files, n_raw, ag, dropped = collect_session_files(args, outside)
     ag_tree = ag["tree"]
     # 本次真的掃過的來源根（對帳只在這些根底下做，見 `prune_gone_sources`）
     scanned_roots = ([root for _, root in accounts] + [root for _, root in codex_accounts]
@@ -14217,7 +14385,8 @@ def main():
         print(f"Codex 來源：{', '.join(a for a, _ in codex_accounts)}")
     if ag["accounts"]:
         print(f"Antigravity 來源：{', '.join(a for a, _ in ag['accounts'])}")
-    if not files:
+    # 這一次掃到的都讓給了範圍外的同名檔（`dropped` 的第三格）不算零場：那幾份要走正常路徑對掉它們的舊列
+    if not files and not any(lost for *_, lost in dropped):
         print("沒有找到任何 session 檔。")
         # ⚠⚠ **零場也要對帳。** 在這裡直接 `return` 的話，
         #     「來源被刪到一場不剩」時整個對帳流程根本不會執行：舊 manifest、
@@ -14231,73 +14400,63 @@ def main():
         #   那不是「東西被刪了」，是「這次沒有去看」。誤判的代價是清掉還在的紀錄。
         if not scanned_roots:
             return
-        filtering = bool(args.project or args.claude_source or args.account or args.no_claude
-                         or args.codex_source or args.no_codex or args.antigravity_source or args.no_antigravity)
-        old_manifest, _ = load_manifest(out)
-        new_entries = dict(old_manifest) if filtering else {}
-        new_entries, n_gone = prune_gone_sources(new_entries, scanned_roots)
-        if n_gone:
-            print(f"  （來源已刪除，對掉 {n_gone} 筆舊紀錄）")
-        save_manifest(out, new_entries)
+        # 兩層的列都照正常路徑沿用與對帳（上一版的列見 `read_manifest`）
+        new_entries, n_gone = prune_gone_sources(dict(mf["entries"]) if filtering else {}, scanned_roots)
+        new_prev, n_gone_prev = prune_gone_sources(dict(mf["prev"]) if filtering else {}, scanned_roots)
+        if n_gone + n_gone_prev:
+            print(f"  （來源已刪除，對掉 {n_gone + n_gone_prev} 筆舊紀錄）")
+        save_manifest(out, new_entries, new_prev)
+        # ⚠⚠ **索引頁要用對帳後的 `new_entries` 重畫，不可以寫死。**
+        #     `new_entries` 在縮範圍時保留了範圍外的紀錄（正常路徑本來就會把它們
+        #     一起畫出來），這裡若寫成 `render_index_html([], False, False, False)`
+        #     ⇒ manifest 說有、`BX_SESS` 也還指著、HTML 檔還在磁碟上，
+        #     **只有索引頁說一場都沒有**。
+        #     ⚠ 這個分支一旦對帳就會動到索引（不對帳、直接 `return` 的話索引不會被動到），
+        #       所以這裡畫的索引（html 與 md 兩份）必須和正常路徑一樣。
+        #     ⚠⚠ **索引的參數全部照正常路徑算一次，不能只換第一個**：要不要連到快取報告寫死 `False` 的話
+        #       ⇒ 報告檔還在磁碟上、索引卻不連它了。**同一個形狀，隔壁兩個參數。**
+        #     ⚠ rows 一律走 `_index_rows()`、索引與管理頁一律走 `_write_indexes`／`_write_bookmark_pages`：
+        #       兩條路各寫一份就會分岔（例如其中一份漏掉 `empty` 的過濾、少畫一種格式）。
+        #     守它的是 `tests/test_smoke.py::test_zero_scan_keeps_out_of_scope_index`
+        #     （列還在）與 `::test_zero_scan_keeps_cache_report_links`（連結還在）。
+        zero_rows = _index_rows(new_entries, args.include_empty)
         # 沿用的列照樣可能撞名，這條路也要講（同正常路徑的收尾）
-        _n_clash = report_output_clashes(_index_rows(new_entries, args.include_empty))
+        _n_clash = report_output_clashes(zero_rows)
         if _n_clash:
             print(f"⚠ 輸出檔名相同 {_n_clash} 個（見上面的 ! 訊息）")
-        # 範圍限制 SCOPE-ZERO-SCAN-HTML-INDEX-ONLY：這條路只重畫 html 的索引（帶不帶 `--no-cache-report` 都一樣），
-        # `index.md` 停在上一次 md 建置寫的樣子，連它的快取報告連結在內。
-        if want_html:
-            # ⚠⚠ **索引頁要用對帳後的 `new_entries` 重畫，不可以寫死。**
-            #     `new_entries` 在縮範圍時保留了範圍外的紀錄（正常路徑本來就會把它們
-            #     一起畫出來），這裡若寫成 `render_index_html([], False, False, False)`
-            #     ⇒ manifest 說有、`BX_SESS` 也還指著、HTML 檔還在磁碟上，
-            #     **只有索引頁說一場都沒有**。
-            #     ⚠ 這個分支一旦對帳就會動到索引（不對帳、直接 `return` 的話索引不會被動到），
-            #       所以這裡畫的索引必須和正常路徑一樣。
-            #     ⚠⚠ **四個參數全部照正常路徑算一次，不能只換第一個**：第三、四個
-            #       （要不要連到快取報告）寫死 `False` 的話 ⇒ 報告檔還在磁碟上、
-            #       索引卻不連它了。**同一個形狀，隔壁兩個參數。**
-            #     ⚠ rows 一律走 `_index_rows()`：兩條路各寫一份就會分岔（例如其中一份漏掉
-            #       `empty` 的過濾）。
-            #     守它的是 `tests/test_smoke.py::test_zero_scan_keeps_out_of_scope_index`
-            #     （列還在）與 `::test_zero_scan_keeps_cache_report_links`（連結還在）。
-            zero_rows = _index_rows(new_entries, args.include_empty)
-            if args.no_cache_report:
-                zero_links = _kept_cache_reports(out, ".html")
-            else:
-                zero_links = (build_cache_report(zero_rows, acct_health=acct_health)["has_data"],
-                              build_codex_survival(zero_rows)["has_data"])
-            _write_atomic(out / "index.html",
-                          render_index_html(zero_rows,
-                                            len({r.get("account", "") for r in zero_rows}) > 1,
-                                            *zero_links))
-            bx_fallback, _ = prune_gone_sources(load_manifest_paths(out), scanned_roots)
-            _write_atomic(sess_dir / "bookmarks.html", render_bookmarks_html([], bx_fallback, sess_dir))
-            _write_atomic(sess_dir / "settings.html", render_settings_html())
+        if args.no_cache_report:
+            zero_links = _kept_cache_reports(out, ".html")
+            zero_links_md = _kept_cache_reports(out, ".md")
+        else:
+            zero_links = zero_links_md = (build_cache_report(zero_rows, acct_health=acct_health)["has_data"],
+                                          build_codex_survival(zero_rows)["has_data"])
+        _write_indexes(out, zero_rows, want_html, want_md, zero_links, zero_links_md)
+        _write_bookmark_pages(sess_dir, zero_rows, want_html, prune_gone_sources(mf["known"], scanned_roots)[0])
         return
     if n_raw > len(files):
         print(f"  （去重 {n_raw - len(files)} 個跨來源重複的 Claude session）")
     print(f"掃描到 {len(files)} 個 session 檔，比對變動中…")
 
-    old_manifest, manifest_stale = load_manifest(out)
+    old_manifest, old_prev, manifest_stale = mf["entries"], mf["prev"], mf["stale"]
     manifest = {} if args.force else old_manifest
-    # 任何「縮小範圍」的旗標下，都沿用其他範圍的舊紀錄並略過孤兒清理，避免誤刪未處理的輸出
-    filtering = bool(args.project or args.claude_source or args.account or args.no_claude
-                     or args.codex_source or args.no_codex or args.antigravity_source or args.no_antigravity)
     # renderer 升級後 manifest 被視為空：明確「子集」建置會讓未涵蓋範圍暫時從索引/報告消失，提醒補跑全量。
     # 只對真正子集的旗標示警；--*-source 是指定來源位置（常為正常全建），不算子集。
     subsetting = bool(args.project or args.account or args.no_claude or args.no_codex or args.no_antigravity)
     if manifest_stale and subsetting:
         print("  ⚠ 偵測到 renderer 版本更新（manifest 需重建）：本次為縮範圍建置，未涵蓋的範圍會暫時"
               "從索引/報告消失；請另跑一次涵蓋全部來源的完整建置以補齊。", file=sys.stderr)
-    # 預設（無縮範圍旗標）時三種來源都會掃，可安全全量對帳
+    # 預設（無縮範圍旗標）時三種來源都會掃，可安全全量對帳。上一版的列（`new_prev`）同樣只在縮範圍時沿用；
+    # 完整建置只留下面放回的那幾筆（壞掉那一場、被去重收掉的那一份，見 `_broken`／`_reconcile_dedupe_losers`）。
     new_entries = dict(old_manifest) if filtering else {}
+    new_prev = dict(old_prev) if filtering else {}
     # ⚠⚠ 沿用舊 manifest 不等於「舊的都還在」。本次真的掃過的來源根底下、檔案已經不在的，
     #     一律對掉——不做的話已刪除的 session 會**永久**留在書籤管理頁的反查表裡
     #     。判準與保守方向見 `prune_gone_sources` 的 docstring。
     if filtering:
         new_entries, n_gone = prune_gone_sources(new_entries, scanned_roots)
-        if n_gone:
-            print(f"  （來源已刪除，對掉 {n_gone} 筆舊紀錄）")
+        new_prev, n_gone_prev = prune_gone_sources(new_prev, scanned_roots)
+        if n_gone + n_gone_prev:
+            print(f"  （來源已刪除，對掉 {n_gone + n_gone_prev} 筆舊紀錄）")
     ag_placed = set()                 # 這一次有頁（新建或沿用）的 Antigravity 主對話（拿掉子代理舊的那一列用，見迴圈後）
     scanned_source_dirs = {safe_name(source_kind, 24) for source_kind, *_ in files}
 
@@ -14330,6 +14489,8 @@ def main():
     sig_mem = {}                                    # memory 目錄 → 指紋那一段（同專案的每一場共用，見 `session_signature`）
     n_build = n_reuse = n_empty = n_broken = 0      # n_broken：壞掉被跳過的來源檔
     n_broken_kept = 0                              # 其中「沿用上一次輸出」的（見下方 except）
+    n_broken_prev = 0                              # 其中只有上一版的列、留著上一版頁面的
+    broken_kind = {}                               # 這一次壞掉的來源檔 → 壞在哪一步（同檔名去重收掉的那一份要標，見 `_reconcile_dedupe_losers`）
     for source_kind, acc_name, proj_name, sf in files:
         key = manifest_key(source_kind, sf)
         if source_kind == SOURCE_ANTIGRAVITY:
@@ -14343,7 +14504,10 @@ def main():
         if (source_kind in (SOURCE_CODEX, SOURCE_ANTIGRAVITY) and args.project and row
                 and not row_matches_project(row, args.project)):
             continue
-        new_entries.pop(key, None)
+        # 這一次掃到它：兩層的舊列先拿掉，照這一次的結果重放。⚠ Codex／Antigravity 要讀進來才知道在不在
+        # `--project` 範圍裡——只有上一版的列、或 `--force`（不用沿用表）時，上面那個先看列的檢查擋不到 ⇒
+        # 讀完發現在範圍外就原樣放回（`carried`，見下面 `project_matches_filter` 那段），和範圍外的其他列一樣沿用。
+        carried = (new_entries.pop(key, None), new_prev.pop(key, None))
         reusable = (
             cached.get("sig") == sig and row
             # ⚠⚠ 帳號標籤變了就**一定要重建**。
@@ -14362,6 +14526,9 @@ def main():
             and (not want_md or (row.get("has_md", True) and (sess_dir / row["out_md"]).exists()))
         )
         if reusable:
+            # 指紋對得上 ⇒ 頁面就是這一份來源產的，上一次壞掉時標的「上次的內容」不成立了
+            if "kept_broken" in row:
+                row = {k: v for k, v in row.items() if k != "kept_broken"}
             new_entries[key] = {"sig": sig, "row": row, "turns": cached.get("turns")}
             n_reuse += 1
             if source_kind == SOURCE_ANTIGRAVITY:
@@ -14372,25 +14539,26 @@ def main():
         # 「把上一次的 row 放回去」可能只做在其中一條路（例：只做在分析那一半
         # ⇒ **解析失敗照樣會刪掉舊頁面**）。兩條路共用這一支，之後再長第三條也是。
         def _broken(kind, exc):
-            nonlocal n_broken, n_broken_kept
+            nonlocal n_broken, n_broken_kept, n_broken_prev
             print(f"  ! {kind} {sf.name}: {type(exc).__name__}: {exc}", file=sys.stderr)
             n_broken += 1
-            # ⚠⚠ **要先確認上一次的輸出真的還在磁碟上**。無條件回填的話，舊 row 指向的
-            # 頁面若早就不見了（被清過、被手動刪過），索引就會多一條**指向不存在的檔**
-            # 的連結——那和「不放回去」留下的壞連結是同一種傷害，只是方向相反。
-            # ⚠ 旗標要照**磁碟上實際在、而且原本就標成同步的檔**改寫：上一次若只建了其中一種格式
-            #   （`--format md`／`html`），這一次又失敗，兩份索引都照舊旗標連結的話，就會有一份連到
-            #   不存在的頁面。索引頁與書籤反查表都看 `has_html`／`has_md` 決定連哪一種。
-            # ⚠ **兩個旗標都不成立就不回填**：磁碟上就算還有一份檔，它若原本就被標成過期（別的
-            #   指紋產的），回填只會多一條連到不存在（或不該信）的頁面的連結。
-            row = dict((cached or {}).get("row") or {})
-            row["has_html"] = bool(row.get("has_html", True) and row.get("out_html")
-                                   and (sess_dir / row["out_html"]).exists())
-            row["has_md"] = bool(row.get("has_md", True) and row.get("out_md")
-                                 and (sess_dir / row["out_md"]).exists())
-            if row["has_html"] or row["has_md"]:
-                new_entries[key] = dict(cached, row=row)
+            broken_kind[key] = kind
+            # 上一次的列照磁碟實況放回（頁面不在就不放，`_row_on_disk`）。看的是讀進來的紀錄、不是 `cached`：
+            # `--force` 不沿用輸出，但壞掉的那一場照樣留著上一次的頁面。
+            back = old_manifest.get(key) or {}
+            row = _row_on_disk(back.get("row"), sess_dir)
+            if row:
+                # 兩份索引在這一列標「⚠ 上次的內容」（`kept_broken_note`）：建置輸出關掉之後，索引是唯一看得到的地方。
+                # 下一次讀得動就拿掉：重建的列沒有這一格，沿用的那條路也拿掉（見 `reusable` 那段）。
+                row["kept_broken"] = kind
+                new_entries[key] = dict(back, row=row)
                 n_broken_kept += 1
+                return
+            # 只有上一版的列（升版後第一次碰到這一場）：留著上一版的頁面與書籤，不畫進索引（見 `read_manifest`）
+            row = _row_on_disk((old_prev.get(key) or {}).get("row"), sess_dir)
+            if row:
+                new_prev[key] = {"row": row}
+                n_broken_prev += 1
 
         try:
             if source_kind == SOURCE_CODEX:
@@ -14404,6 +14572,9 @@ def main():
             _broken("解析失敗", e)
             continue
         if source_kind in (SOURCE_CODEX, SOURCE_ANTIGRAVITY) and not project_matches_filter(s, args.project):
+            for _sec, _e in zip((new_entries, new_prev), carried):
+                if _e is not None:
+                    _sec[key] = _e
             continue
         if not any(e.get("type") in ("user", "assistant") for e in s.events):
             continue
@@ -14418,10 +14589,8 @@ def main():
         # ⚠ 這一段**包到渲染完為止**，不是只包 `analyze()`：宣稱的性質是「一場壞掉不可以
         #   拖垮整批」，而渲染層拿到的是同一份髒資料。
         # ⚠⚠ **不放回上一次的 row 的話**：這一場不進 `rows` ⇒ `allowed` 不含它 ⇒ **孤兒清理
-        # 會刪掉上一次建好的頁面**；而同一次執行寫 `bookmarks.html` 用的是磁碟上那份舊
-        # manifest（`prune_gone_sources()` 只對掉「來源檔不見了」的，來源檔還在）⇒ 管理頁
-        # 留下一列**指向剛剛被自己刪掉的檔案**的書籤：點下去是找不到檔案，而不是設計上
-        # 要給的「⚠ 對不到檔案」。⚠ 沿用的是**上一次**的內容，所以收尾那行要講出來。
+        # 會刪掉上一次建好的頁面**，標在那一頁上的書籤從此對不到檔案。只有上一版的列時也一樣要留
+        # （`_broken` 的第二段）。⚠ 沿用的是**上一次**的內容，所以收尾那行要講出來。
         try:
             analyze(s, acct_switches)
         except Exception as e:
@@ -14518,9 +14687,10 @@ def main():
     for _p in ag_placed:
         for _d in ag_tree.get(_p, (None, ()))[1]:
             new_entries.pop(manifest_key(SOURCE_ANTIGRAVITY, Path(_d["path"])), None)
+    # 同檔名去重收掉的那幾份：留下的那一份這一次有列才拿掉它們的列（要在畫索引之前）
+    _reconcile_dedupe_losers(dropped, new_entries, new_prev, old_manifest, old_prev, sess_dir, broken_kind)
 
     rows = _index_rows(new_entries, args.include_empty)
-    show_account = len({r.get("account", "") for r in rows}) > 1
     n_clash = report_output_clashes(rows)
 
     # 產生「有 memory/ 的 Claude 專案」的 memory 頁。
@@ -14596,38 +14766,15 @@ def main():
                     pass
         links_html = links_md = (has_report, has_codex_report)
 
-    if want_html:
-        _write_atomic(out / "index.html", render_index_html(rows, show_account, *links_html))
-        # 書籤管理頁與設定頁（第 3 期）。⚠ 放 `out/sessions/` **底下**，不是 `out/` 根：
-        # 和寫入者（session 頁）同一棵子樹，把「目錄層級」這個變數整個消掉。
-        # ⚠ 兩份和 index.html 一樣**每次都無條件重產**，不受 manifest 的版本閘管。
-        # ⚠ 下面清孤兒檔那一段只掃 `rel.parts[0] in scanned_source_dirs`（來源夾），
-        #   這兩個檔在 `sessions/` 的**第一層**、`parts[0]` 就是檔名本身 ⇒ 掃不到、不會被誤刪。
-        #   守它的是 `test_bookmark_manage_pages` 的「重建兩次仍在」那一格。
-        # ⚠⚠ fallback 讀的是**磁碟上那份舊 manifest**（`save_manifest` 這時還沒跑），
-        #    所以它必須走**同一條對帳規則**——否則上面 `new_entries` 對掉的那幾筆會從
-        #    這裡再被烤回反查表，同一個缺陷換一條路徑進來。
-        #    守它的是 `test_bookmark_deleted_source_pruned`。
-        bx_fallback, _ = prune_gone_sources(load_manifest_paths(out), scanned_roots)
-        _write_atomic(sess_dir / "bookmarks.html", render_bookmarks_html(rows, bx_fallback, sess_dir))
-        _write_atomic(sess_dir / "settings.html", render_settings_html())
-    elif want_md:
-        # ⚠ 純 md 建置**不重產**這兩頁，留著就是一份**過期的 `BX_SESS`**：
-        #   之後某場的檔名變了（專案改名）而該次是純 md 全量建置時，孤兒清理會刪掉舊
-        #   `.html`、又不會產新的 ⇒ 管理頁生出一條指向**已刪檔案**的連結，
-        #   而不是誠實的「⚠ 對不到檔案」。比照 `cache-report.*` 那段：不重產就刪掉。
-        for stale in (sess_dir / "bookmarks.html", sess_dir / "settings.html"):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
-    if want_md:
-        _write_atomic(out / "index.md", render_index_md(rows, show_account, *links_md))
+    _write_indexes(out, rows, want_html, want_md, links_html, links_md)
 
     # 清掉已不存在 session 的孤兒輸出檔（縮小範圍模式下不清，以免誤刪未處理的帳號/專案）
     removed = 0
     if not filtering:
         allowed = {r["out_html"] for r in rows} | {r["out_md"] for r in rows}
+        # 留著的上一版的頁面（壞掉那一場、被去重收掉的那一份）不在索引上，但不清
+        for _e in new_prev.values():
+            allowed |= {p for p in (_e["row"].get("out_html"), _e["row"].get("out_md")) if p}
         # ⚠ 只產一種格式的建置（`--format md`／`html`）**不刪另一種格式的檔**：另一種格式的索引
         #   （`index.html`／`index.md`）這一次沒有重畫，還連著它們。檔名換了的時候（升版改名、專案改名）
         #   舊名的那一份就留到下一次兩種都產的建置再清。
@@ -14642,7 +14789,13 @@ def main():
                 except OSError:
                     pass
 
-    save_manifest(out, new_entries)
+    # ⚠ 書籤管理頁在清完孤兒檔**之後**才寫：備援的列只收磁碟上還在的頁（`render_bookmarks_html`），
+    #   先寫的話會收進一條這一次剛被清掉的頁、給出死連結，而不是「⚠ 對不到檔案」。
+    # ⚠⚠ 備援是**讀進來的那份紀錄**（`mf["known"]`），所以它必須走**同一條對帳規則**——否則上面
+    #    `new_entries` 對掉的那幾筆會從這裡再被烤回反查表，同一個缺陷換一條路徑進來。
+    #    守它的是 `test_bookmark_deleted_source_pruned`。
+    _write_bookmark_pages(sess_dir, rows, want_html, prune_gone_sources(mf["known"], scanned_roots)[0])
+    save_manifest(out, new_entries, new_prev)
 
     bits = [f"新建/更新 {n_build}", f"沿用 {n_reuse}"]
     if n_empty:
@@ -14652,7 +14805,12 @@ def main():
         #   但那些會被幾百行輸出捲走，收尾這一行是使用者一定看得到的位置。
         # ⚠ 「沿用上一次的輸出」要講出來——那一頁的內容是舊的，而索引與書籤照樣指得到它。
         _kept = f"，其中 {n_broken_kept} 沿用上一次的輸出" if n_broken_kept else ""
+        if n_broken_prev:
+            _kept += f"{'、' if _kept else '，其中 '}{n_broken_prev} 留著上一版的頁面（不在索引）"
         bits.append(f"壞掉跳過 {n_broken}{_kept}（見上面的 ! 訊息）")
+    if len(new_prev) > n_broken_prev:
+        # 縮範圍建置沒涵蓋到的上一版的列（或去重時留下那一份沒有列、被收掉那一份只有上一版的列）
+        bits.append(f"上一版的頁面 {len(new_prev) - n_broken_prev} 場留著、不在索引（跑一次完整建置補齊）")
     if n_clash:
         bits.append(f"⚠ 輸出檔名相同 {n_clash} 個（見上面的 ! 訊息）")
     if n_mem:

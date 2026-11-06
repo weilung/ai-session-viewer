@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -9384,8 +9385,15 @@ def test_archive_command_only(tmp_path=None):
     _src_ul = proj / f"{sid_ul}.jsonl"
     _real_unlink, _ul_hits = _v.os.unlink, []
 
+    _tgt_ul = arc_ul / f"-x-Proj__{sid_ul}.jsonl"
+
+    # ⚠ 注入點認「目的地已經複製進內容之後，這一場的第一個 `unlink`」，不認「第一個 `unlink`」：
+    # POSIX 的凍結（`_rename_noreplace`）本身就是 `link`＋`unlink(來源)`，認第一個的話會落在凍結途中
+    # ——那時來源與凍結檔是同一個 inode，追加進去的是凍結檔，比對對不上而不搬，驗不到這一格要驗的時機。
+    # 那一刻目的地還是空的佔位檔，所以用「目的地有內容」分開兩者（不靠凍結檔的檔名：拿掉凍結也要抓得到）。
     def _append_then_unlink(path, *a, **k):
-        if not _ul_hits and Path(path).name.startswith(sid_ul):
+        if (not _ul_hits and Path(path).name.startswith(sid_ul)
+                and _tgt_ul.is_file() and _tgt_ul.stat().st_size > 0):
             _ul_hits.append(Path(path).name)
             with open(_src_ul, "ab") as fh:             # 依路徑追加（比對完、刪掉之前）
                 fh.write(_LATE)
@@ -10888,7 +10896,7 @@ def test_sync_conflict_copies(tmp_path=None):
 #    ⚠ 反過來：**擴大 fixture 時雜湊一定會變，那時產品輸出沒變，版本不升、只更新雜湊**。
 # 範圍限制 SCOPE-RENDER-PIN-FIXTURE：釘的是這支測試的 fixture 走得到的輸出；Codex 只有「工具結果是
 #    content item 陣列」那一條，子代理、Claude 的圖片、壓縮、排隊句、未知模型這些路徑不在 fixture 裡。
-_RENDER_PIN =(76, "b48802750c60158abe89b5c3362a4fe05340109c0d252ee0c360cc8baf9ad8a7")
+_RENDER_PIN =(77, "353c3709e0b0f7b379f6dc2cfdc1ec7ed2465f3a5ef37bdae80f0ce5ea941a9e")
 
 
 def test_ask_user_question(tmp_path=None):
@@ -11218,12 +11226,19 @@ def test_renderer_version_pinned(tmp_path=None):
         ag_planner(1, text="好", think="先看", calls=[("k1", "run_command", {"CommandLine": "ls"}),
                                                     ("k1", "view_file", {"AbsolutePath": "/x/a.py"}),
                                                     ("k2", "run_command", {"CommandLine": "pwd"}),
-                                                    ("k3", "run_command", {"CommandLine": "sleep 9"})],
+                                                    ("k3", "run_command", {"CommandLine": "sleep 9"}),
+                                                    ("k4", "list_dir", {"DirectoryPath": "/x"}),
+                                                    ("k5", "run_command", {"CommandLine": "false"})],
                    usage=(100, 10, 50)),
         ag_generic(2, "k1", "run_command", {"CommandLine": "ls"}, result="a.py"),
         ag_generic(3, "k1", "view_file", {"AbsolutePath": "/x/a.py"}, result="print(1)"),
         ag_generic(3, "k2", "run_command", {"CommandLine": "pwd"}, result="/x", status=5),          # CLEARED
         ag_generic(3, "k3", "run_command", {"CommandLine": "sleep 9"}, result="半截", status=2),    # 還沒跑完、記下了一半
+        # 舊紀錄：工具結果記成自己專用的步驟型別（list_dir、run_command 帶結束代碼）＋空的 CONVERSATION_HISTORY
+        ag_typed(3, 9, 15, pbm(3, pbs(1, "d"), pbv(2, 1)) + pbm(3, pbs(1, "a.py"), pbv(4, 9)),
+                 "k4", "list_dir", {"DirectoryPath": "/x"}),
+        ag_typed(3, 21, 28, pbv(6, 1) + pbm(21, pbs(1, "err")), "k5", "run_command", {"CommandLine": "false"}),
+        (98, 3, pbv(1, 98) + pbv(4, 3) + ag_meta(3) + pbs(111, b"")),
         ag_system(4, "done", title="Run finished", event="task_notification"),
         ag_checkpoint(5, "摘要", trigger_idx=0),
         ag_planner(6, text="完成", usage=(10, 5, 0), enum=4242)])
@@ -11375,6 +11390,15 @@ def ag_generic(sec, cid, name, args, result=None, status=3, err=None):
     if err:
         p += pbm(31, pbs(2, err))
     return (132, status, p)
+
+
+def ag_typed(sec, stype, field, sub, cid, name, args, status=3, err=None):
+    """舊紀錄的工具結果：記成自己專用的步驟型別（例 21 RUN_COMMAND），結果放在 `Step` 的 `field`（已編好的 `sub`）。"""
+    tc = pbm(4, pbs(1, cid), pbs(2, name), pbs(3, json.dumps(args, ensure_ascii=False)))
+    p = pbv(1, stype) + pbv(4, status) + ag_meta(sec, tc) + pbm(field, sub)
+    if err:
+        p += pbm(31, pbs(2, err))
+    return (stype, status, p)
 
 
 def ag_system(sec, body, title="System Message", event="", src=None):
@@ -11776,6 +11800,71 @@ def test_antigravity_tool_pairing(tmp_path=None):
     assert body.index("echo YY") < body.index("AGYYRES")
     assert "（無結果 / 已中斷）" not in body, "原本的呼叫配到了結果"
     print("OK: antigravity tool pairing test passed")
+
+
+def test_antigravity_legacy_tool_steps(tmp_path=None):
+    """舊紀錄（2026-08 以前）有幾種工具的結果記成自己專用的步驟型別，不是 GENERIC：
+
+    ① grep_search(7)／view_file(8)／list_dir(9)／run_command(21)／search_web(33) 的結果畫出來、配回模型回應裡的那一次呼叫；
+    ② run_command：結束代碼不是 0 的要講（int32 的負數是 10 個位元組的 varint）；被取消的照 GENERIC 的講法；
+    ③ CONVERSATION_HISTORY(98)：空的不畫也不標；有內容的收在摺疊列裡；
+    ④ 這幾種都不再出「認不得的步驟型別」。"""
+    tmp = new_tmp(tmp_path)
+    src = tmp / "conversations"
+    src.mkdir()
+    L = "1357abcd-0000-4000-8000-0000000000d4"
+    calls = [("g1", "grep_search", {"Query": "needle"}), ("v1", "view_file", {"AbsolutePath": "/home/demo/a.py"}),
+             ("d1", "list_dir", {"DirectoryPath": "/home/demo"}), ("r1", "run_command", {"CommandLine": "make"}),
+             ("r2", "run_command", {"CommandLine": "false"}), ("r3", "run_command", {"CommandLine": "rm -rf x"}),
+             ("s1", "search_web", {"query": "q"}),
+             ("r4", "run_command", {"CommandLine": "snap"}), ("r5", "run_command", {"CommandLine": "split"}),
+             ("r6", "run_command", {"CommandLine": "buf"}), ("s2", "search_web", {"query": "docs"})]
+    ag_write_db(src / f"{L}.db", L, [
+        (98, 3, pbv(1, 98) + pbv(4, 3) + ag_meta(0) + pbs(111, b"")),
+        ag_user(0, "AGLEGACYQ"),
+        ag_planner(1, calls=calls, usage=(10, 5, 0)),
+        ag_typed(2, 7, 13, pbs(1, "needle") + pbs(3, "AGGREPRAW a.py:3:needle"), *calls[0]),
+        ag_typed(3, 8, 14, pbs(1, "file:///home/demo/a.py") + pbs(4, "AGVIEWCONTENT"), *calls[1]),
+        ag_typed(4, 9, 15, pbs(1, "file:///home/demo")
+                 + pbm(3, pbs(1, "AGSUBDIR"), pbv(2, 1)) + pbm(3, pbs(1, "AGFILE.txt"), pbv(4, 1234)), *calls[2]),
+        ag_typed(5, 21, 28, pbs(2, "/home/demo") + pbv(6, 0) + pbm(21, pbs(1, "AGMAKEOUT")), *calls[3]),
+        ag_typed(6, 21, 28, pbv(6, (1 << 64) - 2) + pbm(21, pbs(1, "AGFALSEOUT")), *calls[4]),
+        ag_typed(7, 21, 28, pbs(23, "rm -rf x"), *calls[5], status=6, err="AGCANCELERR"),
+        ag_typed(8, 33, 42, pbs(1, "q") + pbs(5, "AGWEBSUMMARY"), *calls[6]),
+        # run_command 的輸出只放在 21 以外的地方：26 snapshot、19／20 分開的 stdout／stderr、7／8 buffer
+        ag_typed(9, 21, 28, pbm(26, pbs(2, "AGSNAPOUT")), *calls[7]),
+        ag_typed(10, 21, 28, pbm(19, pbs(1, "AGSPLITOUT")) + pbm(20, pbs(1, "AGSPLITERR")), *calls[8]),
+        ag_typed(11, 21, 28, pbs(7, "AGBUFOUT"), *calls[9]),
+        # search_web 沒有摘要、只有文件
+        ag_typed(12, 33, 42, pbs(1, "docs") + pbm(2, pbs(4, "AGDOCTITLE"), pbs(3, "https://ex.test/d"), pbs(2, "AGDOCTEXT"))
+                 + pbm(2, pbs(4, "AGDOC2TITLE"), pbs(7, "AGDOC2SUMMARY")), *calls[10]),
+        (98, 3, pbv(1, 98) + pbv(4, 3) + ag_meta(13) + pbm(111, pbs(1, "AGHISTORY\nAGHISTBODY2"))),
+    ])
+    r = _ag_build(src, tmp / "out")
+    body = _page_body(_session_pages(tmp / "out")[0].read_text(encoding="utf-8"))
+    # --- ① 結果在自己的呼叫底下
+    for call, res in (("needle", "AGGREPRAW"), ("/home/demo/a.py", "AGVIEWCONTENT"), ("AGSUBDIR/", "AGFILE.txt"),
+                      ("make", "AGMAKEOUT"), ("false", "AGFALSEOUT"), ("search_web", "AGWEBSUMMARY")):
+        assert res in body, f"舊紀錄的工具結果要畫出來：{res}"
+    assert "AGFILE.txt（1,234 bytes）" in body and "AGSUBDIR/" in body, "list_dir：目錄加斜線、檔案帶大小"
+    assert body.index("run_command · make") < body.index("AGMAKEOUT") < body.index("run_command · false") \
+        < body.index("AGFALSEOUT"), "每個結果在自己的呼叫底下"
+    assert "（無結果 / 已中斷）" not in body, "每一個呼叫都配到了結果"
+    # --- ② 結束代碼、被取消
+    assert "（結束代碼 -2）" in body and "（結束代碼 0）" not in body, "結束代碼：負數照 int32 解，0 不講"
+    assert "沒有執行：被取消，或權限沒有核准" in body, "被取消的 run_command 照 GENERIC 的講法"
+    # --- run_command／search_web 的其他放法：只要有一處有字就畫出來
+    for call, res in (("snap", "AGSNAPOUT"), ("split", "AGSPLITOUT"), ("split", "AGSPLITERR"), ("buf", "AGBUFOUT"),
+                      ("docs", "AGDOCTEXT")):
+        assert res in body, f"輸出不在 21／summary 也要畫出來：{call} → {res}"
+    assert "AGDOCTITLE" in body and "https://ex.test/d" in body and "AGDOC2TITLE" in body and "AGDOC2SUMMARY" in body, \
+        "只有文件的 search_web：每份文件的標題、網址、內文（沒有內文用摘要）"
+    # --- ③ CONVERSATION_HISTORY（第二行只在摺疊的原文裡：摘要只取第一行）
+    assert "對話歷史" in body and "AGHISTORY" in body and body.count("對話歷史") == 1, "空的不畫、有內容的畫一次"
+    assert "AGHISTBODY2" in body, "有內容的 CONVERSATION_HISTORY：原文收在摺疊列裡"
+    # --- ④ 不出聲
+    assert "認不得的步驟" not in r.stderr and "認不得的步驟" not in body, r.stderr
+    print("OK: antigravity legacy tool steps test passed")
 
 
 def test_antigravity_identity(tmp_path=None):
@@ -12488,82 +12577,117 @@ if __name__ == "__main__":
     # `new_tmp()` 本身，而下面每一支測試都靠 `new_tmp()` 開工。排在後面的話，
     # helper 壞掉時整套會在**第一支測試**就 `PermissionError` 死掉，
     # **永遠到不了這一格**——於是「守著它的那格」在最需要它的時候完全沒有聲音。
-    test_tmp_base_env()
-    test_smoke()
-    test_search()
-    test_subagent_inline()
-    test_day_divider()
-    test_compact_marker()
-    test_ai_md()
-    test_codex_step_badges()
-    test_codex_same_minute_outputs()
-    test_session_kind_tags()
-    test_codex_survival_report()
-    test_cache_report()
-    test_review_detection()
-    test_cache_report_by_kind()
-    test_cache_report_active_days()
-    test_classify_cache_causes()
-    test_cold_cause_badges()
-    test_api_miss_reason()
-    test_write_ttl_badges()
-    test_cost_mix_table()
-    test_split_call_usage_last_event()
-    test_ctx_window_and_coldest()
-    test_codex_ai_label()
-    test_codex_item_completed_user()
-    test_account_switch_cause()
-    test_report_partition_and_labels()
-    test_acct_precision_and_server_cause()
-    test_acct_separator_and_step_time()
-    test_scope_notes_without_cold()
-    test_prompt_loss_backstop()
-    test_response_item_type_drift()
-    test_forced_switch_parallel_label()
-    test_limits_section_accumulator()
-    test_message_role_and_content_drift()
-    test_json_string_content()
-    test_history_partial_blank_sentinel()
-    test_durable_anchor()
-    test_anchor_tiebreak_main_vs_side()
-    test_anchor_tiebreak_sort_is_load_bearing()
-    test_bookmark_ui()
-    test_bookmark_block_anchors()
-    test_bookmark_block_anchor_same_second()
-    test_bookmark_manage_pages()
-    test_bookmark_link_durability()
-    test_bookmark_codex_title_masked()
-    test_bookmark_deleted_source_pruned()
-    test_bookmark_account_label_rebuild()
-    test_bookmark_all_sources_deleted()
-    test_zero_scan_keeps_out_of_scope_index()
-    test_zero_scan_keeps_cache_report_links()
-    test_no_cache_report_flag()
-    test_signature_memory_shared()
-    test_prev_rows_after_version_bump()
-    test_prev_rows_codex_project_scope()
-    test_manifest_odd_shapes()
-    test_dedupe_across_scope()
-    test_bookmarks_after_orphan_sweep()
-    test_version_flag()
-    test_no_uppercase_unicode_escape_in_js()
-    test_user_turn_fidelity()
-    test_codex_sentinel_false_alarms()
-    test_one_bad_session_does_not_kill_batch()
-    test_archive_command_only()
-    test_build_interrupt_residue()
-    test_cwd_cache()
-    test_codex_tool_output_items()
-    test_ask_user_question()
-    test_sync_conflict_copies()
-    test_renderer_version_pinned()
-    test_antigravity()
-    test_antigravity_tree_cycle()
-    test_antigravity_tool_pairing()
-    test_antigravity_identity()
-    test_antigravity_page_marks()
-    test_antigravity_tools_scoped_to_source()
-    test_antigravity_tree_deep_and_tmp_mode()
-    test_antigravity_incremental_edges()
-    test_no_known_typo_chars()
-    test_no_review_history_in_source()
+    # ⚠ 它失敗就整套停下（其餘每一支都靠它驗的 helper），但照樣要報出名字、以非零結束：
+    #   `SystemExit(0)` 也算失敗——不接的話整套以 0 結束、什麼都沒印。
+    try:
+        test_tmp_base_env()
+    except (Exception, SystemExit):
+        traceback.print_exc()
+        sys.stdout.flush()
+        print("FAIL: test_tmp_base_env\n\n1 支失敗：test_tmp_base_env（其餘測試都靠它，沒有跑）", file=sys.stderr)
+        sys.exit(1)
+
+    # ⚠ 其餘每一支都跑完再報：遇錯即停的話，排在前面的一支失敗（例：只在某個作業系統失敗的那一支）
+    # 會讓後面的測試一支都不執行，看起來卻只有一個失敗。失敗的先記下、照樣往下跑，最後列出清單並以非零退出。
+    # 一支失敗後留下的狀態可能連帶弄壞後面幾支——清單裡排在最前面的那一支最可信。
+    # ⚠ `SystemExit` 也算那一支失敗（連 `sys.exit(0)` 也是）：只接 `Exception` 的話，後面一支呼叫 `sys.exit(0)`
+    #   會讓整套以 0 結束、蓋掉前面已經記下的失敗，清單也不印。
+    # ⚠ Ctrl+C（`KeyboardInterrupt`）照樣中斷，但先印出已經記下的失敗與「在哪一支中斷」，再以非零結束。
+    _failed, _t = [], None
+    try:
+        for _t in (
+            test_smoke,
+            test_search,
+            test_subagent_inline,
+            test_day_divider,
+            test_compact_marker,
+            test_ai_md,
+            test_codex_step_badges,
+            test_codex_same_minute_outputs,
+            test_session_kind_tags,
+            test_codex_survival_report,
+            test_cache_report,
+            test_review_detection,
+            test_cache_report_by_kind,
+            test_cache_report_active_days,
+            test_classify_cache_causes,
+            test_cold_cause_badges,
+            test_api_miss_reason,
+            test_write_ttl_badges,
+            test_cost_mix_table,
+            test_split_call_usage_last_event,
+            test_ctx_window_and_coldest,
+            test_codex_ai_label,
+            test_codex_item_completed_user,
+            test_account_switch_cause,
+            test_report_partition_and_labels,
+            test_acct_precision_and_server_cause,
+            test_acct_separator_and_step_time,
+            test_scope_notes_without_cold,
+            test_prompt_loss_backstop,
+            test_response_item_type_drift,
+            test_forced_switch_parallel_label,
+            test_limits_section_accumulator,
+            test_message_role_and_content_drift,
+            test_json_string_content,
+            test_history_partial_blank_sentinel,
+            test_durable_anchor,
+            test_anchor_tiebreak_main_vs_side,
+            test_anchor_tiebreak_sort_is_load_bearing,
+            test_bookmark_ui,
+            test_bookmark_block_anchors,
+            test_bookmark_block_anchor_same_second,
+            test_bookmark_manage_pages,
+            test_bookmark_link_durability,
+            test_bookmark_codex_title_masked,
+            test_bookmark_deleted_source_pruned,
+            test_bookmark_account_label_rebuild,
+            test_bookmark_all_sources_deleted,
+            test_zero_scan_keeps_out_of_scope_index,
+            test_zero_scan_keeps_cache_report_links,
+            test_no_cache_report_flag,
+            test_signature_memory_shared,
+            test_prev_rows_after_version_bump,
+            test_prev_rows_codex_project_scope,
+            test_manifest_odd_shapes,
+            test_dedupe_across_scope,
+            test_bookmarks_after_orphan_sweep,
+            test_version_flag,
+            test_no_uppercase_unicode_escape_in_js,
+            test_user_turn_fidelity,
+            test_codex_sentinel_false_alarms,
+            test_one_bad_session_does_not_kill_batch,
+            test_archive_command_only,
+            test_build_interrupt_residue,
+            test_cwd_cache,
+            test_codex_tool_output_items,
+            test_ask_user_question,
+            test_sync_conflict_copies,
+            test_renderer_version_pinned,
+            test_antigravity,
+            test_antigravity_tree_cycle,
+            test_antigravity_tool_pairing,
+            test_antigravity_legacy_tool_steps,
+            test_antigravity_identity,
+            test_antigravity_page_marks,
+            test_antigravity_tools_scoped_to_source,
+            test_antigravity_tree_deep_and_tmp_mode,
+            test_antigravity_incremental_edges,
+            test_no_known_typo_chars,
+            test_no_review_history_in_source,
+        ):
+            try:
+                _t()
+            except (Exception, SystemExit):
+                traceback.print_exc()
+                print(f"FAIL: {_t.__name__}", file=sys.stderr)
+                _failed.append(_t.__name__)
+    except BaseException:
+        sys.stdout.flush()
+        print(f"\n⚠ 在 {getattr(_t, '__name__', '?')} 中斷，之後的測試沒有跑"
+              + (f"；在那之前 {len(_failed)} 支失敗：" + "、".join(_failed) if _failed else ""), file=sys.stderr)
+        raise
+    if _failed:
+        sys.stdout.flush()          # 清單要排在所有 OK 行之後（stdout 有緩衝、stderr 沒有）
+        print(f"\n{len(_failed)} 支失敗（依執行順序）：" + "、".join(_failed), file=sys.stderr)
+        sys.exit(1)

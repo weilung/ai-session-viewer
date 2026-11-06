@@ -49,7 +49,7 @@ except Exception:
 
 # 工具的版本（`--version` 印的就是它）。出版時手動改，和公開 repo 的 git tag 對齊（tag 是 `v` 加上這個字串）。
 # 和 `RENDERER_VERSION` 是兩件事：那一個只管「既有輸出要不要重建」，每次頁面呈現一變就升。
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 MAX_RESULT_CHARS = 20000           # tool 結果在 HTML 裡的最大字數（可摺疊，超過截斷）
 MAX_WRITE_CHARS = 8000             # Write/檔案內容預覽上限
@@ -261,7 +261,10 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 # 75 → 76（2026-10-24）：① 頁尾的孤兒子代理自己派出的子代理只畫一次（原本就地畫過、頁尾又畫一次，錨點重複），
 #    頁頂目錄指向它實際所在的框（三種來源共用；只在那種形狀的頁面上變）。② Antigravity 的工具結果：還沒跑完但記下了
 #    文字或附件的照畫，CLEARED 與它都在那一步之後標「⚠ 工具結果的狀態不是完成」。
-RENDERER_VERSION = 76
+# 76 → 77（2026-10-29）：Antigravity 舊紀錄的工具結果（grep_search／view_file／list_dir／run_command／search_web
+#    記成自己專用的步驟型別）照工具結果畫、配回它的呼叫；原本那幾次呼叫畫成「無結果」、另標「⚠ 認不得的步驟」。
+#    內容是空的 CONVERSATION_HISTORY 不再標「⚠ 認不得的步驟」。只在有那幾種步驟的頁面上變。
+RENDERER_VERSION = 77
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 SOURCE_ANTIGRAVITY = "antigravity"
@@ -2079,6 +2082,7 @@ AG_STEP_ERROR = 17           # ERROR_MESSAGE
 AG_STEP_CHECKPOINT = 23      # CHECKPOINT：壓縮（`/compact` 或自動）
 AG_STEP_SYSTEM = 101         # SYSTEM_MESSAGE：背景任務完成、代理之間的訊息、系統通知
 AG_STEP_GENERIC = 132        # GENERIC：一次工具呼叫的結果
+AG_STEP_CONV_HISTORY = 98    # CONVERSATION_HISTORY（舊紀錄：一場一則，實測內容全是空的）
 AG_STATUS_DONE, AG_STATUS_INVALID, AG_STATUS_CANCELED, AG_STATUS_ERROR = 3, 4, 6, 7
 AG_STATUS_INTERRUPTED = 12
 # CortexStepStatus 的其餘值：還沒跑完的幾種（紀錄停在那裡＝沒有結果）與 CLEARED
@@ -2179,6 +2183,89 @@ def _pb_int(fields, fn, default=0):
     if not isinstance(vals[-1], int):
         raise ValueError(f"field {fn} is not a varint")
     return vals[-1]
+
+
+def _pb_bytes_list(fields, fn):
+    """欄位 `fn` 的每一個值（repeated 的巢狀訊息或字串）；有任何一個不是 length-delimited 丟 `ValueError`。"""
+    vals = fields.get(fn, [])
+    if not all(isinstance(v, bytes) for v in vals):
+        raise ValueError(f"field {fn} is not a message")
+    return vals
+
+
+# 舊紀錄（實測：2026-08 以前的對話；09 起一律記成 GENERIC）有幾種工具的結果記成自己專用的步驟型別。
+# 呼叫一樣在 `metadata.4`，只有結果放在 `Step` 的另一個欄位 ⇒ 配對、狀態、錯誤跟 GENERIC 共用，這裡只管取結果。
+# 每一支：`Step` 的欄位 → (結果文字, 附件數)。欄位號照 CLI 內嵌的描述（`exa.cortex_pb.CortexStep*`）。
+# 取不到文字就回空的：狀態不是完成的那幾種，由呼叫端換成它自己的說明（被取消、出錯…），這裡不可以先填一句蓋掉。
+
+
+def _ag_res_grep(step):
+    g = _pb_msg(step, 13)                                # grep_search
+    text = _pb_str(g, 3) or "\n".join(                   # raw_output；沒有才用 results（1 相對路徑、2 行號、3 內容）
+        f"{_pb_str(r, 1)}:{_pb_int(r, 2)}:{_pb_str(r, 3)}" for r in map(_pb_fields, _pb_bytes_list(g, 4)))
+    return text or _pb_str(g, 5), 0                     # grep_error
+
+
+def _ag_res_view_file(step):
+    v = _pb_msg(step, 14)                                # view_file：4 content、9 raw_content、14／15 圖片與檔案
+    return _pb_str(v, 4) or _pb_str(v, 9), len(v.get(14, [])) + len(v.get(15, []))
+
+
+def _ag_res_list_dir(step):
+    d = _pb_msg(step, 15)                                # list_directory：3 results（1 名字、2 是目錄、3 子項數、4 大小）
+    lines = []
+    for r in map(_pb_fields, _pb_bytes_list(d, 3)):
+        name = _pb_str(r, 1)
+        if _pb_int(r, 2):
+            n = _pb_int(r, 3, None)
+            lines.append(f"{name}/" + (f"（{n} 項）" if n is not None else ""))
+        else:
+            sz = _pb_int(r, 4, None)
+            lines.append(name + (f"（{sz:,} bytes）" if sz is not None else ""))
+    if not lines:                                        # 2 children：只有名字的舊欄位
+        lines = [c.decode("utf-8", "replace") for c in _pb_bytes_list(d, 2)]
+    return "\n".join(lines) or ("（目錄不存在）" if _pb_int(d, 4) else ""), 0   # dir_not_found
+
+
+def _ag_cmd_output(c, fn):
+    """`RunCommandOutput`（1 full、2 truncated）的文字；沒有回空字串。"""
+    o = _pb_msg(c, fn)
+    return _pb_str(o, 1) or _pb_str(o, 2)
+
+
+def _ag_res_run_command(step):
+    # run_command 的輸出在 schema 裡有好幾個放法，依序取第一個有字的（只要有一處有字就不可以畫成空的）：
+    # 21 combined_output → 26 combined_output_snapshot（都是 RunCommandOutput）→ 19／20 stdout_output／stderr_output
+    # （RunCommandOutput）→ 4／5 stdout／stderr → 7／8 stdout_buffer／stderr_buffer（字串）。
+    c = _pb_msg(step, 28)
+    text = (_ag_cmd_output(c, 21) or _ag_cmd_output(c, 26)
+            or _ag_cmd_output(c, 19) + _ag_cmd_output(c, 20)
+            or _pb_str(c, 4) + _pb_str(c, 5) or _pb_str(c, 7) + _pb_str(c, 8))
+    code = _pb_int(c, 6, 0)                              # exit_code（int32：負數是補數編出來的 64 位元）
+    if code >= 1 << 63:
+        code -= 1 << 64
+    if code:
+        text = (text.rstrip("\n") + "\n" if text else "") + f"（結束代碼 {code}）"
+    return text, 0
+
+
+def _ag_res_search_web(step):
+    # search_web：5 summary；沒有摘要時畫 2 web_documents（KnowledgeBaseItem：4 標題、3 網址、2 內文，沒有內文才用 7 摘要），
+    # 一份文件一段——只有文件、沒有摘要的結果不可以畫成空的。
+    s = _pb_msg(step, 42)
+    text = _pb_str(s, 5)
+    if not text:
+        docs = []
+        for d in map(_pb_fields, _pb_bytes_list(s, 2)):
+            parts = [p for p in (_pb_str(d, 4), _pb_str(d, 3), _pb_str(d, 2) or _pb_str(d, 7)) if p]
+            if parts:
+                docs.append("\n".join(parts))
+        text = "\n\n".join(docs)
+    return text, 0
+
+
+_AG_TYPED_TOOL_RESULT = {7: _ag_res_grep, 8: _ag_res_view_file, 9: _ag_res_list_dir,
+                         21: _ag_res_run_command, 33: _ag_res_search_web}
 
 
 def _ag_time(ts):
@@ -2605,7 +2692,8 @@ def _ag_events(path, conv_id, srcf, warn, ids=None):
         if status not in AG_STATUS_KNOWN:
             odd.append((f"認不得的步驟狀態 {status}", "⚠ 認不得的步驟狀態",
                         f"第 {idx} 步：狀態 {status}（照內容畫，做完了沒、成功與否都不知道）"))
-        elif status in _AG_NOT_DONE and stype in (AG_STEP_USER_INPUT, AG_STEP_SYSTEM, AG_STEP_ERROR, AG_STEP_CHECKPOINT):
+        elif status in _AG_NOT_DONE and stype in (AG_STEP_USER_INPUT, AG_STEP_SYSTEM, AG_STEP_ERROR, AG_STEP_CHECKPOINT,
+                                                  AG_STEP_CONV_HISTORY):
             odd.append((f"步驟的狀態不是完成（{_AG_NOT_DONE[status]}）", "⚠ 步驟的狀態不是完成",
                         f"第 {idx} 步：{_AG_NOT_DONE[status]}"))
         try:
@@ -2690,16 +2778,20 @@ def _ag_events(path, conv_id, srcf, warn, ids=None):
                                     f"第 {idx} 步：欄位 {unk} 沒有算進花費（可能是快取寫入之類的量）"))
                     msg["usage"] = use
                 ev("assistant", idx, dt, msg)
-            elif stype == AG_STEP_GENERIC:
+            elif stype == AG_STEP_GENERIC or stype in _AG_TYPED_TOOL_RESULT:
                 tc = _pb_msg(meta, 4)                            # CortexStepMetadata.tool_call
                 raw, name, args = _pb_str(tc, 1), _pb_str(tc, 2), _pb_str(tc, 3)
                 key = (name, args)
-                res = _pb_msg(_pb_msg(step, 140), 2)             # generic.result（GenericStepResult）
-                text = _pb_str(res, 1)
+                if stype == AG_STEP_GENERIC:
+                    res = _pb_msg(_pb_msg(step, 140), 2)         # generic.result（GenericStepResult）
+                    text, n_media = _pb_str(res, 1), len(res.get(4, []))
+                else:
+                    text, n_media = _AG_TYPED_TOOL_RESULT[stype](step)
                 err = _pb_msg(step, 31)                          # Step.error（CortexErrorDetails）
                 err_text = _pb_str(err, 1) or _pb_str(err, 2) or _pb_str(err, 3)
-                n_media = len(res.get(4, []))
                 if raw and pending.get(raw):
+                    # 範圍限制 SCOPE-AG-DUP-ID-FIFO：同一個 id 有好幾次呼叫時照出現順序配（GENERIC 與舊紀錄的專用型別共用），
+                    # 不比工具名與參數 ⇒ 結果的順序跟呼叫相反時會配錯；頁面上有「工具呼叫 id 重複」的標記
                     tid = pending[raw].pop(0)
                 elif not raw and pending_noid.get(key):
                     tid = pending_noid[key].pop(0)
@@ -2729,6 +2821,7 @@ def _ag_events(path, conv_id, srcf, warn, ids=None):
                     if status == AG_STATUS_DONE or partial:
                         content, is_err = text, False
                     elif status == AG_STATUS_CANCELED:
+                        # 範圍限制 SCOPE-AG-CANCELED-ERROR-DETAIL：被取消的那一步畫結果文字或這一句，`Step.error` 的內容不畫
                         content, is_err = text or "（沒有執行：被取消，或權限沒有核准）", True
                     elif status == AG_STATUS_INTERRUPTED:
                         content, is_err = text or "（被打斷）", True
@@ -2780,6 +2873,12 @@ def _ag_events(path, conv_id, srcf, warn, ids=None):
                 meta_c = {"trigger": "manual"} if 25 in cp else {}
                 ev("user", idx, dt, {"role": "user", "content": summ if summ.strip() else "（沒有摘要內容）"},
                    isCompactSummary=True, _compact_meta=meta_c)
+            elif stype == AG_STEP_CONV_HISTORY:
+                # 實測全是空的（沒有東西可畫，不標）；有內容的沒有樣本可對 ⇒ 原文收在摺疊列裡，不猜它的意思
+                hist = _pb_str(_pb_msg(step, 111), 1)            # conversation_history.content
+                if hist.strip():
+                    ev("user", idx, dt, {"role": "user", "content": hist}, isMeta=True,
+                       _special=_ag_notify("對話歷史", first_line(hist, 160), hist))
             else:
                 warn[f"認不得的步驟型別 {stype}"] += 1
                 ev("user", idx, dt, {"role": "user", "content": ""}, isMeta=True,
@@ -12817,7 +12916,10 @@ def _archive_move(path, target, src_id, staging):
       而「複製完、刪來源之前」那段時間 Claude Code 寫進來源的那一行會跟著來源一起被刪掉，紀錄還寫 `moved`。
       原子改名沒有那段窗：之後才依路徑寫入的東西會落在原處一個**新建的檔**，不會被刪。
     ⚠⚠ **跨磁碟**（這個功能的典型用法：來源在 `C:\\Users\\…\\.claude`，封存目錄在別顆碟）才走複製：
-      ① 先把來源**改名凍結**成同目錄的 `staging`（原子；之後依路徑寫入的落在原處的新檔）；
+      ① 先把來源**改名凍結**成同目錄的 `staging`（之後依路徑寫入的落在原處的新檔）；
+        ⚠ 只有 Windows 是一步原子改名。POSIX 的 `_rename_noreplace` 是 `link`＋`unlink(來源)`：
+        兩步之間依路徑寫入的落在凍結檔（同一個 inode）⇒ ③ 對不上 ⇒ 不搬、放回原處（不丟資料）。
+        範圍限制 SCOPE-ARCHIVE-POSIX-FREEZE-WINDOW：那一段窗裡有寫入時，這一場這次就不搬。
       ② 複製凍結檔到目的地；③ **兩邊內容都等於搬移前量的 `src_id`** 才刪凍結檔
       （凍結檔若被開著的 handle 寫過，對不上 ⇒ 不刪）；④ 唯讀的來源先解除唯讀再刪。
       任何一步失敗或中斷：把凍結檔改名回原處（`_restore_staging`），原樣拋出——

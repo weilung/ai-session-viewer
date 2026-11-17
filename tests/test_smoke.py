@@ -8679,6 +8679,41 @@ def test_codex_sentinel_false_alarms(tmp_path=None):
                               {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]), "serial")
     assert "含非文字 block" in err, f"真的序列化的 content（文字＋圖片）照樣要出聲：{err!r}"
 
+    # --- ⑳ CLI 0.164 起的兩種 response_item：工具宣告、執行環境改設定——都不是對話內容 ⇒ 不可以出聲 -------
+    # 形狀照真實 rollout（值是造的）；外層另帶 `ordinal`／`metadata`。
+    def _new(sec, payload, meta):
+        return json.dumps({"timestamp": f"2026-09-01T06:{sec // 60:02d}:{sec % 60:02d}.000Z", "ordinal": sec,
+                           "type": "response_item", "payload": payload, "metadata": meta}, ensure_ascii=False)
+
+    tools = {"type": "additional_tools", "id": "at_x", "role": "developer", "tools": [
+        {"type": "namespace", "name": "functions", "description": "", "tools": [
+            {"type": "function", "name": "exec", "description": "SENTTOOLDESC", "strict": False,
+             "parameters": {"type": "object", "properties": {}}}]}]}
+    conf = {"type": "configuration_update", "reasoning": {"effort": "low"}}
+    rows = turn(10)
+    rows[1:1] = [_new(10, tools, {"history_sequence": 1, "client_authored": False})]
+    rows += [_new(20, conf, {"history_sequence": 8, "harness_authored_configuration": True})] + turn(30)
+    n_ai, err = run(rows, "cli164")
+    assert n_ai == 2, f"前提：兩個回合的回答都要收得到（實得 {n_ai} 則助理內容）"
+    assert not err.strip(), f"工具宣告與改設定不是對話內容，不該出聲：{err!r}"
+    # 夾在同一則 prompt 的兩種表述中間：不算把兩者隔開，「緊鄰的跨格式同文」照樣要出聲（兩種先後都驗）
+    def _legacy_q(sec):
+        return line(sec, "event_msg", {"type": "user_message", "message": "同一句SENTDUAL。"})
+
+    def _new_q(sec):
+        return line(sec, "event_msg", {"type": "item_completed", "item": {
+            "type": "UserMessage", "content": [{"type": "text", "text": "同一句SENTDUAL。"}]}})
+
+    for name, mid in (("tools", tools), ("conf", conf)):
+        for first, second in ((_legacy_q, _new_q), (_new_q, _legacy_q)):
+            rows = [line(10, "event_msg", {"type": "task_started", "turn_id": "t-dual"}), first(11),
+                    _new(12, mid, {"history_sequence": 2}), second(13),
+                    line(14, "response_item", {"type": "message", "role": "assistant",
+                                               "content": [{"type": "output_text", "text": "回答SENTDA。"}]}),
+                    line(15, "event_msg", {"type": "task_complete"})]
+            _n, err = run(rows, f"dual-{name}-{first.__name__}")
+            assert "緊鄰的跨格式同文" in err, f"中間夾著 {name}，同一則的兩種表述仍然緊鄰，要出聲：{err!r}"
+
     print("OK: codex sentinel false alarms test passed")
 
 
@@ -10896,7 +10931,7 @@ def test_sync_conflict_copies(tmp_path=None):
 #    ⚠ 反過來：**擴大 fixture 時雜湊一定會變，那時產品輸出沒變，版本不升、只更新雜湊**。
 # 範圍限制 SCOPE-RENDER-PIN-FIXTURE：釘的是這支測試的 fixture 走得到的輸出；Codex 只有「工具結果是
 #    content item 陣列」那一條，子代理、Claude 的圖片、壓縮、排隊句、未知模型這些路徑不在 fixture 裡。
-_RENDER_PIN =(77, "353c3709e0b0f7b379f6dc2cfdc1ec7ed2465f3a5ef37bdae80f0ce5ea941a9e")
+_RENDER_PIN =(78, "0e339be58df6fc3feb9dc4930905f9550eb9f37b6e02b5c7bf644a2dc6d30345")
 
 
 def test_ask_user_question(tmp_path=None):
@@ -12261,6 +12296,93 @@ def test_antigravity_tools_scoped_to_source(tmp_path=None):
     print("OK: antigravity tools scoped to source test passed")
 
 
+def test_code_fence_and_copy(tmp_path=None):
+    """程式碼圍欄與「複製」鈕。
+
+    ① 四個反引號的圍欄（開頭結尾各自成一行，可以縮排）：裡面的 ``` 原樣留在同一個 `<pre>`，外面不多出反引號；
+       結尾比開頭長也算結尾。
+    ② 其餘的文字（只有 ``` 的圍欄、行內的 ````、找不到結尾的 ````）畫出來的要和「只認 ```」逐字相同——
+       對照組是把 `_LONG_FENCE_OPEN_RE` 換成永遠配不到的一條（只剩 ``` 那一種）再畫一次。
+    ③ session 頁帶著掛「複製」鈕的那一段 JS 與 CSS；按鈕不寫進靜態 HTML（行為由 dev 的真 Chrome 探針驗）。
+    ④ 原文帶著像佔位符的字（NUL 夾著 B／I 加數字）：不可以換進別一塊的內容，也不可以丟例外。
+    ⑤ 一長串配不到結尾、或一個接一個被三反引號圍欄吃掉的四反引號開頭：時間要跟長度成正比
+       （每個開頭都往後逐行找結尾是 n²，100 KB 上下要十幾秒）。"""
+    import html
+    sys.path.insert(0, str(ROOT))
+    import ai_session_viewer as v
+
+    def pres(h):
+        return re.findall(r"<pre><code[^>]*>(.*?)</code></pre>", h, re.S)
+
+    # --- ①
+    inner = "```bash\ngit status\n```\n"
+    h = v.md_to_html(f"開場提示詞：\n\n````text\n{inner}讀 MAINTAINERS.md。\n````\n\n下一段")
+    assert pres(h) == [html.escape(inner + "讀 MAINTAINERS.md。\n", quote=False)], f"四反引號圍欄裡的 ``` 要留在同一塊：{h!r}"
+    assert 'class="language-text"' in h, f"語言字串：{h!r}"
+    assert "`" not in re.sub(r"<pre>.*?</pre>", "", h, flags=re.S), f"圍欄外面不可以多出反引號：{h!r}"
+    assert h.endswith("<p>下一段</p>"), f"圍欄之後的段落照常畫：{h!r}"
+    h = v.md_to_html(f"1. 第一步\n   ````\n   {inner.replace(chr(10), chr(10) + '   ')}   ````\n2. 第二步")
+    assert len(pres(h)) == 1 and "git status" in pres(h)[0] and "第二步" not in pres(h)[0], f"縮排的四反引號圍欄：{h!r}"
+    h = v.md_to_html("````\nA\n```\nB\n`````\n之後")
+    assert pres(h) == ["A\n```\nB\n"] and "之後" in h, f"結尾比開頭長也算結尾：{h!r}"
+
+    # --- ②
+    samples = ["```py\nx = 1\n```", "a\n```\nA```尾巴", "```\nA\n````\nB\n````",
+               "用 ```` ``` ```` 包起來\n\n````\nPROMPT\n````", "x ````\nA\n````", "````\nA\n```\n沒有結尾",
+               "``````\nA\n````\n```\nB\n```"]
+    got = [v.md_to_html(t) for t in samples]
+    orig = v._LONG_FENCE_OPEN_RE
+    v._LONG_FENCE_OPEN_RE = re.compile(r"(?!)")
+    try:
+        want = [v.md_to_html(t) for t in samples]
+    finally:
+        v._LONG_FENCE_OPEN_RE = orig
+    for t, g, w in zip(samples, got, want):
+        assert g == w, f"這段沒有自成一行的四反引號圍欄，畫法要和只認 ``` 時一樣：{t!r}\n{g!r}\n{w!r}"
+
+    # --- ④
+    for t, want in (("````\n\x00B1\x00\n````\n```\nOTHER\n```", ["B1\n", "OTHER\n"]),
+                    ("```\n\x00B1\x00\n```\n```\nOTHER\n```", ["B1\n", "OTHER\n"]),
+                    ("```\n\x00B99\x00\n```", ["B99\n"]),
+                    ("前 \x00B0\x00 後\n```\nX\n```", ["X\n"]),
+                    ("`\x00I5\x00` 與 \x00I0\x00", [])):
+        h = v.md_to_html(t)
+        assert pres(h) == want and "\x00" not in h, f"像佔位符的原文不可以換進別一塊的內容：{t!r} → {h!r}"
+
+    # --- ⑤
+    import time
+    for t in ("````info\nA\n" * 8000, "``````x\n" * 8000 + "````\n" * 8000,
+              "```s\n" + "``````x\n" * 8000 + "````\n" * 8000 + "``````\n"):   # 一個接一個被②吃掉的開頭
+        t0 = time.perf_counter()
+        v.md_to_html(t)
+        dt = time.perf_counter() - t0
+        assert dt < 5, f"一長串配不到結尾的四反引號開頭不可以讓畫一則訊息變成 n²：{dt:.1f} 秒（{len(t):,} 字）"
+
+    # --- ③
+    tmp = new_tmp(tmp_path)
+    proj = tmp / "projects" / "copy-proj"
+    proj.mkdir(parents=True)
+    sid = "c0b40000-0000-4000-8000-00000000c0b4"
+    ev = [{"type": "user", "uuid": "u1", "timestamp": "2026-11-17T01:00:00.000Z", "cwd": "/x/Copy", "sessionId": sid,
+           "message": {"role": "user", "content": "給我交棒提示詞"}},
+          {"type": "assistant", "uuid": "a1", "timestamp": "2026-11-17T01:00:05.000Z", "sessionId": sid,
+           "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "m1",
+                       "usage": {"input_tokens": 3, "output_tokens": 4},
+                       "content": [{"type": "text", "text": "````text\nCOPYME\n```\ncode\n```\n````"}]}}]
+    f = proj / f"{sid}.jsonl"
+    f.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in ev), encoding="utf-8")
+    s = v.load_session(f, "copy-proj", "demo", v.SOURCE_CLAUDE)
+    v.analyze(s)
+    s.out_html, s.out_md, s.mem_href = "claude-code/demo/x.html", "claude-code/demo/x.md", ""
+    page = v.render_session_html(s, "../../../index.html", "")
+    assert "<script>" + v._COPY_JS + "</script>" in page, "session 頁要帶掛複製鈕的那一段"
+    assert ".cpbtn::before{content:" in page and ".cpwrap{position:relative}" in page, "CSS 要在頁面裡"
+    body = _page_body(page)
+    assert "cpbtn" not in body and "cpwrap" not in body, "按鈕由 JS 掛，不寫進靜態 HTML"
+    assert pres(body) == ["COPYME\n```\ncode\n```\n"], body
+    print("OK: code fence and copy test passed")
+
+
 def test_antigravity_tree_deep_and_tmp_mode(tmp_path=None):
     """① 父子鏈很深（資料壞掉或刻意造的）：排樹不撞 Python 的遞迴上限——那個例外發生在每一場的例外處理之外，
        整批建置會停下來；
@@ -12671,6 +12793,7 @@ if __name__ == "__main__":
             test_antigravity_identity,
             test_antigravity_page_marks,
             test_antigravity_tools_scoped_to_source,
+            test_code_fence_and_copy,
             test_antigravity_tree_deep_and_tmp_mode,
             test_antigravity_incremental_edges,
             test_no_known_typo_chars,

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import bisect      # 圍欄：找四反引號開頭配到的結尾行，見 `_fence_spans()`
 import collections
 import errno       # 封存搬移時認「跨磁碟」（EXDEV／WinError 17），見 `_archive_move()`
 import hashlib
@@ -49,7 +50,7 @@ except Exception:
 
 # 工具的版本（`--version` 印的就是它）。出版時手動改，和公開 repo 的 git tag 對齊（tag 是 `v` 加上這個字串）。
 # 和 `RENDERER_VERSION` 是兩件事：那一個只管「既有輸出要不要重建」，每次頁面呈現一變就升。
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 MAX_RESULT_CHARS = 20000           # tool 結果在 HTML 裡的最大字數（可摺疊，超過截斷）
 MAX_WRITE_CHARS = 8000             # Write/檔案內容預覽上限
@@ -264,7 +265,11 @@ CWD_CACHE_NAME = ".cwd-cache.json"
 # 76 → 77（2026-10-29）：Antigravity 舊紀錄的工具結果（grep_search／view_file／list_dir／run_command／search_web
 #    記成自己專用的步驟型別）照工具結果畫、配回它的呼叫；原本那幾次呼叫畫成「無結果」、另標「⚠ 認不得的步驟」。
 #    內容是空的 CONVERSATION_HISTORY 不再標「⚠ 認不得的步驟」。只在有那幾種步驟的頁面上變。
-RENDERER_VERSION = 77
+# 77 → 78（2026-11-17）：① HTML 的程式碼區塊有「複製」鈕（`_COPY_JS`、CSS 的 `.cpbtn`；每一頁都變）。
+#    ② `md_to_html` 認得四個以上反引號的圍欄（開頭結尾各自成一行）：原本停在裡面第一個 ```、外面多出落單的反引號。
+#    ③ `md_to_html` 拿掉原文裡的 NUL：原文帶著像佔位符的字時，原本會換進別一塊的內容或丟例外。
+#    ②③ 只在有那種圍欄、帶 NUL 的頁面上變；MD 不變。
+RENDERER_VERSION = 78
 SOURCE_CLAUDE = "claude-code"
 SOURCE_CODEX = "codex"
 SOURCE_ANTIGRAVITY = "antigravity"
@@ -866,8 +871,61 @@ def first_line(s, n=70):
 # =========================================================================
 # 迷你 Markdown -> HTML（夠用版：程式碼區塊/行內碼/標題/清單/引用/粗斜體/連結）
 # =========================================================================
-_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
+# 程式碼圍欄有兩種認法（`_fence_spans`）：
+# ① 四個以上反引號：開頭與結尾各自成一行（前面可以縮排），結尾至少一樣長。要給人複製的提示詞常這樣包、
+#    裡面再放 ``` 的程式碼；只認三個的話會停在裡面第一個 ```，內容斷成兩半、外面多出落單的反引號。
+#    ⚠ 一定要自成一行：行內的 ```` ``` ```` 是在講反引號本身，當成開頭會吞掉後面一整段。
+# ② 三個反引號：在下一個 ``` 結束、不要求自成一行。①找不到結尾時也走這一種。
+_LONG_FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{4,})([^\n`]*)\n", re.M)
+_LONG_FENCE_CLOSE_RE = re.compile(r"^[ \t]*(`{4,})[ \t]*$", re.M)
+_SHORT_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+
+
+def _fence_spans(text):
+    """由左往右產生每一個圍欄 `(起點, 終點, 語言字串, 內容)`；同一個位置①優先，①找不到結尾就照②。
+    ⚠ 時間要跟長度成正比（多一個 log）：①的結尾行先一次找齊，「從某一行往後第一個不短於 n 的結尾」
+      用區間最大值的稀疏表跳著找；每個開頭只找一次，內容等到真的畫成圍欄才切。
+      逐行往後掃的話，一長串配不到結尾、或一個接一個被②吃掉的開頭，每一個都要再掃一次（n²）。"""
+    closes = [(m.start(), m.end(), len(m.group(1))) for m in _LONG_FENCE_CLOSE_RE.finditer(text)]
+    starts = [c[0] for c in closes]
+    longest = [[c[2] for c in closes]]      # longest[j][i]＝第 i 個結尾起、連續 2**j 個裡最長的
+    while (1 << len(longest)) <= len(closes):
+        prev, half = longest[-1], 1 << (len(longest) - 1)
+        longest.append([max(prev[i], prev[i + half]) for i in range(len(prev) - half)])
+
+    def first_close(k, n):
+        """第 k 個結尾起、第一個不短於 n 的那一個的索引；沒有就回 None。"""
+        for j in range(len(longest) - 1, -1, -1):
+            if k + (1 << j) <= len(closes) and longest[j][k] < n:
+                k += 1 << j
+        return k if k < len(closes) else None
+
+    opens = _LONG_FENCE_OPEN_RE.finditer(text)
+
+    def next_long(after):
+        # 跳過的開頭（已經畫掉的範圍裡、或配不到結尾）以後也不會用到：共用同一個 iterator，不回頭
+        for op in opens:
+            if op.start() >= after:
+                k = first_close(bisect.bisect_left(starts, op.end()), len(op.group(1)))
+                if k is not None:
+                    return op, k
+        return None
+
+    pos, long_ = 0, next_long(0)
+    while True:
+        if long_ is not None and long_[0].start() < pos:
+            long_ = next_long(pos)
+        short = _SHORT_FENCE_RE.search(text, pos)
+        if short is not None and (long_ is None or short.start() < long_[0].start()):
+            yield short.start(), short.end(), short.group(1), short.group(2)
+            pos = short.end()
+        elif long_ is not None:
+            op, k = long_
+            yield op.start(), closes[k][1], op.group(2), text[op.end():closes[k][0]]
+            pos, long_ = closes[k][1], next_long(closes[k][1])
+        else:
+            return
 
 
 def md_to_html(text: str) -> str:
@@ -875,19 +933,23 @@ def md_to_html(text: str) -> str:
         return ""
     text = str(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # 原文裡的 NUL 一律拿掉：下面的佔位符用 NUL 當邊界，原文帶著長得像佔位符的字，就會被換成別一塊的內容
+    # （或索引超出範圍而丟例外）。瀏覽器本來就不畫內文裡的 NUL，畫出來的頁面不變。
+    text = text.replace("\x00", "")
 
     blocks: list[tuple[str, str]] = []
     inlines: list[str] = []
-
-    def stash_block(m):
-        blocks.append((m.group(1).strip(), m.group(2)))
-        return f"\x00B{len(blocks) - 1}\x00"
 
     def stash_inline(m):
         inlines.append(m.group(1))
         return f"\x00I{len(inlines) - 1}\x00"
 
-    text = _FENCE_RE.sub(stash_block, text)
+    parts, pos = [], 0
+    for start, end, lang, code in _fence_spans(text):
+        blocks.append((lang.strip(), code))
+        parts += [text[pos:start], f"\x00B{len(blocks) - 1}\x00"]
+        pos = end
+    text = "".join(parts) + text[pos:]
     text = _INLINE_CODE_RE.sub(stash_inline, text)
     text = html.escape(text, quote=False)
 
@@ -1459,11 +1521,19 @@ _CODEX_HANDLED_EVENTS = ("task_started", "user_message", "item_completed", "toke
 # ⚠ 後四個是**現有語料裡出現、但本工具刻意不呈現**的（實測 516 份 rollout：web_search_call 143／
 #   tool_search_call 61／tool_search_output 61／agent_message 2）。不列的話哨兵一上線就對 267 筆
 #   真實事件狂叫，而一個會誤報的警告很快就沒有人讀。
+# 另外兩種認得、但不是對話內容的，在 `_CODEX_NONCONTENT_ITEMS`（比這張白名單先處理）。
 _CODEX_HANDLED_RESPONSE_ITEMS = frozenset((
     "message", "reasoning", "function_call", "custom_tool_call",
     "function_call_output", "custom_tool_call_output",
     "web_search_call", "tool_search_call", "tool_search_output", "agent_message",
 ))
+# 認得、但不是對話內容的 `response_item`：載入時整筆略過——不畫、不出聲，也不算把同一則 prompt 的
+# 兩種表述隔開（見 `_codex_dual_shape`）。實測 943 份 rollout，兩者都是 CLI 0.164 起才有：
+#   `additional_tools`（146 則）＝交給模型的工具宣告，`role=developer`、`tools` 是一組 namespace，
+#   每個 namespace 底下是工具的名稱／說明／參數 schema，多數在 `task_started` 之後第一筆；
+#   `configuration_update`（2 則）＝執行環境自己改的設定（`reasoning.effort`，
+#   `metadata.harness_authored_configuration=true`）——Codex 的 effort 本來就不畫。
+_CODEX_NONCONTENT_ITEMS = frozenset(("additional_tools", "configuration_update"))
 # `response_item:message` 的已知 `role`。上游改名或拿掉 role，`role != "assistant"`
 # 那一行會**直接吞掉**整則助理訊息——症狀與型別改名一模一樣（頁面「N 則提問、零則回答」、
 # stderr 全靜），而 `payload.type`、content 元素型別等三條哨兵一條都接不到。
@@ -1795,6 +1865,9 @@ def load_codex_session(path: Path, account: str = "default", thread_names=None) 
             if (_codex_event_user_like(payload, ptype)
                     or "user" in str(e.get("type") or "").lower()):
                 n_unhandled_user_outer += 1
+            continue
+        # 不是內容的那幾種：不畫、不進下面的型別白名單，也不算把「同一則的兩種表述」隔開（下一行）。
+        if ptype in _CODEX_NONCONTENT_ITEMS:
             continue
         # 內容事件把「同一則的兩種表述」隔開：之後再出現同文字的 UserMessage 就是真的重打了。
         pending_user = None
@@ -8110,6 +8183,43 @@ var BK_MGR='bookmarks.html';
     return html_page("書籤設定", body)
 
 
+# session 頁：程式碼區塊（`md_to_html` 產的 `pre>code`）的「複製」鈕。普通字串，理由同書籤那幾段。
+# 按鈕不寫進建置期的 HTML、由這段在載入時掛上：沒有 JS 本來就複製不了，靜態寫進去只會讓每一頁變胖。
+# 自己一個 `<script>`：和書籤那一段任一邊丟例外，都不會讓另一邊沒跑。
+# 版面與「字為什麼畫在 ::before」見 CSS 的 `.cpwrap`／`.cpbtn`。
+_COPY_JS = r"""
+/* 複製的是 `<code>` 的文字，去掉最後那個換行（連同結尾那一行的縮排）：那是圍欄的格式，不是內容。 */
+function cpText(code){return code.textContent.replace(/\n[ \t]*$/,'');}
+function cpDone(b,cls){
+ b.classList.remove('ok','fail');b.classList.add(cls);
+ clearTimeout(b._cpT);b._cpT=setTimeout(function(){b.classList.remove(cls);},1600);}
+function cpCopy(b){
+ var code=b.parentNode.querySelector('pre>code'),t=cpText(code);
+ /* `navigator.clipboard` 不可用或被拒時退回 execCommand；兩條都不行就把內容選起來，讓人自己按複製。 */
+ var fallback=function(){
+  var ta=document.createElement('textarea'),ok=false;
+  ta.value=t;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.top='-9999px';
+  document.body.appendChild(ta);ta.select();
+  try{ok=document.execCommand('copy');}catch(e){}
+  document.body.removeChild(ta);
+  if(ok){cpDone(b,'ok');return;}
+  var r=document.createRange(),s=window.getSelection();
+  r.selectNodeContents(code);s.removeAllRanges();s.addRange(r);
+  cpDone(b,'fail');};
+ if(navigator.clipboard&&navigator.clipboard.writeText){
+  navigator.clipboard.writeText(t).then(function(){cpDone(b,'ok');},fallback);}
+ else fallback();}
+function cpInit(){
+ [].slice.call(document.querySelectorAll('pre>code')).forEach(function(code){
+  var pre=code.parentNode,w=document.createElement('div'),b=document.createElement('button');
+  w.className='cpwrap';b.type='button';b.className='cpbtn';
+  b.title='複製這段內容';b.setAttribute('aria-label','複製這段內容');
+  b.onclick=function(){cpCopy(b);};
+  pre.parentNode.insertBefore(w,pre);w.appendChild(pre);w.appendChild(b);});}
+cpInit();
+"""
+
+
 def render_session_html(s: Session, index_href: str, memory_href: str = "") -> str:
     if not hasattr(s, "main_groups"):
         analyze(s)
@@ -8450,6 +8560,7 @@ var BK_MGR={bk_mgr};
 {_BOOKMARK_CORE_JS}
 {bookmark_js}
 </script>
+<script>{_COPY_JS}</script>
 """
     return html_page(s.title, body,
                      body_class="hide-in hide-cw hide-cr hide-ctx hide-out hide-dur hide-ttl hide-eff")
@@ -11848,6 +11959,24 @@ font-family:ui-monospace,Consolas,monospace;font-size:.9em}
 pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;
 overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;line-height:1.5}
 pre code{background:none;padding:0}
+/* 程式碼區塊的「複製」鈕（session 頁的 `cpInit()` 把每個 `pre>code` 包進 `.cpwrap`、掛上按鈕）。
+   ⚠ 按鈕掛在外框、不放進 `<pre>`：`<pre>` 會橫向捲動，放在裡面會跟著內容捲走。
+   ⚠ 字畫在 `::before`、按鈕裡沒有文字節點：書籤摘要讀的是 `textContent`，
+     選取一整段再複製也不會多出「複製」兩個字。
+   ⚠ 平常 `pointer-events:none`：看不見的按鈕不可以擋住右上角那幾個字的選取與點擊。 */
+.cpwrap{position:relative}
+.cpbtn{position:absolute;top:5px;right:5px;z-index:1;background:var(--panel);border:1px solid var(--border);
+color:var(--muted);border-radius:6px;padding:1px 8px;font-size:12px;line-height:1.5;cursor:pointer;
+opacity:0;pointer-events:none;transition:opacity .12s}
+.cpbtn::before{content:"複製"}
+.cpbtn.ok::before{content:"✓ 已複製"}
+.cpbtn.fail::before{content:"已選取，請手動複製"}
+.cpwrap:hover>.cpbtn,.cpbtn:focus,.cpbtn.ok,.cpbtn.fail{opacity:1;pointer-events:auto}
+.cpbtn:hover{color:var(--accent)}
+.cpbtn.ok{color:var(--assistant)}
+/* 程式碼就是那一塊的第一個元素時，右上角已經有那一塊的 `#`／`☆`（`.blk-ctls`）：往左讓開。 */
+.blk>.blk-ctls+.cpwrap>.cpbtn{right:60px}
+@media (hover:none){.cpbtn{opacity:.6;pointer-events:auto}}
 /* 工具 / 思考 */
 details.tool,details.think,details.sidechain-wrap{border:1px solid var(--border);border-radius:8px;
 margin:8px 0;background:var(--panel2)}
